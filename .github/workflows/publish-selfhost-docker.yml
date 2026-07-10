@@ -162,13 +162,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Release gate: run the full selfhost-docker e2e project against the exact
-  # by-digest image each build leg pushed, before any user-visible tag moves.
-  # Build-only smoke misses startup crashes and feature-path breaks (a package
-  # resolved at runtime but missing from the packaged runtime shipped broken in
-  # v1.5.30 exactly this way); per-arch matters too — the libsql native-addon
-  # bug was arm64-only.
-  e2e:
+  # Release gate: boot the exact by-digest image each build leg pushed using
+  # the owned WorkOS identity contract before any user-visible tag moves.
+  # The upstream Better Auth scenario suite is intentionally not a compatibility
+  # gate for this WorkOS-only fork.
+  smoke:
     needs:
       - metadata
       - build
@@ -181,52 +179,12 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: read
 
     steps:
-      - name: Checkout release tag
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.metadata.outputs.release_tag }}
-          persist-credentials: false
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.11
-
-      - name: Cache Bun package cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.bun/install/cache
-          key: ${{ runner.os }}-${{ runner.arch }}-bun-1.3.11-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-bun-1.3.11-
-
-      # Scenario helpers spawn Node sidecars; pin the same Node 24 runtime the
-      # other workflows use.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - run: bun install --frozen-lockfile
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-${{ runner.arch }}-playwright-1.60.0
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-playwright-
-
-      # Install from e2e so bunx resolves ITS pinned playwright (the version
-      # the tests run against) rather than floating to the latest.
-      - name: Install Playwright Chromium
-        run: bunx playwright install --with-deps chromium chromium-headless-shell
-        working-directory: e2e
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -256,27 +214,65 @@ jobs:
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           docker pull "$ref"
 
-      - name: Run selfhost-docker scenarios against the published digest
+      - name: Boot WorkOS-only image from the published digest
+        shell: bash
         env:
           E2E_SELFHOST_DOCKER_IMAGE: ${{ steps.image_ref.outputs.ref }}
-        run: bunx vitest run --project selfhost-docker --retry=2
-        working-directory: e2e
+          EXPECTED_REVISION: ${{ needs.metadata.outputs.revision }}
+        run: |
+          set -euo pipefail
 
-      - name: Upload run artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-runs-selfhost-docker-${{ matrix.arch }}
-          path: |
-            e2e/runs/
-            e2e/selfhost-docker.boot.log
-          retention-days: 7
+          name="executor-release-probe-${{ matrix.arch }}"
+          data_volume="${name}-data"
+          cleanup() {
+            docker logs "$name" > "$RUNNER_TEMP/${name}.log" 2>&1 || true
+            docker rm --force "$name" >/dev/null 2>&1 || true
+            docker volume rm "$data_volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          actual_revision="$(docker image inspect "$E2E_SELFHOST_DOCKER_IMAGE" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          if [ "$actual_revision" != "$EXPECTED_REVISION" ]; then
+            echo "Image revision mismatch: expected $EXPECTED_REVISION, got $actual_revision"
+            exit 1
+          fi
+
+          docker run --detach \
+            --name "$name" \
+            --network host \
+            --volume "$data_volume:/data" \
+            -e PORT=42605 \
+            -e EXECUTOR_WEB_BASE_URL=http://localhost:42605 \
+            -e EXECUTOR_ALLOW_LOCAL_NETWORK=true \
+            -e EXECUTOR_AUTH_PROVIDER=workos-authkit \
+            -e WORKOS_API_KEY=sk_test_executor_release_probe \
+            -e WORKOS_CLIENT_ID=client_executor_release_probe \
+            -e WORKOS_COOKIE_PASSWORD=executor-release-probe-cookie-password \
+            -e WORKOS_AUTHKIT_DOMAIN=https://example.authkit.app \
+            -e WORKOS_SERVICE_ORGANIZATION_ID=org_executor_release_probe \
+            -e WORKOS_M2M_ALLOWED_CLIENT_IDS=client_manifest_trigger_probe \
+            "$E2E_SELFHOST_DOCKER_IMAGE"
+
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error http://localhost:42605/api/health > /dev/null; then
+              exit 0
+            fi
+            if [ "$(docker inspect "$name" --format '{{.State.Running}}')" != "true" ]; then
+              docker logs "$name"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          docker logs "$name"
+          echo "Timed out waiting for the Executor health endpoint"
+          exit 1
 
   merge:
     needs:
       - metadata
       - build
-      - e2e
+      - smoke
     runs-on: ubuntu-24.04
     permissions:
       packages: write
