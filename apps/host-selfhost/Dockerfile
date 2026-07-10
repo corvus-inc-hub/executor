@@ -20,7 +20,7 @@ FROM gcr.io/distroless/cc-debian12 AS runtime
 WORKDIR /app
 ARG EXECUTOR_IMAGE_SOURCE
 ARG EXECUTOR_SOURCE_REVISION
-ARG EXECUTOR_UPSTREAM_REVISION=724600c1a26594f23388e6cac067f86a62cc3764
+ARG EXECUTOR_UPSTREAM_REVISION=04ce4b4ae53a900f9c28276c300f3c8d5010472b
 LABEL org.opencontainers.image.source="${EXECUTOR_IMAGE_SOURCE}" \
       org.opencontainers.image.revision="${EXECUTOR_SOURCE_REVISION}" \
       org.opencontainers.image.description="Single-container self-hosted Executor" \

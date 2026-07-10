@@ -18,15 +18,15 @@ concurrency:
 
 jobs:
   metadata:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     outputs:
       release_tag: ${{ steps.validate.outputs.tag }}
       image: ${{ steps.image.outputs.image }}
       tags: ${{ steps.image.outputs.tags }}
-      legacy_tags: ${{ steps.image.outputs.legacy_tags }}
       labels: ${{ steps.image.outputs.labels }}
+      revision: ${{ steps.image.outputs.revision }}
 
     steps:
       - name: Checkout
@@ -63,7 +63,6 @@ jobs:
           version="${RELEASE_TAG#v}"
           owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
           image="ghcr.io/${owner}/executor-selfhost"
-          legacy_image="ghcr.io/rhyssullivan/executor-selfhost"
           revision="$(git rev-parse HEAD)"
 
           if [[ "$version" == *-* ]]; then
@@ -76,15 +75,11 @@ jobs:
             echo "image=$image"
             echo "version=$version"
             echo "channel=$channel"
+            echo "revision=$revision"
             echo "tags<<TAGS"
             echo "${image}:${RELEASE_TAG}"
             echo "${image}:${version}"
             echo "${image}:${channel}"
-            echo "TAGS"
-            echo "legacy_tags<<TAGS"
-            echo "${legacy_image}:${RELEASE_TAG}"
-            echo "${legacy_image}:${version}"
-            echo "${legacy_image}:${channel}"
             echo "TAGS"
             echo "labels<<LABELS"
             echo "org.opencontainers.image.title=Executor self-host"
@@ -103,10 +98,10 @@ jobs:
         include:
           - arch: amd64
             platform: linux/amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - arch: arm64
             platform: linux/arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -120,8 +115,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Setup Blacksmith Builder
-        uses: useblacksmith/setup-docker-builder@v1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -132,12 +127,16 @@ jobs:
 
       - name: Build and push self-host image by digest
         id: build
-        uses: useblacksmith/build-push-action@v2
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: apps/host-selfhost/Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ needs.metadata.outputs.labels }}
+          build-args: |
+            EXECUTOR_IMAGE_SOURCE=https://github.com/${{ github.repository }}
+            EXECUTOR_SOURCE_REVISION=${{ needs.metadata.outputs.revision }}
+            EXECUTOR_UPSTREAM_REVISION=04ce4b4ae53a900f9c28276c300f3c8d5010472b
           outputs: type=image,name=${{ needs.metadata.outputs.image }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Export image digest
@@ -178,9 +177,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - arch: arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     permissions:
@@ -278,11 +277,9 @@ jobs:
       - metadata
       - build
       - e2e
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     permissions:
       packages: write
-    env:
-      HAS_LEGACY_TOKEN: ${{ secrets.GHCR_LEGACY_TOKEN != '' }}
 
     steps:
       - name: Download image digests
@@ -329,32 +326,3 @@ jobs:
           done <<< "$TAGS"
 
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
-
-      - name: Skip legacy GHCR mirror (GHCR_LEGACY_TOKEN not configured)
-        if: env.HAS_LEGACY_TOKEN != 'true'
-        run: echo "GHCR_LEGACY_TOKEN is not configured; skipping legacy GHCR mirror."
-
-      - name: Log in to legacy GHCR namespace
-        if: env.HAS_LEGACY_TOKEN == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: rhyssullivan
-          password: ${{ secrets.GHCR_LEGACY_TOKEN }}
-
-      - name: Mirror self-host image to legacy GHCR namespace
-        if: env.HAS_LEGACY_TOKEN == 'true'
-        shell: bash
-        env:
-          SOURCE_IMAGE: ${{ needs.metadata.outputs.image }}:${{ needs.metadata.outputs.release_tag }}
-          LEGACY_TAGS: ${{ needs.metadata.outputs.legacy_tags }}
-        run: |
-          set -euo pipefail
-
-          tag_args=()
-          while IFS= read -r tag; do
-            [[ -n "$tag" ]] || continue
-            tag_args+=("-t" "$tag")
-          done <<< "$LEGACY_TAGS"
-
-          docker buildx imagetools create "${tag_args[@]}" "$SOURCE_IMAGE"
