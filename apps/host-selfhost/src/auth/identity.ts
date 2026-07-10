@@ -1,85 +1,224 @@
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Predicate } from "effect";
 
-import { IdentityProvider, Unauthorized } from "@executor-js/api/server";
+import {
+  IdentityProvider,
+  NoOrganization,
+  Unauthorized,
+  Unavailable,
+  type Principal,
+} from "@executor-js/api/server";
 
-import { BetterAuth } from "./better-auth";
+import type { WorkOSConfig } from "../config";
+import type { ApiKeyService } from "./api-keys";
+import { parseCookie } from "./cookies";
+import {
+  cachedRemoteJwks,
+  verifyWorkOSAccessToken,
+  type VerifiedWorkOSToken,
+  type WorkOSJwtError,
+} from "./jwt";
+import {
+  authorizeServiceOrganization,
+  authorizeUserOrganizationSelector,
+  resolveOrganization,
+  selectedOrganization,
+  type OrganizationAuthDeps,
+} from "./organization";
+import type { OrganizationStore } from "./organization-store";
+import {
+  WORKOS_SESSION_COOKIE,
+  type WorkOSBrowserSession,
+  type WorkOSClient,
+  type WorkOSRequestError,
+} from "./workos";
 
-// ---------------------------------------------------------------------------
-// The self-host identity seam — the production implementation of the shared
-// `IdentityProvider` from `@executor-js/api/server`, which resolves an incoming
-// request to a Principal. WorkOS (cloud) and Better Auth (self-host) are
-// interchangeable implementations of the same tag; nothing downstream knows
-// which is wired.
-//
-//   - succeeds with a Principal      -> authenticated
-//   - fails Unauthorized             -> no/invalid credential (renders 401)
-//   - fails NoOrganization           -> valid credential, no org (renders 403)
-//
-// `betterAuthIdentityLayer` is the only production provider. The trivial fake
-// identities tests inject live in `src/testing/test-app.ts`.
-// ---------------------------------------------------------------------------
-
-const bearerToken = (headers: Headers): string | undefined => {
-  const authorization = headers.get("authorization");
-  if (!authorization) return undefined;
-  return authorization.toLowerCase().startsWith("bearer ")
-    ? authorization.slice(7).trim() || undefined
-    : undefined;
+const INVALID_AUTHORIZATION_HEADER = {
+  code: "invalid_authorization_header",
+  message: "Authorization header must use Bearer authentication",
+};
+const INVALID_CREDENTIAL = { code: "invalid_credential", message: "Invalid credential" };
+const NO_ORGANIZATION = { code: "no_organization", message: "No authorized organization" };
+const IDENTITY_UNAVAILABLE = {
+  code: "identity_unavailable",
+  message: "Identity validation is temporarily unavailable",
 };
 
-// ---------------------------------------------------------------------------
-// The production IdentityProvider: resolve a request to a Better Auth session
-// and map it to a neutral Principal. Three credential shapes resolve here:
-//   - session cookie (browser SPA)
-//   - Bearer session token (bearer plugin)
-//   - Bearer API key — the apiKey plugin reads `x-api-key`, so when the normal
-//     resolution fails we retry with the Bearer value as x-api-key, which (with
-//     enableSessionForAPIKeys) mints the owner's session. This is what lets a
-//     generated API key authenticate the API + MCP endpoint as a Bearer token.
-// Single-org instance, so organizationName is the boot-cached org name.
-// ---------------------------------------------------------------------------
+export interface WorkOSIdentityDeps extends OrganizationAuthDeps {
+  readonly apiKeys: ApiKeyService;
+  readonly workos: WorkOSClient;
+  readonly organizations: OrganizationStore;
+  readonly config: WorkOSConfig;
+}
 
-export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, BetterAuth> =
-  Layer.effect(IdentityProvider)(
-    Effect.gen(function* () {
-      const { auth, organizationId, organizationName, organizationSlug } = yield* BetterAuth;
-      return IdentityProvider.of({
-        authenticate: (request) =>
-          Effect.gen(function* () {
-            let resolved = yield* Effect.promise(() =>
-              auth.api.getSession({ headers: request.headers }),
-            );
-            if (!resolved) {
-              const token = bearerToken(request.headers);
-              if (token) {
-                resolved = yield* Effect.tryPromise({
-                  try: () => auth.api.getSession({ headers: { "x-api-key": token } }),
-                  catch: () => "api-key session lookup failed",
-                }).pipe(Effect.orElseSucceed(() => null));
-              }
-            }
-            // No session resolved from any credential shape -> unauthenticated.
-            // The middleware's failure strategy renders this as a 401.
-            if (!resolved) return yield* new Unauthorized();
-            // Single-org instance: every authenticated user belongs to the one
-            // seeded org. Cookie/bearer-session logins are pinned to it by the
-            // session hook; API-key-minted sessions carry no active org, so we
-            // default to the seeded org rather than rejecting with NoOrganization.
-            const resolvedOrganizationId = resolved.session.activeOrganizationId ?? organizationId;
-            return {
-              accountId: resolved.user.id,
-              organizationId: resolvedOrganizationId,
-              organizationName,
-              organizationSlug,
-              email: resolved.user.email,
-              name: resolved.user.name ?? null,
-              avatarUrl: resolved.user.image ?? null,
-              roles: (resolved.user.role ?? "user")
-                .split(",")
-                .map((role) => role.trim())
-                .filter((role) => role.length > 0),
-            };
-          }),
-      });
-    }),
+const authorizationFailure = (error: unknown): NoOrganization | Unavailable =>
+  Predicate.isTagged("WorkOSRequestError")(error) &&
+  "status" in error &&
+  (error.status === 401 || error.status === 403 || error.status === 404)
+    ? new NoOrganization(NO_ORGANIZATION)
+    : new Unavailable(IDENTITY_UNAVAILABLE);
+
+const jwtFailure = (error: WorkOSJwtError): Unauthorized | Unavailable =>
+  error.reason === "system"
+    ? new Unavailable(IDENTITY_UNAVAILABLE)
+    : new Unauthorized(INVALID_CREDENTIAL);
+
+const userDisplayName = (user: {
+  readonly firstName?: string | null;
+  readonly lastName?: string | null;
+}): string | null => [user.firstName, user.lastName].filter(Boolean).join(" ") || null;
+
+const userPrincipal = (deps: WorkOSIdentityDeps, accountId: string, organizationSelector: string) =>
+  Effect.gen(function* () {
+    const authorized = yield* authorizeUserOrganizationSelector(
+      deps,
+      accountId,
+      organizationSelector,
+    ).pipe(Effect.mapError(authorizationFailure));
+    if (!authorized) return yield* new NoOrganization(NO_ORGANIZATION);
+    const user = yield* deps.workos.getUser(accountId).pipe(Effect.mapError(authorizationFailure));
+    return {
+      accountId,
+      organizationId: authorized.id,
+      organizationName: authorized.name,
+      organizationSlug: authorized.slug,
+      email: user.email,
+      name: userDisplayName(user),
+      avatarUrl: user.profilePictureUrl ?? null,
+      roles: authorized.roles,
+    } satisfies Principal;
+  });
+
+const servicePrincipal = (deps: WorkOSIdentityDeps, clientId: string, organizationId: string) =>
+  Effect.gen(function* () {
+    const authorized = yield* authorizeServiceOrganization(deps, clientId, organizationId).pipe(
+      Effect.mapError(authorizationFailure),
+    );
+    if (!authorized) return yield* new NoOrganization(NO_ORGANIZATION);
+    return {
+      accountId: clientId,
+      organizationId: authorized.id,
+      organizationName: authorized.name,
+      organizationSlug: authorized.slug,
+      email: "",
+      name: clientId,
+      avatarUrl: null,
+      roles: ["service"],
+    } satisfies Principal;
+  });
+
+const principalFromJwt = (
+  deps: WorkOSIdentityDeps,
+  verified: VerifiedWorkOSToken | null,
+  request: Request,
+) =>
+  Effect.gen(function* () {
+    if (!verified || !verified.organizationId) {
+      return yield* new NoOrganization(NO_ORGANIZATION);
+    }
+    const selector = selectedOrganization(request, verified.organizationId);
+    if (!selector) return yield* new NoOrganization(NO_ORGANIZATION);
+    if (verified.subject.startsWith("client_")) {
+      if (verified.organizationId !== deps.config.serviceOrganizationId) {
+        return yield* new NoOrganization(NO_ORGANIZATION);
+      }
+      return yield* servicePrincipal(deps, verified.subject, selector);
+    }
+    if (selector !== verified.organizationId) return yield* new NoOrganization(NO_ORGANIZATION);
+    return yield* userPrincipal(deps, verified.subject, selector);
+  });
+
+const resolveJwtPrincipal = (deps: WorkOSIdentityDeps, token: string, request: Request) =>
+  verifyWorkOSAccessToken(token, cachedRemoteJwks(`${deps.config.authkitDomain}/oauth2/jwks`), {
+    issuer: deps.config.authkitDomain,
+    audience: deps.config.connectAudience,
+  }).pipe(
+    Effect.mapError(jwtFailure),
+    Effect.flatMap((verified) => principalFromJwt(deps, verified, request)),
   );
+
+const resolveApiKeyPrincipal = (deps: WorkOSIdentityDeps, token: string, request: Request) =>
+  Effect.gen(function* () {
+    const owner = yield* deps.apiKeys
+      .validate(token)
+      .pipe(
+        Effect.catchTag("ApiKeyValidationError", () =>
+          Effect.fail(new Unavailable(IDENTITY_UNAVAILABLE)),
+        ),
+      );
+    if (!owner) return yield* new Unauthorized(INVALID_CREDENTIAL);
+    const selector = selectedOrganization(request, owner.organizationId);
+    if (!selector) return yield* new NoOrganization(NO_ORGANIZATION);
+
+    if (owner.accountId.startsWith("api-key:")) {
+      if (selector !== owner.organizationId) return yield* new NoOrganization(NO_ORGANIZATION);
+      const organization = yield* resolveOrganization(deps, owner.organizationId).pipe(
+        Effect.mapError(authorizationFailure),
+      );
+      if (!organization) return yield* new NoOrganization(NO_ORGANIZATION);
+      return {
+        accountId: owner.accountId,
+        organizationId: organization.id,
+        organizationName: organization.name,
+        organizationSlug: organization.slug,
+        email: "",
+        name: "Organization API key",
+        avatarUrl: null,
+        roles: owner.roles,
+      } satisfies Principal;
+    }
+    return yield* userPrincipal(deps, owner.accountId, selector);
+  });
+
+const bearerToken = (request: Request): string | null => {
+  const authorization = request.headers.get("authorization");
+  if (!authorization) return null;
+  if (!authorization.startsWith("Bearer ")) {
+    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: helper reports malformed authorization through the caller's typed path
+    throw new Unauthorized(INVALID_AUTHORIZATION_HEADER);
+  }
+  return authorization.slice(7).trim();
+};
+
+export const resolveBrowserPrincipal = (deps: WorkOSIdentityDeps, request: Request) =>
+  Effect.gen(function* () {
+    const sessionData = parseCookie(request.headers.get("cookie"), WORKOS_SESSION_COOKIE);
+    if (!sessionData) return null;
+    const session = yield* deps.workos
+      .authenticateSealedSession(sessionData)
+      .pipe(Effect.catch(() => Effect.succeed(null)));
+    if (!session) return null;
+    const selector = selectedOrganization(request, session.organizationId);
+    if (!selector) return null;
+    return yield* userPrincipal(deps, session.accountId, selector).pipe(
+      Effect.catch(() => Effect.succeed(null)),
+    );
+  });
+
+export const makeWorkOSIdentityLayer = (deps: WorkOSIdentityDeps): Layer.Layer<IdentityProvider> =>
+  Layer.succeed(IdentityProvider)({
+    authenticate: (request) =>
+      Effect.gen(function* () {
+        const token = yield* Effect.try({
+          try: () => bearerToken(request),
+          catch: () => new Unauthorized(INVALID_AUTHORIZATION_HEADER),
+        });
+        if (token !== null) {
+          if (!token) return yield* new Unauthorized(INVALID_CREDENTIAL);
+          return yield* token.split(".").length === 3
+            ? resolveJwtPrincipal(deps, token, request)
+            : resolveApiKeyPrincipal(deps, token, request);
+        }
+
+        const browser = yield* resolveBrowserPrincipal(deps, request);
+        if (!browser) return yield* new Unauthorized(INVALID_CREDENTIAL);
+        return browser;
+      }),
+  });
+
+export const sessionForRequest = (
+  workos: WorkOSClient,
+  request: Request,
+): Effect.Effect<WorkOSBrowserSession | null, WorkOSRequestError> => {
+  const sessionData = parseCookie(request.headers.get("cookie"), WORKOS_SESSION_COOKIE);
+  return sessionData ? workos.authenticateSealedSession(sessionData) : Effect.succeed(null);
+};

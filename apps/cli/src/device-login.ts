@@ -8,10 +8,9 @@
 //   3. poll the token endpoint until the user approves in the browser,
 //   4. hand the access + refresh tokens back to be stored in the profile.
 //
-// The flow is provider-neutral: the server advertises WorkOS (cloud) or Better
-// Auth (self-host) endpoints, and both speak the same RFC 8628 wire shape, so
-// this module never branches on provider. Tokens are sent to the `/api/*`
-// plane as `Authorization: Bearer <access_token>`.
+// The flow is provider-neutral: the server advertises RFC 8628 endpoints and
+// the CLI never branches on provider. Tokens are sent to the `/api/*` plane as
+// `Authorization: Bearer <access_token>`.
 // ---------------------------------------------------------------------------
 
 import { spawn } from "node:child_process";
@@ -24,8 +23,8 @@ export interface CliLoginDiscovery {
   readonly scope?: string;
   /**
    * How to encode the device-authorization + token requests. RFC 8628 mandates
-   * `form` (WorkOS), but some providers' endpoints only accept JSON (Better
-   * Auth). The server tells us via discovery; defaults to `form`.
+   * `form`. Some providers accept only JSON, so the server tells us via
+   * discovery; defaults to `form`.
    */
   readonly requestFormat: "form" | "json";
 }
@@ -280,8 +279,7 @@ export const pollForDeviceTokens = async (
 };
 
 /** Exchange a refresh token for a fresh access token (silent re-auth). Only
- * providers that issue refresh tokens reach here (WorkOS, which is form-encoded
- * per RFC 8628); Better Auth's device flow issues no refresh token. */
+ * providers that issue refresh tokens reach here. Refresh is form-encoded. */
 export const refreshDeviceTokens = async (input: {
   readonly tokenEndpoint: string;
   readonly clientId: string;

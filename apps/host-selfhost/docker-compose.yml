@@ -1,16 +1,11 @@
-# One-command self-hosted Executor.
+# WorkOS-authenticated self-hosted Executor.
 #
 #   docker compose up -d --build      # build the image and start
-#   open http://localhost:4788        # create the admin account (first-run)
+#   open http://localhost:4788        # continue to WorkOS AuthKit
 #
-# Everything — SQLite (libSQL), QuickJS code execution, and the MCP server — runs
-# in this single container. The named volume persists the database and the
-# generated keys across restarts and upgrades. Nothing else to orchestrate.
-#
-# No configuration is required: a bare `docker compose up` boots a working
-# instance and walks you through creating the admin account in the browser.
-# Optional settings live in .env (see .env.example) — most importantly
-# EXECUTOR_WEB_BASE_URL when serving behind a domain / TLS.
+# SQLite, QuickJS code execution, integrations, and MCP run in this container.
+# WorkOS AuthKit supplies identity. Create .env from .env.example before boot.
+# The named volume persists the database and Executor encryption key.
 
 services:
   executor:
@@ -18,13 +13,16 @@ services:
       # Build context is the repo root: the Bun workspace install needs every member.
       context: ../..
       dockerfile: apps/host-selfhost/Dockerfile
+      args:
+        EXECUTOR_IMAGE_SOURCE: ${EXECUTOR_IMAGE_SOURCE:-local}
+        EXECUTOR_SOURCE_REVISION: ${EXECUTOR_SOURCE_REVISION:-development}
     image: executor-selfhost
     restart: unless-stopped
     ports:
       - "4788:4788"
     env_file:
       - path: .env
-        required: false
+        required: true
     volumes:
       - executor-data:/data
     healthcheck:

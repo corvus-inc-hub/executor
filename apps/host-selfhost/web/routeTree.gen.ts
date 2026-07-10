@@ -14,9 +14,8 @@ import { Route as DotDotDotDotDotDotDotDotPackagesReactSrcRoutesToolsRouteImport
 import { Route as DotDotDotDotDotDotDotDotPackagesReactSrcRoutesToolkitsRouteImport } from './../../../packages/react/src/routes/toolkits'
 import { Route as DotDotDotDotDotDotDotDotPackagesReactSrcRoutesSecretsRouteImport } from './../../../packages/react/src/routes/secrets'
 import { Route as DotDotDotDotDotDotDotDotPackagesReactSrcRoutesPoliciesRouteImport } from './../../../packages/react/src/routes/policies'
+import { Route as OrgRouteImport } from './routes/app/org'
 import { Route as ApiKeysRouteImport } from './routes/app/api-keys'
-import { Route as AdminRouteImport } from './routes/app/admin'
-import { Route as JoinDotcodeRouteImport } from './routes/public/join.$code'
 import { Route as DotDotDotDotDotDotDotDotPackagesReactSrcRoutesToolkitsDottoolkitSlugRouteImport } from './../../../packages/react/src/routes/toolkits.$toolkitSlug'
 import { Route as DotDotDotDotDotDotDotDotPackagesReactSrcRoutesResumeDotexecutionIdRouteImport } from './../../../packages/react/src/routes/resume.$executionId'
 import { Route as DotDotDotDotDotDotDotDotPackagesReactSrcRoutesIntegrationsDotnamespaceRouteImport } from './../../../packages/react/src/routes/integrations.$namespace'
@@ -53,19 +52,14 @@ const DotDotDotDotDotDotDotDotPackagesReactSrcRoutesPoliciesRoute =
     path: '/{-$orgSlug}/policies',
     getParentRoute: () => rootRouteImport,
   } as any)
+const OrgRoute = OrgRouteImport.update({
+  id: '/{-$orgSlug}/org',
+  path: '/{-$orgSlug}/org',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiKeysRoute = ApiKeysRouteImport.update({
   id: '/{-$orgSlug}/api-keys',
   path: '/{-$orgSlug}/api-keys',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const AdminRoute = AdminRouteImport.update({
-  id: '/{-$orgSlug}/admin',
-  path: '/{-$orgSlug}/admin',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const JoinDotcodeRoute = JoinDotcodeRouteImport.update({
-  id: '/join/$code',
-  path: '/join/$code',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DotDotDotDotDotDotDotDotPackagesReactSrcRoutesToolkitsDottoolkitSlugRoute =
@@ -111,9 +105,8 @@ const DotDotDotDotDotDotDotDotPackagesReactSrcRoutesIntegrationsDotaddDotpluginK
   )
 
 export interface FileRoutesByFullPath {
-  '/join/$code': typeof JoinDotcodeRoute
-  '/{-$orgSlug}/admin': typeof AdminRoute
   '/{-$orgSlug}/api-keys': typeof ApiKeysRoute
+  '/{-$orgSlug}/org': typeof OrgRoute
   '/{-$orgSlug}/policies': typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesPoliciesRoute
   '/{-$orgSlug}/secrets': typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesSecretsRoute
   '/{-$orgSlug}/toolkits': typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesToolkitsRouteWithChildren
@@ -126,9 +119,8 @@ export interface FileRoutesByFullPath {
   '/{-$orgSlug}/plugins/$pluginId/$': typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesPluginsDotpluginIdDotsplatRoute
 }
 export interface FileRoutesByTo {
-  '/join/$code': typeof JoinDotcodeRoute
-  '/{-$orgSlug}/admin': typeof AdminRoute
   '/{-$orgSlug}/api-keys': typeof ApiKeysRoute
+  '/{-$orgSlug}/org': typeof OrgRoute
   '/{-$orgSlug}/policies': typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesPoliciesRoute
   '/{-$orgSlug}/secrets': typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesSecretsRoute
   '/{-$orgSlug}/toolkits': typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesToolkitsRouteWithChildren
@@ -142,9 +134,8 @@ export interface FileRoutesByTo {
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
-  '/join/$code': typeof JoinDotcodeRoute
-  '/{-$orgSlug}/admin': typeof AdminRoute
   '/{-$orgSlug}/api-keys': typeof ApiKeysRoute
+  '/{-$orgSlug}/org': typeof OrgRoute
   '/{-$orgSlug}/policies': typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesPoliciesRoute
   '/{-$orgSlug}/secrets': typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesSecretsRoute
   '/{-$orgSlug}/toolkits': typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesToolkitsRouteWithChildren
@@ -159,9 +150,8 @@ export interface FileRoutesById {
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    | '/join/$code'
-    | '/{-$orgSlug}/admin'
     | '/{-$orgSlug}/api-keys'
+    | '/{-$orgSlug}/org'
     | '/{-$orgSlug}/policies'
     | '/{-$orgSlug}/secrets'
     | '/{-$orgSlug}/toolkits'
@@ -174,9 +164,8 @@ export interface FileRouteTypes {
     | '/{-$orgSlug}/plugins/$pluginId/$'
   fileRoutesByTo: FileRoutesByTo
   to:
-    | '/join/$code'
-    | '/{-$orgSlug}/admin'
     | '/{-$orgSlug}/api-keys'
+    | '/{-$orgSlug}/org'
     | '/{-$orgSlug}/policies'
     | '/{-$orgSlug}/secrets'
     | '/{-$orgSlug}/toolkits'
@@ -189,9 +178,8 @@ export interface FileRouteTypes {
     | '/{-$orgSlug}/plugins/$pluginId/$'
   id:
     | '__root__'
-    | '/join/$code'
-    | '/{-$orgSlug}/admin'
     | '/{-$orgSlug}/api-keys'
+    | '/{-$orgSlug}/org'
     | '/{-$orgSlug}/policies'
     | '/{-$orgSlug}/secrets'
     | '/{-$orgSlug}/toolkits'
@@ -205,9 +193,8 @@ export interface FileRouteTypes {
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
-  JoinDotcodeRoute: typeof JoinDotcodeRoute
-  AdminRoute: typeof AdminRoute
   ApiKeysRoute: typeof ApiKeysRoute
+  OrgRoute: typeof OrgRoute
   DotDotDotDotDotDotDotDotPackagesReactSrcRoutesPoliciesRoute: typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesPoliciesRoute
   DotDotDotDotDotDotDotDotPackagesReactSrcRoutesSecretsRoute: typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesSecretsRoute
   DotDotDotDotDotDotDotDotPackagesReactSrcRoutesToolkitsRoute: typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesToolkitsRouteWithChildren
@@ -256,25 +243,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DotDotDotDotDotDotDotDotPackagesReactSrcRoutesPoliciesRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/{-$orgSlug}/org': {
+      id: '/{-$orgSlug}/org'
+      path: '/{-$orgSlug}/org'
+      fullPath: '/{-$orgSlug}/org'
+      preLoaderRoute: typeof OrgRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/{-$orgSlug}/api-keys': {
       id: '/{-$orgSlug}/api-keys'
       path: '/{-$orgSlug}/api-keys'
       fullPath: '/{-$orgSlug}/api-keys'
       preLoaderRoute: typeof ApiKeysRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/{-$orgSlug}/admin': {
-      id: '/{-$orgSlug}/admin'
-      path: '/{-$orgSlug}/admin'
-      fullPath: '/{-$orgSlug}/admin'
-      preLoaderRoute: typeof AdminRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/join/$code': {
-      id: '/join/$code'
-      path: '/join/$code'
-      fullPath: '/join/$code'
-      preLoaderRoute: typeof JoinDotcodeRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/{-$orgSlug}/toolkits/$toolkitSlug': {
@@ -331,9 +311,8 @@ const DotDotDotDotDotDotDotDotPackagesReactSrcRoutesToolkitsRouteWithChildren =
   )
 
 const rootRouteChildren: RootRouteChildren = {
-  JoinDotcodeRoute: JoinDotcodeRoute,
-  AdminRoute: AdminRoute,
   ApiKeysRoute: ApiKeysRoute,
+  OrgRoute: OrgRoute,
   DotDotDotDotDotDotDotDotPackagesReactSrcRoutesPoliciesRoute:
     DotDotDotDotDotDotDotDotPackagesReactSrcRoutesPoliciesRoute,
   DotDotDotDotDotDotDotDotPackagesReactSrcRoutesSecretsRoute:

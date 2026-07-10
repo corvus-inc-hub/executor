@@ -1,271 +1,268 @@
-import { Effect, Layer } from "effect";
-import { oAuthDiscoveryMetadata, oAuthProtectedResourceMetadata } from "better-auth/plugins";
+import { Effect, Layer, Result } from "effect";
 
-import { IdentityProvider } from "@executor-js/api/server";
 import {
   authenticated,
+  forbidden,
   McpAuthProvider,
   unauthorized,
+  unavailable,
   type AuthOutcome,
   type McpDiscoveryRoute,
   type Principal,
 } from "@executor-js/host-mcp";
 
-import { BetterAuth } from "../auth/better-auth";
+import type { WorkOSIdentityDeps } from "../auth/identity";
+import { cachedRemoteJwks, verifyWorkOSAccessToken } from "../auth/jwt";
+import {
+  authorizeServiceOrganization,
+  authorizeUserOrganization,
+  ORG_SELECTOR_HEADER,
+  organizationIdFromSelector,
+  resolveOrganization,
+} from "../auth/organization";
 import { MCP_ORIGINAL_PATH_HEADER, mcpResourcePathFromOriginalPath } from "./org-path";
-
-// ---------------------------------------------------------------------------
-// Self-host McpAuthProvider adapter, backed by Better Auth's mcp() plugin.
-//
-// Responsibilities the envelope needs:
-//
-//  1. DECLARE the discovery routes it owns. MCP clients probe the true origin
-//     ROOT, but Better Auth's handler only mounts the well-known docs under
-//     /api/auth/.well-known/*, so we re-emit BOTH docs at the bare origin root
-//     via the plugin's helpers. The envelope registers a GET for each declared
-//     path.
-//
-//  2. `resourceMetadataUrl(request)` — the absolute `resource_metadata` URL the
-//     401 challenge points at: the bare origin-root protected-resource doc
-//     (`<origin>/.well-known/oauth-protected-resource`) UNLESS the request came
-//     in org-scoped (`/<org>/mcp…`), in which case both this and the PRM
-//     document's `resource` field must echo the org-scoped form back — the MCP
-//     SDK client enforces that the advertised `resource` is a same-origin
-//     path-prefix of the URL it actually dialed (RFC 9728). The strip
-//     middleware (../serve.ts, ../../vite.config.ts) rewrites org-scoped
-//     requests to the bare route before they reach here, so the org prefix is
-//     recovered from MCP_ORIGINAL_PATH_HEADER, not the live request path.
-//
-//  3. `authenticate(request)` resolving an MCP principal as a typed AuthOutcome,
-//     trying two credential shapes in order:
-//       a. The mcp() OAuth opaque bearer (getMcpSession) — ONLY when an
-//          `Authorization: Bearer …` header is present (avoids a getMcpSession
-//          round-trip on every cookie request). getMcpSession does NOT validate
-//          `accessTokenExpiresAt`, so we ENFORCE expiry ourselves before
-//          accepting it, then enrich the bare {userId} into a full principal.
-//       b. The existing IdentityProvider path (session cookie / bearer-session /
-//          x-api-key) — preserves API-key Bearer access for the API + MCP.
-//     Anything that fails or yields nothing collapses to `Unauthorized`; the
-//     envelope renders the 401 + challenge. Self-host always has an org, so it
-//     never returns Forbidden/Unavailable.
-//
-// The OAuth endpoints themselves (/api/auth/mcp/{register,authorize,token})
-// stay on the Better Auth handler mounted at /api/auth — NOT in this seam.
-// ---------------------------------------------------------------------------
 
 const PROTECTED_RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource";
 const TOOLKIT_PROTECTED_RESOURCE_METADATA_PATH = `${PROTECTED_RESOURCE_METADATA_PATH}/mcp/toolkits/:toolkitSlug`;
 const AUTHORIZATION_SERVER_METADATA_PATH = "/.well-known/oauth-authorization-server";
-const TOOLKIT_MCP_SEGMENT = "/mcp/toolkits/";
 
-const parseRoles = (role: string | null | undefined): ReadonlyArray<string> =>
-  (role ?? "user")
-    .split(",")
-    .map((r) => r.trim())
-    .filter((r) => r.length > 0);
-
-/**
- * The admin plugin's `role` column is populated at runtime but isn't part of
- * Better Auth's static base-user type, so read it through a single typed view.
- */
-const userRole = (user: object): string | null => {
-  const role = (user as { readonly role?: unknown }).role;
-  return typeof role === "string" ? role : null;
-};
-
-const hasBearer = (request: Request): boolean =>
-  (request.headers.get("authorization") ?? "").startsWith("Bearer ");
-
-/**
- * The org-scoped pathname the client actually dialed, recovered from the strip
- * middleware's header (see ./org-path.ts). `null` for a request that was never
- * org-scoped (already-bare `/mcp…`), OR whose header value isn't one the
- * middleware would itself have set — never trust an arbitrary client-supplied
- * string here, even though the middleware already strips a spoofed header at
- * its own boundary; this is a second, cheap check against reflecting garbage
- * into a security-relevant URL.
- */
-const originalOrgScopedPathFor = (request: Request): string | null => {
-  const header = request.headers.get(MCP_ORIGINAL_PATH_HEADER);
-  return header ? mcpResourcePathFromOriginalPath(header) : null;
-};
-
-/** The pathname to derive the toolkit slug / resource path from: the
- * org-scoped original when the client dialed org-scoped, else the request's
- * own (already-bare) path. */
-const effectivePathnameFor = (request: Request): string =>
-  originalOrgScopedPathFor(request) ?? new URL(request.url).pathname;
-
-const toolkitSlugFromRequest = (request: Request): string | null => {
-  const pathname = effectivePathnameFor(request);
-  const index = pathname.indexOf(TOOLKIT_MCP_SEGMENT);
-  if (index < 0) return null;
-  const slug = pathname.slice(index + TOOLKIT_MCP_SEGMENT.length).split("/", 1)[0];
-  return slug && slug.length > 0 ? slug : null;
-};
-
-const mcpResourcePathFor = (request: Request): string => {
-  const orgScoped = originalOrgScopedPathFor(request);
-  if (orgScoped) return orgScoped;
-  const toolkitSlug = toolkitSlugFromRequest(request);
-  return toolkitSlug ? `/mcp/toolkits/${toolkitSlug}` : "/mcp";
-};
-
-/**
- * Absolute protected-resource metadata URL for the 401 challenge. Derive the
- * origin from `baseURL` when set; otherwise from the live request so the URL is
- * never relative (cloud-drop-in: a self-host behind any host resolves right).
- * When the client dialed org-scoped, echo the org-scoped PRM path back (see
- * `mcpResourcePathFor`) so the MCP SDK's same-origin resource check passes.
- */
-const resourceMetadataUrlFor = (baseURL: string | undefined, request: Request): string => {
-  const origin = baseURL && baseURL.length > 0 ? baseURL : new URL(request.url).origin;
-  const orgScoped = originalOrgScopedPathFor(request);
-  if (orgScoped) return `${origin}${PROTECTED_RESOURCE_METADATA_PATH}${orgScoped}`;
-  const toolkitSlug = toolkitSlugFromRequest(request);
-  return toolkitSlug
-    ? `${origin}${PROTECTED_RESOURCE_METADATA_PATH}/mcp/toolkits/${toolkitSlug}`
-    : `${origin}${PROTECTED_RESOURCE_METADATA_PATH}`;
-};
-
-const resourceUrlFor = (baseURL: string | undefined, request: Request): string => {
-  const origin = baseURL && baseURL.length > 0 ? baseURL : new URL(request.url).origin;
-  return `${origin}${mcpResourcePathFor(request)}`;
-};
-
-const toolkitProtectedResourceMetadata = (
-  request: Request,
-  response: Response,
-  baseURL: string | undefined,
-): Effect.Effect<Response> => {
-  const toolkitSlug = toolkitSlugFromRequest(request);
-  if (!toolkitSlug) return Effect.succeed(response);
-  return Effect.promise(async () => {
-    const body = (await response.json()) as Record<string, unknown>;
-    const headers = new Headers(response.headers);
-    headers.set("content-type", "application/json");
-    return new Response(JSON.stringify({ ...body, resource: resourceUrlFor(baseURL, request) }), {
-      status: response.status,
-      statusText: response.statusText,
-      headers,
-    });
+const json = (value: unknown, status = 200): Response =>
+  new Response(JSON.stringify(value), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "access-control-allow-origin": "*",
+      "cache-control": "no-store",
+    },
   });
+
+const originalResourcePath = (request: Request): string | null => {
+  const original = request.headers.get(MCP_ORIGINAL_PATH_HEADER);
+  return original ? mcpResourcePathFromOriginalPath(original) : null;
 };
 
-export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | IdentityProvider> =
-  Layer.effect(
-    McpAuthProvider,
-    Effect.gen(function* () {
-      const { auth, organizationId, organizationName, organizationSlug } = yield* BetterAuth;
-      const fallback = yield* IdentityProvider;
+const toolkitSlug = (request: Request): string | null => {
+  const pathname = originalResourcePath(request) ?? new URL(request.url).pathname;
+  const marker = "/mcp/toolkits/";
+  const index = pathname.indexOf(marker);
+  if (index < 0) return null;
+  return pathname.slice(index + marker.length).split("/", 1)[0] || null;
+};
 
-      const asMetadata = oAuthDiscoveryMetadata(auth);
-      const prMetadata = oAuthProtectedResourceMetadata(auth);
+const resourcePath = (request: Request): string => {
+  const original = originalResourcePath(request);
+  if (original) return original;
+  const toolkit = toolkitSlug(request);
+  return toolkit ? `/mcp/toolkits/${toolkit}` : "/mcp";
+};
 
-      const baseURL = auth.options.baseURL;
-      const resourceMetadataUrl = (request: Request): string =>
-        resourceMetadataUrlFor(baseURL, request);
+const resourceUrl = (deps: WorkOSIdentityDeps, request: Request): string =>
+  new URL(resourcePath(request), deps.config.redirectUri).toString();
 
-      // RFC 9728 challenge string carried on the Unauthorized outcome. Same shape
-      // as the envelope's default; we supply it explicitly to keep the 401's
-      // `WWW-Authenticate` fully owned by the provider.
-      const challengeFor = (request: Request): string =>
-        `Bearer resource_metadata="${resourceMetadataUrl(request)}"`;
+const metadataUrl = (deps: WorkOSIdentityDeps, request: Request): string => {
+  const path = originalResourcePath(request);
+  const toolkit = toolkitSlug(request);
+  const suffix = path ? path : toolkit ? `/mcp/toolkits/${toolkit}` : "";
+  return new URL(
+    `${PROTECTED_RESOURCE_METADATA_PATH}${suffix}`,
+    deps.config.redirectUri,
+  ).toString();
+};
 
-      const discoveryRoutes: ReadonlyArray<McpDiscoveryRoute> = [
-        {
-          path: PROTECTED_RESOURCE_METADATA_PATH,
-          handler: (request) =>
-            Effect.promise(() => prMetadata(request)).pipe(
-              Effect.flatMap((response) =>
-                toolkitProtectedResourceMetadata(request, response, baseURL),
-              ),
-            ),
-        },
-        {
-          path: TOOLKIT_PROTECTED_RESOURCE_METADATA_PATH,
-          handler: (request) =>
-            Effect.promise(() => prMetadata(request)).pipe(
-              Effect.flatMap((response) =>
-                toolkitProtectedResourceMetadata(request, response, baseURL),
-              ),
-            ),
-        },
-        {
-          path: AUTHORIZATION_SERVER_METADATA_PATH,
-          handler: (request) => Effect.promise(() => asMetadata(request)),
-        },
-      ];
+const organizationSelector = (request: Request): string | null => {
+  const path = originalResourcePath(request);
+  const [firstSegment] = path?.split("/").filter(Boolean) ?? [];
+  const pathSelector = firstSegment && firstSegment !== "mcp" ? firstSegment : null;
+  return pathSelector ?? request.headers.get(ORG_SELECTOR_HEADER)?.trim() ?? null;
+};
 
-      // Resolved once; `internalAdapter.findUserById` enriches an OAuth userId.
-      const context = yield* Effect.promise(() => auth.$context);
+const hasAudience = (audience: string | readonly string[] | undefined, expected: string): boolean =>
+  typeof audience === "string" ? audience === expected : (audience?.includes(expected) ?? false);
 
-      /** Enrich a bare OAuth `userId` into the full provider-neutral principal. */
-      const principalFromUserId = (userId: string): Effect.Effect<Principal | null> =>
-        Effect.gen(function* () {
-          const user = yield* Effect.promise(() => context.internalAdapter.findUserById(userId));
-          if (!user) return null;
-          return {
-            accountId: user.id,
-            // Single-org self-host: OAuth tokens carry no active org, so pin to
-            // the seeded org (same default as the cookie/api-key path).
-            organizationId,
-            organizationName,
-            organizationSlug,
-            email: user.email ?? "",
-            name: user.name ?? null,
-            avatarUrl: user.image ?? null,
-            roles: parseRoles(userRole(user)),
-          } satisfies Principal;
-        });
+const challenge = (deps: WorkOSIdentityDeps, request: Request, invalid = false): string =>
+  [
+    "Bearer",
+    ...(invalid ? ['error="invalid_token"'] : []),
+    `resource_metadata="${metadataUrl(deps, request)}"`,
+  ].join(" ");
 
-      /** (a) The mcp() OAuth opaque bearer, with self-enforced expiry. */
-      const authenticateOAuthBearer = (request: Request): Effect.Effect<Principal | null> =>
-        Effect.gen(function* () {
-          const session = yield* Effect.promise(() =>
-            auth.api.getMcpSession({ headers: request.headers }),
-          );
-          if (!session) return null;
-          // GOTCHA: getMcpSession does NOT validate accessTokenExpiresAt — an
-          // expired token still resolves. Reject it here.
-          if (new Date(session.accessTokenExpiresAt).getTime() < Date.now()) return null;
-          return yield* principalFromUserId(session.userId);
-        }).pipe(Effect.orElseSucceed(() => null));
+const principal = (
+  accountId: string,
+  organization: { readonly id: string; readonly name: string; readonly slug: string },
+  roles: readonly string[],
+): Principal => ({
+  accountId,
+  organizationId: organization.id,
+  organizationName: organization.name,
+  email: "",
+  name: null,
+  avatarUrl: null,
+  roles,
+});
 
-      /** (b) The existing cookie / bearer-session / x-api-key path. The fallback's
-       * api `Principal` shape is byte-identical to host-mcp's `Principal`. */
-      const authenticateSession = (request: Request): Effect.Effect<Principal | null> =>
-        fallback.authenticate(request).pipe(
-          Effect.catchTags({
-            Unauthorized: () => Effect.succeed(null),
-            NoOrganization: () => Effect.succeed(null),
-          }),
-        );
+const authorizeJwt = (
+  deps: WorkOSIdentityDeps,
+  request: Request,
+  token: string,
+): Effect.Effect<AuthOutcome> =>
+  Effect.gen(function* () {
+    const verified = yield* verifyWorkOSAccessToken(
+      token,
+      cachedRemoteJwks(`${deps.config.authkitDomain}/oauth2/jwks`),
+      {
+        issuer: deps.config.authkitDomain,
+        audience: [resourceUrl(deps, request), deps.config.connectAudience],
+      },
+    ).pipe(Effect.result);
+    if (Result.isFailure(verified)) {
+      return verified.failure.reason === "system"
+        ? unavailable("Authentication temporarily unavailable")
+        : unauthorized(challenge(deps, request, true));
+    }
+    if (!verified.success?.organizationId) {
+      return forbidden("No organization in WorkOS token", -32001);
+    }
 
-      /**
-       * Try the OAuth bearer ONLY when a Bearer header is present (no
-       * getMcpSession round-trip on cookie requests), then the cookie/api-key
-       * fallback. Self-host always pins an org, so the outcome is always
-       * Authenticated or Unauthorized.
-       */
-      const authenticate = (request: Request): Effect.Effect<AuthOutcome> =>
-        (hasBearer(request)
-          ? authenticateOAuthBearer(request).pipe(
-              Effect.flatMap((principal) =>
-                principal ? Effect.succeed(principal) : authenticateSession(request),
-              ),
-            )
-          : authenticateSession(request)
-        ).pipe(
-          Effect.map((principal) =>
-            principal ? authenticated(principal) : unauthorized(challengeFor(request)),
+    if (verified.success.subject.startsWith("client_")) {
+      if (
+        verified.success.organizationId !== deps.config.serviceOrganizationId ||
+        !hasAudience(verified.success.payload.aud, deps.config.connectAudience)
+      ) {
+        return unauthorized(challenge(deps, request, true));
+      }
+      const selected = organizationSelector(request);
+      if (!selected) return forbidden("A target organization is required", -32001);
+      const organizationId = yield* organizationIdFromSelector(deps, selected).pipe(
+        Effect.orElseSucceed(() => null),
+      );
+      if (!organizationId) return forbidden("Organization is not authorized", -32001);
+      const authorized = yield* authorizeServiceOrganization(
+        deps,
+        verified.success.subject,
+        organizationId,
+      ).pipe(Effect.result);
+      if (Result.isFailure(authorized)) return unavailable("Organization lookup unavailable");
+      return authorized.success
+        ? authenticated(principal(verified.success.subject, authorized.success, ["service"]))
+        : forbidden("Organization is not authorized", -32001);
+    }
+
+    if (!hasAudience(verified.success.payload.aud, resourceUrl(deps, request))) {
+      return unauthorized(challenge(deps, request, true));
+    }
+    const selected = organizationSelector(request);
+    const organizationId = selected
+      ? yield* organizationIdFromSelector(deps, selected).pipe(Effect.orElseSucceed(() => null))
+      : verified.success.organizationId;
+    if (!organizationId || organizationId !== verified.success.organizationId) {
+      return forbidden("Organization is not authorized", -32001);
+    }
+
+    const authorized = yield* authorizeUserOrganization(
+      deps,
+      verified.success.subject,
+      organizationId,
+    ).pipe(Effect.result);
+    if (Result.isFailure(authorized)) return unavailable("Organization lookup unavailable");
+    return authorized.success
+      ? authenticated(
+          principal(verified.success.subject, authorized.success, authorized.success.roles),
+        )
+      : forbidden("Organization is not authorized", -32001);
+  });
+
+const authorizeApiKey = (
+  deps: WorkOSIdentityDeps,
+  request: Request,
+  token: string,
+): Effect.Effect<AuthOutcome> =>
+  Effect.gen(function* () {
+    const key = yield* deps.apiKeys.validate(token).pipe(Effect.result);
+    if (Result.isFailure(key)) return unavailable("API key validation unavailable");
+    if (!key.success) return unauthorized(challenge(deps, request, true));
+
+    const selected = organizationSelector(request);
+    const selectedId = selected
+      ? yield* organizationIdFromSelector(deps, selected).pipe(Effect.orElseSucceed(() => null))
+      : key.success.organizationId;
+    if (!selectedId || selectedId !== key.success.organizationId) {
+      return forbidden("Organization is not authorized", -32001);
+    }
+
+    if (key.success.accountId.startsWith("api-key:")) {
+      const organization = yield* resolveOrganization(deps, selectedId).pipe(Effect.result);
+      if (Result.isFailure(organization)) return unavailable("Organization lookup unavailable");
+      return organization.success
+        ? authenticated(principal(key.success.accountId, organization.success, ["service"]))
+        : forbidden("Organization is not authorized", -32001);
+    }
+
+    const organization = yield* authorizeUserOrganization(
+      deps,
+      key.success.accountId,
+      selectedId,
+    ).pipe(Effect.result);
+    if (Result.isFailure(organization)) return unavailable("Organization lookup unavailable");
+    return organization.success
+      ? authenticated(
+          principal(key.success.accountId, organization.success, organization.success.roles),
+        )
+      : forbidden("Organization is not authorized", -32001);
+  });
+
+export const makeSelfHostMcpAuth = (deps: WorkOSIdentityDeps): Layer.Layer<McpAuthProvider> =>
+  Layer.succeed(McpAuthProvider)({
+    discoveryRoutes: [
+      {
+        path: PROTECTED_RESOURCE_METADATA_PATH,
+        handler: (request) =>
+          Effect.succeed(
+            json({
+              resource: resourceUrl(deps, request),
+              authorization_servers: [deps.config.authkitDomain],
+              bearer_methods_supported: ["header"],
+              scopes_supported: deps.config.mcpScopes,
+            }),
           ),
-        );
-
-      return {
-        discoveryRoutes,
-        resourceMetadataUrl,
-        authenticate,
-      };
-    }),
-  );
+      },
+      {
+        path: TOOLKIT_PROTECTED_RESOURCE_METADATA_PATH,
+        handler: (request) =>
+          Effect.succeed(
+            json({
+              resource: resourceUrl(deps, request),
+              authorization_servers: [deps.config.authkitDomain],
+              bearer_methods_supported: ["header"],
+              scopes_supported: deps.config.mcpScopes,
+            }),
+          ),
+      },
+      {
+        path: AUTHORIZATION_SERVER_METADATA_PATH,
+        handler: () =>
+          Effect.tryPromise({
+            try: async () => {
+              const response = await fetch(
+                `${deps.config.authkitDomain}/.well-known/oauth-authorization-server`,
+              );
+              return response.ok
+                ? json(await response.json())
+                : json({ error: "upstream_error" }, 502);
+            },
+            catch: () => undefined,
+          }).pipe(Effect.catch(() => Effect.succeed(json({ error: "upstream_error" }, 502)))),
+      },
+    ] satisfies ReadonlyArray<McpDiscoveryRoute>,
+    resourceMetadataUrl: (request) => metadataUrl(deps, request),
+    authenticate: (request) => {
+      const authorization = request.headers.get("authorization");
+      if (!authorization?.startsWith("Bearer ")) {
+        return Effect.succeed(unauthorized(challenge(deps, request)));
+      }
+      const token = authorization.slice(7).trim();
+      if (!token) return Effect.succeed(unauthorized(challenge(deps, request, true)));
+      return token.split(".").length === 3
+        ? authorizeJwt(deps, request, token)
+        : authorizeApiKey(deps, request, token);
+    },
+  });

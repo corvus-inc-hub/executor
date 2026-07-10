@@ -1,95 +1,122 @@
 ---
-title: Self Hosted Docker
-description: "Run the whole Executor server in one Docker container over a SQLite file: API, MCP, auth, code execution, and the web UI."
+title: MNFST Self-Hosted Docker
+description: "Run Executor's API, MCP, integrations, execution runtime, and web console in one WorkOS-authenticated container."
 ---
 
-The self-hosted image is the entire Executor server in a single container: the
-typed API, the MCP server, authentication, QuickJS code execution, and the web
-console, all in one process over a libSQL (SQLite) file. There is no external
-database, worker, or proxy to run.
+The MNFST self-hosted image runs Executor's API, MCP server, integrations,
+encrypted credential plane, QuickJS runtime, and web console in one container.
+SQLite state remains under `/data`. WorkOS AuthKit is the only identity plane.
 
-## Run it
+<Warning>
+  This fork has no local first-user setup, password login, bootstrap admin, or local invite-code
+  flow. Complete the WorkOS configuration before starting the container. Missing identity
+  configuration fails the boot.
+</Warning>
 
-Using the published image:
+## Run a pinned image
+
+Use an immutable arm64 digest and an explicit environment file:
 
 ```bash
 docker run -d \
   --name executor-selfhost \
   -p 4788:4788 \
+  --env-file /etc/executor/executor.env \
   -v executor-data:/data \
-  ghcr.io/usefulsoftwareco/executor-selfhost:latest
+  ghcr.io/OWNER/executor-selfhost@sha256:DIGEST
 ```
 
-Or build from a clone of the [repo](https://github.com/UsefulSoftwareCo/executor),
-from `apps/host-selfhost`:
+Open the configured `EXECUTOR_WEB_BASE_URL`. Browser authentication redirects
+to AuthKit and returns through `/api/auth/callback`.
+
+## Required WorkOS resources
+
+Configure an AuthKit application, WorkOS organization roles, and the exact
+redirect URI. Configure a WorkOS Connect OAuth application for CLI device auth.
+For MCP, enable CIMD and register each exact MCP resource URL used by clients.
+For Manifest Trigger credential delivery, create an M2M application owned by
+the platform service organization with the single `credentials:lease`
+permission. Each request names the customer organization explicitly. Provider
+resource scopes belong to the connected credential and are not WorkOS
+permissions.
+
+## Environment
+
+| Variable                                        | Required    | Purpose                                                      |
+| ----------------------------------------------- | ----------- | ------------------------------------------------------------ |
+| `EXECUTOR_WEB_BASE_URL`                         | yes         | Exact public Executor origin.                                |
+| `EXECUTOR_AUTH_PROVIDER`                        | recommended | `workos-authkit`. Any other value fails.                     |
+| `WORKOS_API_KEY`                                | yes         | Server-side WorkOS API key.                                  |
+| `WORKOS_CLIENT_ID`                              | yes         | AuthKit client ID and default Connect audience.              |
+| `WORKOS_COOKIE_PASSWORD`                        | yes         | WorkOS sealed-session password, at least 32 characters.      |
+| `WORKOS_AUTHKIT_DOMAIN`                         | yes         | AuthKit issuer origin.                                       |
+| `WORKOS_REDIRECT_URI`                           | no          | Defaults to `<web base URL>/api/auth/callback`.              |
+| `WORKOS_SERVICE_ORGANIZATION_ID`                | yes         | Platform organization that owns allowlisted M2M apps.        |
+| `WORKOS_ALLOWED_ORGANIZATION_IDS`               | no          | Optional customer organization allowlist.                    |
+| `WORKOS_CLI_CLIENT_ID`                          | for CLI     | Public Connect OAuth client used by device auth.             |
+| `WORKOS_CONNECT_AUDIENCE`                       | no          | Connect JWT audience, default `WORKOS_CLIENT_ID`.            |
+| `WORKOS_M2M_ALLOWED_CLIENT_IDS`                 | for M2M     | Allowed service client IDs. Empty denies all M2M identities. |
+| `WORKOS_CREDENTIAL_LEASE_SCOPE`                 | no          | Required lease scope, default `credentials:lease`.           |
+| `EXECUTOR_CREDENTIAL_LEASE_DEFAULT_TTL_SECONDS` | no          | Default 300.                                                 |
+| `EXECUTOR_CREDENTIAL_LEASE_MAX_TTL_SECONDS`     | no          | Default 900.                                                 |
+| `EXECUTOR_SECRET_KEY`                           | recommended | Master key for encrypted Executor credentials.               |
+| `EXECUTOR_ALLOW_LOCAL_NETWORK`                  | no          | Allow sandbox access to private networks. Default `false`.   |
+
+Always mount `/data`. When `EXECUTOR_SECRET_KEY` is unset, Executor generates
+`/data/secret.key`; losing it makes existing encrypted credentials unreadable.
+
+## Manifest Trigger lease
+
+`POST /api/credential-leases` accepts a WorkOS M2M bearer token and an
+organization/workspace/run identity, organization-owned credential
+reference, purpose, resource scopes, and disposal TTL. The response may contain
+requested environment and `0600` secret-file material. `disposeAfter` is a
+Manifest Sandbox cleanup deadline, not a claim that Executor revoked the source
+credential. Local receipts contain only metadata, timestamps, scopes, cleanup
+semantics, and SHA-256 hashes.
+
+The endpoint fails closed when identity, organization, scopes, connection
+lookup, credential resolution, OAuth refresh, requested variables, or receipt
+persistence cannot be verified. It never returns placeholder credential
+material.
+
+## Build the infrastructure image
+
+Build from the repository root and push a `linux/arm64` image:
 
 ```bash
-docker compose up -d --build
+SOURCE_URL=https://github.com/OWNER/executor
+SOURCE_REVISION=$(git rev-parse HEAD)
+IMAGE=ghcr.io/OWNER/executor-selfhost:mnfst-${SOURCE_REVISION}
+
+docker buildx build \
+  --platform linux/arm64 \
+  --file apps/host-selfhost/Dockerfile \
+  --build-arg EXECUTOR_IMAGE_SOURCE="$SOURCE_URL" \
+  --build-arg EXECUTOR_SOURCE_REVISION="$SOURCE_REVISION" \
+  --build-arg EXECUTOR_UPSTREAM_REVISION=724600c1a26594f23388e6cac067f86a62cc3764 \
+  --tag "$IMAGE" \
+  --push \
+  .
+
+docker buildx imagetools inspect "$IMAGE"
 ```
 
-No configuration is required. Open [http://localhost:4788](http://localhost:4788);
-the first person to create an account becomes the owner. After that, people join
-through single-use invite links you mint from the **Admin** page, and open signup
-is closed.
+Consume the resulting digest, not the mutable tag. The image must report
+`linux/arm64` and these provenance labels:
 
-## Storage
-
-Everything that must persist (the SQLite database and the generated encryption
-keys) lives in the data directory, mounted at **`/data`** in the container. Always
-mount a volume there so it survives restarts and upgrades:
-
-```bash
--v executor-data:/data     # named volume (what compose uses)
-# or a host path:
--v /srv/executor:/data
+```text
+org.opencontainers.image.source=<owned fork URL>
+org.opencontainers.image.revision=<full owned-fork commit SHA>
+io.mnfst.executor.auth-provider=workos-authkit
+io.mnfst.executor.upstream-revision=724600c1a26594f23388e6cac067f86a62cc3764
 ```
 
-Back it up by snapshotting that volume (or copying `/data`, primarily `data.db`).
-`EXECUTOR_DATA_DIR` (default `/data`) sets the directory, and `EXECUTOR_DB_PATH`
-(default `<data dir>/data.db`) sets the database file.
-
-## Environment variables
-
-Everything is optional: a bare run boots a working instance. The defaults below are
-the container defaults.
-
-| Variable                            | Default                         | Purpose                                                                                         |
-| ----------------------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `PORT`                              | `4788`                          | HTTP port the server listens on.                                                                |
-| `EXECUTOR_HOST`                     | `0.0.0.0`                       | Bind address. The image binds all interfaces.                                                   |
-| `EXECUTOR_DATA_DIR`                 | `/data`                         | Directory holding the database and generated keys.                                              |
-| `EXECUTOR_DB_PATH`                  | `<data dir>/data.db`            | SQLite database file.                                                                           |
-| `EXECUTOR_WEB_BASE_URL`             | auto (`http://localhost:4788`)  | Public URL browsers use. Required behind a domain or TLS (see below).                           |
-| `BETTER_AUTH_SECRET`                | generated, persisted in `/data` | Session secret (32+ chars). Rotating it signs everyone out.                                     |
-| `EXECUTOR_SECRET_KEY`               | generated, persisted in `/data` | Master key encrypting stored secrets. Set it to manage it yourself.                             |
-| `EXECUTOR_BOOTSTRAP_ADMIN_EMAIL`    | unset                           | Pre-create the admin headlessly (with the password below); skips browser first-run.             |
-| `EXECUTOR_BOOTSTRAP_ADMIN_PASSWORD` | unset                           | Password for the bootstrap admin.                                                               |
-| `EXECUTOR_BOOTSTRAP_ADMIN_NAME`     | `Admin`                         | Display name for the bootstrap admin.                                                           |
-| `EXECUTOR_ORG_NAME`                 | `Default`                       | Display name of the single org every user joins.                                                |
-| `EXECUTOR_ORG_SLUG`                 | `default`                       | URL slug for that org.                                                                          |
-| `EXECUTOR_ALLOW_LOCAL_NETWORK`      | `false`                         | Allow sandboxed code to reach loopback / private addresses. Keep off unless you trust the code. |
-
-## Behind a domain or TLS
-
-<Warning>
-  Set `EXECUTOR_WEB_BASE_URL` to the exact public URL you load in the browser (scheme, host, and
-  port). If it does not match, browser logins are rejected with an invalid-origin error.
-</Warning>
-
-```bash
-docker run -d \
-  -p 4788:4788 \
-  -v executor-data:/data \
-  -e EXECUTOR_WEB_BASE_URL=https://executor.example.com \
-  ghcr.io/usefulsoftwareco/executor-selfhost:latest
-```
-
-For a headless deploy (CI or infra-as-code), set `EXECUTOR_BOOTSTRAP_ADMIN_EMAIL`
-and `EXECUTOR_BOOTSTRAP_ADMIN_PASSWORD` to create the admin without the browser
-setup screen.
+Building or publishing this image does not deploy it.
 
 ## Connect an agent
 
-The server exposes a streamable-HTTP MCP endpoint at `/mcp`. Point your client at
-`http://localhost:4788/mcp` (or your public URL). See [MCP Proxy](/mcp-proxy) for
-how that endpoint exposes your integrations.
+MCP is served at `/mcp` and at organization-scoped
+`/<organization-slug>/mcp` URLs. AuthKit publishes the OAuth authorization
+server; Executor publishes protected-resource metadata and verifies the issued
+JWT audience and WorkOS organization before exposing tools.

@@ -1,13 +1,8 @@
-# Self-hosted Executor, single container, no external services.
+# Self-hosted Executor data plane. WorkOS AuthKit supplies identity.
 # Build context is the repo root because Bun workspaces need every member:
 #   docker build -f apps/host-selfhost/Dockerfile -t executor-selfhost .
 #
-# Runtime needs this container plus a volume for the data dir:
-#   docker run -p 4788:4788 -e BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
-#     -e EXECUTOR_BOOTSTRAP_ADMIN_EMAIL=you@example.com \
-#     -e EXECUTOR_BOOTSTRAP_ADMIN_PASSWORD=... \
-#     -e EXECUTOR_WEB_BASE_URL=https://your.domain \
-#     -v executor-data:/data executor-selfhost
+# Runtime needs this container, WorkOS AuthKit configuration, and a data volume.
 
 FROM oven/bun:1 AS prod-deps
 WORKDIR /app
@@ -23,9 +18,15 @@ RUN cd apps/host-selfhost && bun run build
 
 FROM gcr.io/distroless/cc-debian12 AS runtime
 WORKDIR /app
-LABEL org.opencontainers.image.source="https://github.com/UsefulSoftwareCo/executor" \
+ARG EXECUTOR_IMAGE_SOURCE
+ARG EXECUTOR_SOURCE_REVISION
+ARG EXECUTOR_UPSTREAM_REVISION=724600c1a26594f23388e6cac067f86a62cc3764
+LABEL org.opencontainers.image.source="${EXECUTOR_IMAGE_SOURCE}" \
+      org.opencontainers.image.revision="${EXECUTOR_SOURCE_REVISION}" \
       org.opencontainers.image.description="Single-container self-hosted Executor" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      io.mnfst.executor.auth-provider="workos-authkit" \
+      io.mnfst.executor.upstream-revision="${EXECUTOR_UPSTREAM_REVISION}"
 ENV NODE_ENV=production \
     EXECUTOR_HOST=0.0.0.0 \
     PORT=4788 \

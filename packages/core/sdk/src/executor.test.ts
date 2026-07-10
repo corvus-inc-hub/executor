@@ -430,6 +430,27 @@ describe("createExecutor", () => {
     }),
   );
 
+  it.effect("resolves complete credential material for a privileged host", () =>
+    Effect.gen(function* () {
+      const executor = yield* makeTestExecutor({ plugins: [demoPlugin] as const });
+      yield* executor.demo.seed();
+      yield* executor.connections.create({
+        owner: "org",
+        name: CONN,
+        integration: INTEG,
+        template: TEMPLATE,
+        value: "lease-secret",
+      });
+
+      const values = yield* executor.connections.resolveValues({
+        owner: "org",
+        name: CONN,
+        integration: INTEG,
+      });
+      expect(values).toEqual({ token: "lease-secret" });
+    }),
+  );
+
   it.effect("execute on a missing address fails with ToolNotFoundError", () =>
     Effect.gen(function* () {
       const executor = yield* makeTestExecutor({

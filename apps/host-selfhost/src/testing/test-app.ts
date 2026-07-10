@@ -35,10 +35,10 @@ import { ErrorCaptureLive } from "../observability";
 
 // ===========================================================================
 // Self-host TEST harness — the throwaway composition tests use to exercise the
-// shared app graph WITHOUT booting Better Auth.
+// shared app graph WITHOUT booting WorkOS.
 //
-// Production (`makeSelfHostApp`) is unconditional: it always builds Better Auth
-// over the libSQL file, mounts the account API, and serves the real MCP OAuth
+// Production (`makeSelfHostApp`) is unconditional: it always builds WorkOS
+// identity over the libSQL file, mounts the account API, and serves the real MCP
 // seam. Tests that don't need a real auth backend (scope-stack isolation, the
 // QuickJS sandbox, encrypted-secret-at-rest) want a trivial, deterministic
 // identity and no auth secret. That test-only wiring used to live in production
@@ -48,12 +48,8 @@ import { ErrorCaptureLive } from "../observability";
 //   - a test `IdentityProvider` (single-admin or header-driven),
 //   - a stub `McpAuthProvider` (no OAuth Authorization Server; authenticate via
 //     the same injected identity),
-//   - NO account API (Better Auth is never constructed),
+//   - NO account API (WorkOS is never constructed),
 //   - a throwaway libSQL path.
-//
-// Tests that DO need the real Better Auth backend (multi-user sign-up, the MCP
-// OAuth DCR -> authorize -> token flow) use the production `makeSelfHostApiHandler`
-// instead — that path is the honest unconditional composition.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -117,7 +113,7 @@ export const headerIdentityLayer: Layer.Layer<IdentityProvider> = Layer.succeed(
 // ---------------------------------------------------------------------------
 // Stub McpAuthProvider — no OAuth Authorization Server, so the declared metadata
 // docs 404; authentication delegates to the injected test `IdentityProvider`.
-// Keeps /mcp mountable under the test composition without Better Auth.
+// Keeps /mcp mountable under the test composition without WorkOS.
 // ---------------------------------------------------------------------------
 
 const PROTECTED_RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource";

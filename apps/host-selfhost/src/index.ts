@@ -5,5 +5,6 @@ export {
   type SelfHostApiHandler,
   type MakeSelfHostAppOptions,
 } from "./app";
-export { loadConfig, type SelfHostConfig } from "./config";
-export { BetterAuth, buildBetterAuth, betterAuthIdentityLayer } from "./auth";
+export { loadConfig, loadWorkOSConfig, type SelfHostConfig, type WorkOSConfig } from "./config";
+export { makeWorkOSClient, makeWorkOSIdentityLayer } from "./auth";
+export { makeCredentialLeaseHandler, makeCredentialLeaseService } from "./credential-leases";

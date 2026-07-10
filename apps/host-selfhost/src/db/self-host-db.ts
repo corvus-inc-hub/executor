@@ -31,14 +31,8 @@ import { SELF_HOST_NAMESPACE, SELF_HOST_SCHEMA_VERSION } from "../config";
 // executor reuses this long-lived handle's `db`.
 //
 // Driver: libSQL (@libsql/client + drizzle-orm/libsql), not bun:sqlite, so the
-// self-host server runs on Node AND Bun (and the same code path serves edge by
-// swapping the `file:` URL for an https Turso URL). Better Auth SHARES this very
-// `@libsql/client` (its LibsqlDialect is built with `{ client }`, not a fresh
-// `{ url }` connection) — so the PRAGMAs set here cover auth queries too, and
-// there is exactly ONE connection and ONE WAL. That sharing is load-bearing: a
-// second libSQL connection to the same file unlinks this one's `-wal`/`-shm` on
-// open, orphaning executor-core writes onto a deleted inode that vanishes on
-// restart (the self-host data-loss bug — see better-auth.ts's header).
+// self-host server runs on Node and Bun. The WorkOS organization mirror and
+// credential lease receipts use this same handle and WAL as Executor core.
 // ---------------------------------------------------------------------------
 
 /**
@@ -56,12 +50,7 @@ export interface SelfHostDbHandle<TTables extends FumaTables = FumaTables> {
   readonly db: FumaDb<SelfHostFumaSchema<TTables>>;
   readonly fuma: FumaDB<SelfHostFumaSchema<TTables>[]>;
   readonly drizzle: LibSQLDatabase<Record<string, unknown>>;
-  /**
-   * The libSQL client for this handle's `file:` URL. Better Auth's LibsqlDialect
-   * is built on THIS client (one shared connection — see better-auth.ts), and
-   * the seed reads Better Auth's tables through it too. `url` is retained for
-   * callers that still need the `file:` string (diagnostics, edge swap).
-   */
+  /** The shared libSQL client used by Executor and host-owned metadata tables. */
   readonly client: Client;
   readonly url: string;
   readonly close: () => Promise<void>;
@@ -84,11 +73,7 @@ export const createSqliteExecutorDb = async <const TTables extends FumaTables>(
 
   const url = toLibsqlFileUrl(options.path);
   const client = createClient({ url });
-  // Connection PRAGMAs. This is the ONE libSQL connection for the process —
-  // drizzle (executor tables) and Better Auth's LibsqlDialect both run on this
-  // same client (see better-auth.ts), so these apply to every query, auth
-  // included. WAL is a file-level mode; foreign_keys/busy_timeout/synchronous
-  // are connection-level and set once here.
+  // Connection PRAGMAs apply to Executor and the host-owned WorkOS metadata.
   await client.execute("PRAGMA foreign_keys = ON");
   await client.execute("PRAGMA journal_mode = WAL");
   // Survive concurrent writes from the multi-user HTTP server, and trade
@@ -148,9 +133,8 @@ export interface SelfHostDbLayerOptions {
 }
 
 /**
- * Open the self-host DB with the full plugin table set. Used both by the layer
- * and by the composition root (which needs the raw handle eagerly so Better
- * Auth can open its own libSQL connection to the same `file:` URL).
+ * Open the self-host DB with the full plugin table set. The composition root
+ * also uses the raw handle for organization mirrors and lease receipts.
  */
 export const createSelfHostDb = (options: SelfHostDbLayerOptions): Promise<SelfHostDbHandle> =>
   createSqliteExecutorDb({

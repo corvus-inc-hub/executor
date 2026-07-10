@@ -344,6 +344,15 @@ export type Executor<TPlugins extends readonly AnyPlugin[] = readonly []> = {
     readonly validate: (
       input: ValidateConnectionInput,
     ) => Effect.Effect<HealthCheckResult, IntegrationNotFoundError | StorageFailure>;
+    /**
+     * Resolve every credential input through its registered provider, including
+     * OAuth refresh. This is a privileged host boundary for short-lived
+     * credential delivery. HTTP and agent tool surfaces must never expose it
+     * without their own authorization and audit policy.
+     */
+    readonly resolveValues: (
+      ref: ConnectionRef,
+    ) => Effect.Effect<Record<string, string | null>, StorageFailure>;
   };
 
   /** Shared OAuth service. Hosts use this through the core HTTP OAuth group;
@@ -4069,6 +4078,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         refresh: connectionsRefresh,
         checkHealth: connectionCheckHealth,
         validate: connectionValidate,
+        resolveValues: resolveConnectionValuesByRef,
       },
       oauth,
       tools: {

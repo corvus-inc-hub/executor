@@ -5,8 +5,7 @@ import "@executor-js/react/globals.css";
 
 import { getRouter } from "./router";
 
-// The whole app — shell, pages, and the Better-Auth-gated multiplayer surface —
-// is the shared @executor-js/react composition wired in routes/__root.tsx.
+// The shell and WorkOS-gated multiplayer surface are wired in routes/__root.tsx.
 const router = getRouter();
 const rootElement = document.getElementById("root");
 

@@ -23,21 +23,15 @@ const EXECUTOR_VERSION = cliPackage.version;
 
 // Self-host web SPA. Mirrors @executor-js/app's vite plugin bundle, but points
 // the TanStack router codegen at THIS app's routes (web/routes) so we get the
-// multiplayer shell + Better-Auth gate (routes/__root.tsx) instead of the
+// multiplayer shell + WorkOS AuthKit gate (routes/__root.tsx) instead of the
 // personal-mode local shell. executorVitePlugin feeds plugin client bundles
 // from our executor.config.ts into `virtual:executor/plugins-client`.
 const APP_ROOT = fileURLToPath(new URL("../../packages/app/", import.meta.url));
 const DEV_PORT = 5173;
 
-// Dev defaults so `bun run dev` boots the full stack with zero manual env.
-// Set at module load (before any plugin/executor.config reads them). Override
-// via real env for anything you care about (esp. BETTER_AUTH_SECRET in prod).
+// Local storage and origin defaults. WorkOS identity values remain explicit so
+// development never invents a second local login or a fake identity provider.
 process.env.EXECUTOR_DATA_DIR ??= fileURLToPath(new URL("./.executor-dev/", import.meta.url));
-process.env.BETTER_AUTH_SECRET ??= "executor-selfhost-dev-secret-change-me-0123456789";
-if (process.env.EXECUTOR_DEV_SEED_ADMIN === "1") {
-  process.env.EXECUTOR_BOOTSTRAP_ADMIN_EMAIL ??= "admin@example.com";
-  process.env.EXECUTOR_BOOTSTRAP_ADMIN_PASSWORD ??= "executor-dev-admin";
-}
 process.env.EXECUTOR_WEB_BASE_URL ??= `http://localhost:${DEV_PORT}`;
 
 // Dev-only: forward /api, /mcp, /docs to the self-host Effect handler in-process
@@ -109,18 +103,17 @@ function executorApiPlugin(): Plugin {
           path.startsWith("/.well-known/");
         if (!handled) {
           // SPA document navigations must receive the app shell, not a module.
-          // A browser navigating to a route like `/login` (Better Auth's
-          // MCP-OAuth `loginPage` 302s here as a real document GET) sends an
+          // A browser navigating to a route like `/login` sends an
           // extensionless request that Vite's transform middleware would resolve
-          // to a colliding web-root module (`web/login.tsx` shadows `/login`,
-          // `web/setup.tsx` shadows `/setup`) and serve as text/javascript, so
+          // to a colliding web-root module (`web/login.tsx` shadows `/login`)
+          // and serve as text/javascript, so
           // the page renders as raw JS and the OAuth login never appears. Rewrite
           // genuine page navigations to the index so Vite's html fallback serves
           // index.html; the SPA reads window.location and renders the right
           // route. Module/asset/HMR requests carry a file extension or a
           // non-document fetch destination, so they fall through untouched. This
           // is dev-only: the production static server already serves index.html
-          // for unknown routes, with login/setup bundled into the SPA.
+          // for unknown routes, with login bundled into the SPA.
           const isGet = req.method === "GET" || req.method === "HEAD";
           const dest = req.headers["sec-fetch-dest"];
           const accept = req.headers.accept;

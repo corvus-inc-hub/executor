@@ -5,7 +5,7 @@
  * layer. Self-host binds it to a listening Bun socket via `BunHttpServer.layer`.
  * All routing lives in the Effect router — no hand-written fetch:
  *   - /api/*       typed API (auth-gated)
- *   - /api/auth/*  Better Auth
+ *   - /api/auth/*  WorkOS AuthKit browser and CLI routes
  *   - /mcp         MCP (per-user)
  *   - /docs        Swagger
  *   - everything else: the built web SPA (static files + index.html fallback)
@@ -24,15 +24,12 @@ import {
   HttpStaticServer,
 } from "effect/unstable/http";
 import { BunFileSystem, BunHttpServer, BunPath, BunRuntime } from "@effect/platform-bun";
-import { Effect, Layer } from "effect";
+import { Duration, Effect, Layer, Option } from "effect";
 
 import { makeSelfHostApp } from "./app";
-import { loadConfig } from "./config";
-import type { BetterAuthHandle } from "./auth";
-import {
-  OAUTH_CALLBACK_PATH,
-  oauthCallbackSignInRedirectLocation,
-} from "./auth/oauth-callback-login";
+import { loadConfig, type WorkOSConfig } from "./config";
+import { sessionForRequest, type WorkOSClient } from "./auth";
+import { WORKOS_SESSION_COOKIE } from "./auth/workos";
 import { MCP_ORIGINAL_PATH_HEADER, stripMcpOrgSegment } from "./mcp/org-path";
 
 const distDir = fileURLToPath(new URL("../dist/", import.meta.url));
@@ -47,21 +44,40 @@ const assetsDir = fileURLToPath(new URL("../dist/assets/", import.meta.url));
 // resource check for org-scoped clients). A no-op for every other request,
 // aside from scrubbing any client-supplied value of that header so it can't be
 // spoofed into an unrewritten request.
-const selfHostHttpMiddleware = (betterAuth: BetterAuthHandle) =>
+const replaceCookie = (header: string | null, name: string, value: string): string => {
+  const retained = (header ?? "")
+    .split(";")
+    .map((cookie) => cookie.trim())
+    .filter((cookie) => cookie.length > 0 && !cookie.startsWith(`${name}=`));
+  return [`${name}=${value}`, ...retained].join("; ");
+};
+
+const selfHostHttpMiddleware = (workos: WorkOSClient, workosConfig: WorkOSConfig) =>
   HttpMiddleware.make((httpApp) =>
     Effect.gen(function* () {
       const request = yield* HttpServerRequest.HttpServerRequest;
       const url = new URL(request.url, "http://host.internal");
-      if (
-        url.pathname === OAUTH_CALLBACK_PATH &&
-        (request.method === "GET" || request.method === "HEAD")
-      ) {
-        const headers = new Headers(request.headers as Record<string, string>);
-        const webRequest = new Request(url, { method: request.method, headers });
-        const location = yield* Effect.promise(() =>
-          oauthCallbackSignInRedirectLocation(webRequest, betterAuth.auth),
-        );
-        if (location) return HttpServerResponse.redirect(location, { status: 302 });
+      const webRequest = new Request(url, {
+        method: request.method,
+        headers: new Headers(request.headers as Record<string, string>),
+      });
+      const session = yield* sessionForRequest(workos, webRequest).pipe(
+        Effect.orElseSucceed(() => null),
+      );
+      const refreshed = session?.refreshedSession ?? null;
+      let nextRequest = request;
+      if (refreshed) {
+        nextRequest = nextRequest.modify({
+          headers: EffectHeaders.set(
+            nextRequest.headers,
+            "cookie",
+            replaceCookie(
+              Option.getOrNull(EffectHeaders.get(nextRequest.headers, "cookie")),
+              WORKOS_SESSION_COOKIE,
+              refreshed,
+            ),
+          ),
+        });
       }
 
       const rewritten = stripMcpOrgSegment(url.pathname);
@@ -69,31 +85,36 @@ const selfHostHttpMiddleware = (betterAuth: BetterAuthHandle) =>
         // Never let a client dictate the org-scoped echo below by smuggling
         // this header in directly — it's only ever trustworthy when WE set it
         // a few lines down, for a request we ourselves just rewrote.
-        if (!EffectHeaders.has(request.headers, MCP_ORIGINAL_PATH_HEADER)) return yield* httpApp;
-        return yield* httpApp.pipe(
-          Effect.provideService(
-            HttpServerRequest.HttpServerRequest,
-            request.modify({
-              headers: EffectHeaders.remove(request.headers, MCP_ORIGINAL_PATH_HEADER),
-            }),
-          ),
-        );
+        if (EffectHeaders.has(nextRequest.headers, MCP_ORIGINAL_PATH_HEADER)) {
+          nextRequest = nextRequest.modify({
+            headers: EffectHeaders.remove(nextRequest.headers, MCP_ORIGINAL_PATH_HEADER),
+          });
+        }
+      } else {
+        nextRequest = nextRequest.modify({
+          url: `${rewritten}${url.search}`,
+          headers: EffectHeaders.set(nextRequest.headers, MCP_ORIGINAL_PATH_HEADER, url.pathname),
+        });
       }
-      return yield* httpApp.pipe(
-        Effect.provideService(
-          HttpServerRequest.HttpServerRequest,
-          request.modify({
-            url: `${rewritten}${url.search}`,
-            headers: EffectHeaders.set(request.headers, MCP_ORIGINAL_PATH_HEADER, url.pathname),
-          }),
-        ),
+
+      const response = yield* httpApp.pipe(
+        Effect.provideService(HttpServerRequest.HttpServerRequest, nextRequest),
       );
+      return refreshed
+        ? HttpServerResponse.setCookieUnsafe(response, WORKOS_SESSION_COOKIE, refreshed, {
+            path: "/",
+            httpOnly: true,
+            sameSite: "lax",
+            secure: workosConfig.redirectUri.startsWith("https://"),
+            maxAge: Duration.days(7),
+          })
+        : response;
     }),
   );
 
 export const startServer = async (): Promise<void> => {
   const config = loadConfig();
-  const { AppLayer, betterAuth } = await makeSelfHostApp();
+  const { AppLayer, workos, workosConfig } = await makeSelfHostApp();
 
   // Serve the built SPA, split by cacheability so a redeploy is picked up at
   // once instead of stranding browsers on a stale shell:
@@ -121,7 +142,7 @@ export const startServer = async (): Promise<void> => {
   }).pipe(Layer.provide(BunFileSystem.layer), Layer.provide(BunPath.layer));
 
   const ServerLive = HttpRouter.serve(Layer.mergeAll(AppLayer, AssetsLive, SpaLive), {
-    middleware: selfHostHttpMiddleware(betterAuth),
+    middleware: selfHostHttpMiddleware(workos, workosConfig),
   }).pipe(
     Layer.provide(
       BunHttpServer.layer({ hostname: config.host, port: config.port, idleTimeout: 0 }),
