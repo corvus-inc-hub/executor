@@ -14,6 +14,7 @@ import {
 import type { WorkOSConfig } from "../config";
 import { ensureWorkOSIdentityTables } from "../auth/organization-store";
 import type { WorkOSClient } from "../auth/workos";
+import type { AwsRoleAssumer, AwsRoleAssumptionInput } from "./aws-role-assumer";
 import { makeCredentialLeaseService, type CredentialLeaseRequest } from "./service";
 
 const config: WorkOSConfig = {
@@ -35,6 +36,7 @@ const config: WorkOSConfig = {
 };
 
 const unavailable = <A>(): Effect.Effect<A> => Effect.die("unused WorkOS test method");
+const assumeAwsRoleUnused: AwsRoleAssumer = () => Effect.die("unused AWS test method");
 
 const workos: WorkOSClient = {
   userJwksUrl: "https://example.authkit.app/sso/jwks/client_executor",
@@ -98,6 +100,34 @@ const input: CredentialLeaseRequest = {
   },
 };
 
+const awsConnection: Connection = {
+  owner: "org",
+  name: ConnectionName.make("bedrock-production"),
+  integration: IntegrationSlug.make("amazonaws.com"),
+  template: AuthTemplateSlug.make("role"),
+  provider: ProviderKey.make("default"),
+  address: ConnectionAddress.make("tools.amazonaws.com.bedrock-production"),
+  oauthScope: "inference",
+};
+
+const awsInput: CredentialLeaseRequest = {
+  organizationId: "org_allowed",
+  workspaceId: "workspace_manifest",
+  runId: "run_bedrock_123",
+  credential: { integration: "amazonaws.com", name: "bedrock-production" },
+  purpose: "Run approved Bedrock inference",
+  scopes: ["inference"],
+  ttlSeconds: 120,
+  delivery: {
+    environment: {
+      AWS_ACCESS_KEY_ID: "AWS_ACCESS_KEY_ID",
+      AWS_SECRET_ACCESS_KEY: "AWS_SECRET_ACCESS_KEY",
+      AWS_SESSION_TOKEN: "AWS_SESSION_TOKEN",
+      AWS_REGION: "AWS_REGION",
+    },
+  },
+};
+
 const request = new Request("https://executor.example.com/api/credential-leases", {
   method: "POST",
   headers: { authorization: "Bearer header.payload.signature" },
@@ -127,6 +157,7 @@ describe("credential lease service", () => {
             config,
             workos,
             db,
+            assumeAwsRole: assumeAwsRoleUnused,
             verifyM2mToken: verified(),
             now: () => new Date("2026-07-10T12:00:00.000Z"),
             uuid: () => "lease_123",
@@ -173,6 +204,7 @@ describe("credential lease service", () => {
             config,
             workos,
             db,
+            assumeAwsRole: assumeAwsRoleUnused,
             verifyM2mToken: verified(),
             resolveCredential: () => Effect.succeed(null),
           });
@@ -206,6 +238,7 @@ describe("credential lease service", () => {
             config,
             workos,
             db,
+            assumeAwsRole: assumeAwsRoleUnused,
             verifyM2mToken: verified("org_other"),
             resolveCredential: () => {
               resolved = true;
@@ -236,6 +269,7 @@ describe("credential lease service", () => {
             config,
             workos,
             db,
+            assumeAwsRole: assumeAwsRoleUnused,
             verifyM2mToken: verified("org_allowed", ["github:read"]),
             resolveCredential: () => {
               resolved = true;
@@ -247,6 +281,125 @@ describe("credential lease service", () => {
           if (!Result.isFailure(result)) return;
           expect(result.failure).toMatchObject({ code: "forbidden", status: 403 });
           expect(resolved).toBe(false);
+        }),
+      (db) => Effect.sync(() => db.close()),
+    ),
+  );
+
+  it.effect("materializes an AWS role into an expiring STS session", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(async () => {
+        const db = createClient({ url: ":memory:" });
+        await Effect.runPromise(ensureWorkOSIdentityTables(db));
+        return db;
+      }),
+      (db) =>
+        Effect.gen(function* () {
+          let assumption: AwsRoleAssumptionInput | undefined;
+          const service = makeCredentialLeaseService({
+            config,
+            workos,
+            db,
+            assumeAwsRole: (input) => {
+              assumption = input;
+              return Effect.succeed({
+                accessKeyId: "ASIA_TEMPORARY",
+                secretAccessKey: "temporary-secret",
+                sessionToken: "temporary-session",
+                expiresAt: Date.parse("2026-07-10T12:15:00.000Z"),
+              });
+            },
+            verifyM2mToken: verified(),
+            now: () => new Date("2026-07-10T12:00:00.000Z"),
+            uuid: () => "lease_aws_123",
+            resolveCredential: () =>
+              Effect.succeed({
+                connection: awsConnection,
+                values: {
+                  AWS_ROLE_ARN: "arn:aws:iam::123456789012:role/executor-bedrock",
+                  AWS_REGION: "us-east-1",
+                  AWS_EXTERNAL_ID: "manifest-production",
+                },
+              }),
+          });
+
+          const response = yield* service.lease(request, awsInput);
+          expect(assumption).toMatchObject({
+            roleArn: "arn:aws:iam::123456789012:role/executor-bedrock",
+            region: "us-east-1",
+            externalId: "manifest-production",
+            durationSeconds: 900,
+          });
+          expect(assumption?.roleSessionName).toMatch(/^executor-[a-f0-9]{32}$/);
+          expect(response.material).toEqual({
+            environment: {
+              AWS_ACCESS_KEY_ID: "ASIA_TEMPORARY",
+              AWS_SECRET_ACCESS_KEY: "temporary-secret",
+              AWS_SESSION_TOKEN: "temporary-session",
+              AWS_REGION: "us-east-1",
+            },
+            secretFiles: [],
+          });
+          expect(response.lease).toMatchObject({
+            disposeAfter: "2026-07-10T12:02:00.000Z",
+            sourceCredentialExpiresAt: "2026-07-10T12:15:00.000Z",
+          });
+
+          const receipt = yield* Effect.promise(() =>
+            db.execute("SELECT * FROM credential_lease_receipt WHERE id = 'lease_aws_123'"),
+          );
+          const serialized = JSON.stringify(receipt.rows[0]);
+          expect(serialized).not.toContain("ASIA_TEMPORARY");
+          expect(serialized).not.toContain("temporary-secret");
+          expect(serialized).not.toContain("temporary-session");
+        }),
+      (db) => Effect.sync(() => db.close()),
+    ),
+  );
+
+  it.effect("rejects static AWS access keys without calling STS", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(async () => {
+        const db = createClient({ url: ":memory:" });
+        await Effect.runPromise(ensureWorkOSIdentityTables(db));
+        return db;
+      }),
+      (db) =>
+        Effect.gen(function* () {
+          let assumed = false;
+          const service = makeCredentialLeaseService({
+            config,
+            workos,
+            db,
+            assumeAwsRole: () => {
+              assumed = true;
+              return Effect.die("STS must not be called for static AWS credentials");
+            },
+            verifyM2mToken: verified(),
+            resolveCredential: () =>
+              Effect.succeed({
+                connection: awsConnection,
+                values: {
+                  AWS_ROLE_ARN: "arn:aws:iam::123456789012:role/executor-bedrock",
+                  AWS_REGION: "us-east-1",
+                  AWS_ACCESS_KEY_ID: "AKIA_STATIC",
+                  AWS_SECRET_ACCESS_KEY: "static-secret",
+                },
+              }),
+          });
+
+          const result = yield* Effect.result(service.lease(request, awsInput));
+          expect(Result.isFailure(result)).toBe(true);
+          if (!Result.isFailure(result)) return;
+          expect(result.failure).toMatchObject({
+            code: "credential_unavailable",
+            status: 409,
+          });
+          expect(assumed).toBe(false);
+          const receipts = yield* Effect.promise(() =>
+            db.execute("SELECT id FROM credential_lease_receipt"),
+          );
+          expect(receipts.rows).toHaveLength(0);
         }),
       (db) => Effect.sync(() => db.close()),
     ),

@@ -1,3 +1,10 @@
+export {
+  AwsRoleAssumptionError,
+  makeAwsRoleAssumer,
+  type AwsRoleAssumer,
+  type AwsRoleAssumptionInput,
+  type AwsRoleCredentials,
+} from "./aws-role-assumer";
 export { makeCredentialLeaseHandler } from "./handler";
 export {
   CredentialLeaseError,

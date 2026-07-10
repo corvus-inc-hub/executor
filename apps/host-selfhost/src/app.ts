@@ -29,7 +29,7 @@ import {
   SELF_HOST_NAMESPACE,
   SELF_HOST_SCHEMA_VERSION,
 } from "./config";
-import { makeCredentialLeaseHandler } from "./credential-leases";
+import { makeAwsRoleAssumer, makeCredentialLeaseHandler } from "./credential-leases";
 import { selfHostDataMigrations } from "./db/data-migrations";
 import { createSelfHostDb, SelfHostDb, SelfHostDbProvider } from "./db/self-host-db";
 import {
@@ -83,6 +83,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     organizations,
   });
   const mcp = makeSelfHostMcpSeams(dbHandle, identity, config.webBaseUrl);
+  const assumeAwsRole = makeAwsRoleAssumer();
 
   const scopedExecutorLayer = SelfHostScopedExecutorSeams.pipe(
     Layer.provide(Layer.succeed(SelfHostDb)(dbHandle)),
@@ -91,6 +92,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     config: workosConfig,
     workos,
     db: dbHandle.client,
+    assumeAwsRole,
     resolveCredential: (serviceAccountId, organizationId, ref) =>
       makeScopedExecutor(serviceAccountId, organizationId, "").pipe(
         Effect.provide(scopedExecutorLayer),

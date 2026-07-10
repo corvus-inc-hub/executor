@@ -17,10 +17,18 @@ import {
   type WorkOSJwtError,
 } from "../auth/jwt";
 import type { WorkOSClient } from "../auth/workos";
+import type { AwsRoleAssumer, AwsRoleCredentials } from "./aws-role-assumer";
 
 const ENV_NAME = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const FILE_NAME = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const ID = /^[A-Za-z0-9][A-Za-z0-9_:./-]{0,127}$/;
+const AWS_INTEGRATION = "amazonaws.com";
+const AWS_ROLE_ARN = /^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role\/[A-Za-z0-9_+=,.@/-]+$/;
+const AWS_REGION = /^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$/;
+const AWS_EXTERNAL_ID = /^[A-Za-z0-9_+=,.@:/-]{2,1224}$/;
+const AWS_ROLE_CONFIGURATION = new Set(["AWS_ROLE_ARN", "AWS_REGION", "AWS_EXTERNAL_ID"]);
+const AWS_MIN_SESSION_SECONDS = 900;
+const AWS_ROLE_CHAIN_MAX_SESSION_SECONDS = 3600;
 
 export interface CredentialLeaseRequest {
   readonly organizationId: string;
@@ -243,6 +251,7 @@ export interface CredentialLeaseDeps {
   readonly config: WorkOSConfig;
   readonly workos: WorkOSClient;
   readonly db: Client;
+  readonly assumeAwsRole: AwsRoleAssumer;
   readonly resolveCredential: (
     serviceAccountId: string,
     organizationId: string,
@@ -256,6 +265,129 @@ export interface CredentialLeaseDeps {
 }
 
 const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
+
+type PreparedCredential =
+  | {
+      readonly _tag: "Resolved";
+      readonly values: Readonly<Record<string, string>>;
+      readonly sourceExpiration: number | null;
+    }
+  | {
+      readonly _tag: "AwsRole";
+      readonly roleArn: string;
+      readonly region: string;
+      readonly externalId?: string;
+    };
+
+const prepareCredential = (
+  input: CredentialLeaseRequest,
+  resolved: ResolvedCredential,
+): Effect.Effect<PreparedCredential, CredentialLeaseError> => {
+  const requestedAws = input.credential.integration === AWS_INTEGRATION;
+  const resolvedAws = String(resolved.connection.integration) === AWS_INTEGRATION;
+  if (requestedAws || resolvedAws) {
+    const entries = Object.entries(resolved.values);
+    const roleArn = nonEmpty(resolved.values.AWS_ROLE_ARN, 2048);
+    const region = nonEmpty(resolved.values.AWS_REGION, 64);
+    const hasExternalId = Object.hasOwn(resolved.values, "AWS_EXTERNAL_ID");
+    const externalId = hasExternalId ? nonEmpty(resolved.values.AWS_EXTERNAL_ID, 1224) : undefined;
+    if (
+      !requestedAws ||
+      !resolvedAws ||
+      resolved.connection.owner !== "org" ||
+      entries.length < 2 ||
+      entries.length > 3 ||
+      entries.some(([name]) => !AWS_ROLE_CONFIGURATION.has(name)) ||
+      !roleArn ||
+      !AWS_ROLE_ARN.test(roleArn) ||
+      !region ||
+      !AWS_REGION.test(region) ||
+      (hasExternalId && (!externalId || !AWS_EXTERNAL_ID.test(externalId)))
+    ) {
+      return leaseFailure(
+        409,
+        "credential_unavailable",
+        "AWS credential must contain only an assumable role configuration",
+      );
+    }
+    return Effect.succeed({
+      _tag: "AwsRole",
+      roleArn,
+      region,
+      ...(typeof externalId === "string" ? { externalId } : {}),
+    });
+  }
+
+  const entries = Object.entries(resolved.values);
+  if (entries.length === 0 || entries.some(([, value]) => value === null || value.length === 0)) {
+    return leaseFailure(409, "credential_unavailable", "Credential material is incomplete");
+  }
+  return Effect.succeed({
+    _tag: "Resolved",
+    values: Object.fromEntries(entries) as Record<string, string>,
+    sourceExpiration: resolved.connection.expiresAt ?? null,
+  });
+};
+
+const materializeCredential = (
+  deps: CredentialLeaseDeps,
+  input: CredentialLeaseRequest,
+  ttlSeconds: number,
+  prepared: PreparedCredential,
+): Effect.Effect<
+  { readonly values: Readonly<Record<string, string>>; readonly sourceExpiration: number | null },
+  CredentialLeaseError
+> => {
+  if (prepared._tag === "Resolved") return Effect.succeed(prepared);
+  const roleSessionName = `executor-${sha256(
+    `${input.organizationId}:${input.workspaceId}:${input.runId}`,
+  ).slice(0, 32)}`;
+  const durationSeconds = Math.max(
+    AWS_MIN_SESSION_SECONDS,
+    Math.min(ttlSeconds, AWS_ROLE_CHAIN_MAX_SESSION_SECONDS),
+  );
+  return deps
+    .assumeAwsRole({
+      roleArn: prepared.roleArn,
+      region: prepared.region,
+      roleSessionName,
+      durationSeconds,
+      ...(prepared.externalId === undefined ? {} : { externalId: prepared.externalId }),
+    })
+    .pipe(
+      Effect.mapError(
+        () =>
+          new CredentialLeaseError({
+            status: 503,
+            code: "service_unavailable",
+            detail: "AWS credential materialization is unavailable",
+          }),
+      ),
+      Effect.flatMap((credentials: AwsRoleCredentials) => {
+        if (
+          !credentials.accessKeyId ||
+          !credentials.secretAccessKey ||
+          !credentials.sessionToken ||
+          !Number.isSafeInteger(credentials.expiresAt)
+        ) {
+          return leaseFailure(
+            503,
+            "service_unavailable",
+            "AWS credential materialization is unavailable",
+          );
+        }
+        return Effect.succeed({
+          values: {
+            AWS_ACCESS_KEY_ID: credentials.accessKeyId,
+            AWS_SECRET_ACCESS_KEY: credentials.secretAccessKey,
+            AWS_SESSION_TOKEN: credentials.sessionToken,
+            AWS_REGION: prepared.region,
+          },
+          sourceExpiration: credentials.expiresAt,
+        });
+      }),
+    );
+};
 
 const requestedDelivery = (
   request: CredentialLeaseRequest,
@@ -414,18 +546,7 @@ export const makeCredentialLeaseService = (deps: CredentialLeaseDeps) => ({
       if (!resolved) {
         return yield* leaseFailure(409, "credential_unavailable", "Credential cannot be leased");
       }
-      const entries = Object.entries(resolved.values);
-      if (
-        entries.length === 0 ||
-        entries.some(([, value]) => value === null || value.length === 0)
-      ) {
-        return yield* leaseFailure(
-          409,
-          "credential_unavailable",
-          "Credential material is incomplete",
-        );
-      }
-      const values = Object.fromEntries(entries) as Record<string, string>;
+      const prepared = yield* prepareCredential(input, resolved);
       const grantedCredentialScopes = new Set(
         (resolved.connection.oauthScope ?? "").split(/\s+/).filter(Boolean),
       );
@@ -439,7 +560,8 @@ export const makeCredentialLeaseService = (deps: CredentialLeaseDeps) => ({
           "Connected credential does not grant a requested resource scope",
         );
       }
-      const material = requestedDelivery(input, values);
+      const materialized = yield* materializeCredential(deps, input, ttlSeconds, prepared);
+      const material = requestedDelivery(input, materialized.values);
       if (!material) {
         return yield* leaseFailure(
           409,
@@ -452,7 +574,7 @@ export const makeCredentialLeaseService = (deps: CredentialLeaseDeps) => ({
       const now = (deps.now ?? (() => new Date()))();
       const issuedAt = now.toISOString();
       const requestedDisposal = now.getTime() + ttlSeconds * 1000;
-      const sourceExpiration = resolved.connection.expiresAt ?? null;
+      const sourceExpiration = materialized.sourceExpiration;
       if (sourceExpiration !== null && sourceExpiration <= now.getTime()) {
         return yield* leaseFailure(409, "credential_unavailable", "Credential has expired");
       }

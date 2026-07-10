@@ -18,6 +18,7 @@
     "routes:gen": "bun scripts/gen-routes.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-sts": "3.1085.0",
     "@effect/atom-react": "catalog:",
     "@effect/platform-bun": "catalog:",
     "@executor-js/api": "workspace:*",
