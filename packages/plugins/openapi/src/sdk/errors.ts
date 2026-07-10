@@ -28,7 +28,7 @@ export class OpenApiExtractionError extends Schema.TaggedErrorClass<OpenApiExtra
 export class OpenApiInvocationError extends Data.TaggedError("OpenApiInvocationError")<{
   readonly message: string;
   readonly statusCode: Option.Option<number>;
-  readonly reason?: "response_headers_timeout";
+  readonly reason?: "response_headers_timeout" | "unknown_arguments";
   readonly cause?: unknown;
 }> {}
 

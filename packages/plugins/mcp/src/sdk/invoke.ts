@@ -30,7 +30,7 @@ import {
 
 import { McpConnectionError, McpInvocationError, McpOAuthReauthorizationRequired } from "./errors";
 import type { McpConnection, McpConnector } from "./connection";
-import { httpStatusFromCause } from "./http-status";
+import { httpStatusFromCause, insufficientScopeFromCause } from "./http-status";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -172,12 +172,26 @@ const useConnection = (
             message: "MCP OAuth re-authorization required",
           });
         }
+        // Raised by the fetch adapter when the 403 carried an RFC 6750
+        // insufficient_scope challenge (the authProvider path, where the SDK
+        // would otherwise consume the challenge before we could see it).
+        if (Predicate.isTagged(cause, "McpInsufficientScopeError")) {
+          return new McpInvocationError({
+            toolName,
+            message: `MCP tool call failed for ${toolName}`,
+            status: 403,
+            insufficientScope: true,
+          });
+        }
         const status = httpStatusFromCause(cause);
         return new McpInvocationError({
           toolName,
           message: `MCP tool call failed for ${toolName}`,
           ...(status === undefined ? {} : { status }),
           ...(isUnknownToolCause(cause, toolName) ? { unknownTool: true } : {}),
+          ...(status === 403 && insufficientScopeFromCause(cause)
+            ? { insufficientScope: true }
+            : {}),
         });
       },
     }).pipe(

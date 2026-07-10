@@ -5,8 +5,6 @@ import { memoryAdapter } from "@executor-js/fumadb/adapters/memory";
 import { withQueryContext, type Condition, type ConditionBuilder } from "@executor-js/fumadb/query";
 import { schema as fumaSchema, type RelationsMap } from "@executor-js/fumadb/schema";
 import type { AnyColumn } from "@executor-js/fumadb/schema";
-import { generateKeyBetween } from "fractional-indexing";
-
 import {
   StorageError,
   isStorageFailure,
@@ -99,6 +97,7 @@ import {
   comparePolicyRow,
   isValidPattern,
   matchPattern,
+  positionForNewPattern,
   resolveEffectivePolicy,
   rowToToolPolicy,
   type CreateToolPolicyInput,
@@ -589,6 +588,17 @@ const rowToConnection = (row: ConnectionRow): Connection => {
     missingOAuthScopes: missingOAuthScopesFromProviderState(row.provider_state),
     lastHealth: Option.getOrNull(decodeLastHealth(row.last_health)),
   };
+};
+
+/** Parse a connection row's `oauth_scope` (space-delimited, as echoed by the
+ *  token endpoint) into the credential's `grantedScopes`. Undefined when the
+ *  row carries none, so scope comparisons downstream fail open. */
+const grantedScopesFromRow = (row: {
+  readonly oauth_scope?: unknown;
+}): readonly string[] | undefined => {
+  if (row.oauth_scope == null) return undefined;
+  const scopes = String(row.oauth_scope).split(/\s+/).filter(Boolean);
+  return scopes.length > 0 ? scopes : undefined;
 };
 
 /** The canonical credential variable for a single-secret connection. OAuth tokens
@@ -2842,6 +2852,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             integrationRow,
             describeAuthMethodsForRow(integrationRow),
           );
+          const grantedScopes = grantedScopesFromRow(connectionRow);
           const credential: ToolInvocationCredential = {
             owner: connectionRow.owner as Owner,
             integration: ref.integration,
@@ -2850,6 +2861,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             value: values[PRIMARY_INPUT_VARIABLE] ?? null,
             values,
             config: record.config,
+            ...(grantedScopes ? { grantedScopes } : {}),
           };
           // Core resolves the declared spec (its own column) and hands it to the
           // plugin; plugins no longer read it out of their config.
@@ -3416,11 +3428,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         const existing = yield* core.findMany("tool_policy", {
           where: byOwner(input.owner),
         });
-        const minPosition = existing
-          .map((row) => row.position)
-          .sort()
-          .at(0);
-        const position = input.position ?? generateKeyBetween(null, minPosition ?? null);
+        // Default placement is specificity-aware (below any more-specific
+        // rule), not top-of-list: a client that omits position — the UI when
+        // its policy list is stale, the API, an agent tool — must not have its
+        // broad rule silently shadow an existing narrow one.
+        const position = input.position ?? positionForNewPattern(input.pattern, existing);
         const id = PolicyId.make(
           `pol_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`,
         );
@@ -3778,6 +3790,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // the primary `token` for single-input + OAuth callers.
         const values = yield* resolveConnectionValues(connectionRow);
         const integrationRow = yield* findIntegrationRow(parsed.integration);
+        const grantedScopes = grantedScopesFromRow(connectionRow);
         const credential: ToolInvocationCredential = {
           owner: parsed.owner,
           integration: parsed.integration,
@@ -3786,6 +3799,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           value: values[PRIMARY_INPUT_VARIABLE] ?? null,
           values,
           config: integrationRow ? decodeJsonColumn(integrationRow.config) : undefined,
+          ...(grantedScopes ? { grantedScopes } : {}),
         };
 
         return yield* wrapInvocationError(

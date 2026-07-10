@@ -821,12 +821,64 @@ const applyRequestBody = (
 // `invoke` applies (one code path, not a parallel re-implementation).
 // ---------------------------------------------------------------------------
 
+const acceptedArgumentNames = (operation: OperationBinding): readonly string[] => {
+  const accepted = new Set<string>();
+
+  for (const param of operation.parameters) {
+    accepted.add(param.name);
+    for (const container of CONTAINER_KEYS[param.location] ?? []) accepted.add(container);
+  }
+
+  for (const match of operation.pathTemplate.matchAll(/\{([^{}]+)\}/g)) {
+    if (match[1]) accepted.add(match[1]);
+  }
+
+  if (Option.isSome(operation.requestBody)) {
+    const requestBody = operation.requestBody.value;
+    const contents = Option.getOrUndefined(requestBody.contents);
+    accepted.add("body");
+    accepted.add("input");
+    if (
+      isOctetStream(requestBody.contentType) ||
+      contents?.some((content) => isOctetStream(content.contentType))
+    ) {
+      accepted.add("bodyBase64");
+    }
+    if (contents && contents.length > 1) accepted.add("contentType");
+  }
+
+  const servers = operation.servers ?? [];
+  const hasServerVariables = servers.some(
+    (server) => Object.keys(Option.getOrUndefined(server.variables) ?? {}).length > 0,
+  );
+  if (servers.length > 1 || hasServerVariables) accepted.add("server");
+
+  return [...accepted];
+};
+
 export const buildRequest = Effect.fn("OpenApi.buildRequest")(function* (
   operation: OperationBinding,
   args: Record<string, unknown>,
   resolvedHeaders: Record<string, string>,
   integrationQueryParams: Record<string, string> = {},
 ) {
+  const accepted = acceptedArgumentNames(operation);
+  const acceptedSet = new Set(accepted);
+  const unknown = Object.keys(args).filter((name) => !acceptedSet.has(name));
+  if (unknown.length > 0) {
+    const label = unknown.length === 1 ? "Unknown argument" : "Unknown arguments";
+    const names = unknown.map((name) => JSON.stringify(name)).join(", ");
+    const acceptedMessage =
+      accepted.length > 0
+        ? `This operation accepts: ${accepted.join(", ")}.`
+        : "This operation accepts no arguments.";
+    return yield* new OpenApiInvocationError({
+      message: `${label} ${names}. ${acceptedMessage}`,
+      statusCode: Option.none(),
+      reason: "unknown_arguments",
+    });
+  }
+
   const resolvedPath = yield* resolvePath(operation.pathTemplate, args, operation.parameters);
 
   const path = resolvedPath.startsWith("/") ? resolvedPath : `/${resolvedPath}`;
@@ -854,6 +906,14 @@ export const buildRequest = Effect.fn("OpenApi.buildRequest")(function* (
     const value = readParamValue(args, param);
     if (value === undefined || value === null) continue;
     request = HttpClientRequest.setHeader(request, param.name, String(value));
+  }
+
+  const cookieValues: string[] = [];
+  for (const param of operation.parameters) {
+    if (param.location !== "cookie") continue;
+    const value = readParamValue(args, param);
+    if (value === undefined || value === null) continue;
+    cookieValues.push(`${param.name}=${primitiveToString(value)}`);
   }
 
   if (Option.isSome(operation.requestBody)) {
@@ -972,6 +1032,15 @@ export const buildRequest = Effect.fn("OpenApi.buildRequest")(function* (
   }
 
   request = applyHeaders(request, resolvedHeaders);
+  if (cookieValues.length > 0) {
+    const existingCookie = request.headers.cookie;
+    const serializedCookies = cookieValues.join("; ");
+    request = HttpClientRequest.setHeader(
+      request,
+      "Cookie",
+      existingCookie ? `${existingCookie}; ${serializedCookies}` : serializedCookies,
+    );
+  }
 
   return request;
 });

@@ -177,3 +177,69 @@ describe("OpenAPI extract response bodies", () => {
     }),
   );
 });
+
+describe("OpenAPI extract required scopes", () => {
+  it.effect("preserves requirement alternatives and applies document-level inheritance", () =>
+    Effect.gen(function* () {
+      const doc = yield* parse(
+        JSON.stringify({
+          openapi: "3.0.3",
+          info: { title: "Scoped", version: "1.0.0" },
+          servers: [{ url: "https://api.example.com" }],
+          // Document default: everything needs base.read unless overridden.
+          security: [{ oauth: ["base.read"] }],
+          paths: {
+            "/files": {
+              get: {
+                operationId: "listFiles",
+                // Two ALTERNATIVE requirement objects (an OR): a caller needs
+                // files.read, OR files.admin — never both at once. Alternatives
+                // must survive extraction separately, not as a union.
+                security: [{ oauth: ["files.read"] }, { oauth: ["files.admin"] }],
+                responses: { "200": { description: "ok" } },
+              },
+            },
+            "/mixed": {
+              get: {
+                operationId: "mixedSchemes",
+                // One requirement object spanning two schemes: an AND — its
+                // scopes union into a single alternative.
+                security: [{ oauth: ["a.read"], other: ["b.read"] }],
+                responses: { "200": { description: "ok" } },
+              },
+            },
+            "/inherited": {
+              get: {
+                operationId: "inheritedOp",
+                // No security key: inherits the document default.
+                responses: { "200": { description: "ok" } },
+              },
+            },
+            "/public": {
+              get: {
+                operationId: "publicPing",
+                // Explicit []: auth disabled — no scopes, despite the default.
+                security: [],
+                responses: { "200": { description: "ok" } },
+              },
+            },
+          },
+        }),
+      );
+
+      const result = yield* extract(doc);
+      const byId = (id: string) => result.operations.find((op) => op.operationId === id);
+
+      expect(byId("listFiles")?.requiredScopeAlternatives).toEqual([
+        ["files.read"],
+        ["files.admin"],
+      ]);
+      expect(byId("mixedSchemes")?.requiredScopeAlternatives).toEqual([["a.read", "b.read"]]);
+      expect(byId("inheritedOp")?.requiredScopeAlternatives).toEqual([["base.read"]]);
+      expect(
+        byId("publicPing")?.requiredScopeAlternatives,
+        "explicit security: [] disables auth, so no scopes",
+      ).toBeUndefined();
+    }),
+  );
+});

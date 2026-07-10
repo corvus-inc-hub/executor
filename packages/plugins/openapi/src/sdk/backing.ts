@@ -8,6 +8,7 @@ import {
   ToolResult,
   authToolFailure,
   classifyHttpStatus,
+  detectInsufficientScope,
   sortHealthCheckCandidatesByIdentity,
   extractIdentity,
   extractResponseFields,
@@ -197,6 +198,9 @@ const toBinding = (def: ToolDefinition): OperationBinding =>
     parameters: [...def.operation.parameters],
     requestBody: def.operation.requestBody,
     responseBody: def.operation.responseBody,
+    ...(def.operation.requiredScopeAlternatives
+      ? { requiredScopeAlternatives: def.operation.requiredScopeAlternatives }
+      : {}),
   });
 
 const descriptionFor = (def: ToolDefinition): string => {
@@ -722,6 +726,41 @@ export const invokeOpenApiBackedTool = (input: {
     const ok = result.status >= 200 && result.status < 300;
     if (!ok) {
       if (result.status === 401 || result.status === 403) {
+        // A 403 naming a scope shortfall (RFC 6750 insufficient_scope,
+        // Google's ACCESS_TOKEN_SCOPE_INSUFFICIENT) cannot be fixed by
+        // re-running the same grant, so it gets its own code and recovery
+        // guidance instead of the re-authenticate loop.
+        const insufficientScope =
+          result.status === 403
+            ? detectInsufficientScope({ body: result.error, headers: result.headers })
+            : null;
+        if (insufficientScope) {
+          // Name the shortfall as precisely as the data allows: the scopes
+          // the upstream challenge asked for, else the operation's declared
+          // requirement (from the binding; alternatives joined with "or",
+          // since each Security Requirement Object is one acceptable set),
+          // plus what the connection's grant actually holds. Advisory only —
+          // the upstream made the call; this annotation tells the agent/user
+          // what to reconnect with.
+          const required =
+            insufficientScope.requiredScopes.length > 0
+              ? insufficientScope.requiredScopes.join(" ")
+              : (binding.requiredScopeAlternatives ?? [])
+                  .map((alternative) => alternative.join(" "))
+                  .join(", or ");
+          const granted = input.credential.grantedScopes;
+          return openApiAuthToolFailure({
+            code: "oauth_scope_insufficient",
+            status: result.status,
+            message: `The connection "${input.credential.connection}" for "${integration}" is authorized, but its grant${granted && granted.length > 0 ? ` (${granted.join(" ")})` : ""} does not cover the scope this operation requires${required.length > 0 ? ` (${required})` : ""}. Re-authenticating with the same grant will return the same error; reconnect with broader access.`,
+            owner: input.credential.owner,
+            integration,
+            connection: String(input.credential.connection),
+            credentialKind: "oauth",
+            credentialLabel: "Upstream authorization",
+            details: result.error,
+          });
+        }
         return openApiAuthToolFailure({
           code: "connection_rejected",
           status: result.status,

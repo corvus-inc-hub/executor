@@ -369,6 +369,12 @@ export interface ToolInvocationCredential {
   readonly values: Record<string, string | null>;
   /** The integration's stored config, for template rendering. */
   readonly config: IntegrationConfig;
+  /** The OAuth scopes the connection's grant actually covers, from the
+   *  connection row's `oauth_scope` (space-delimited, as returned by the
+   *  token endpoint). Absent for non-OAuth connections and for OAuth
+   *  providers that never echo a scope; consumers comparing against an
+   *  operation's declared scopes must fail open when this is undefined. */
+  readonly grantedScopes?: readonly string[];
 }
 
 // ---------------------------------------------------------------------------

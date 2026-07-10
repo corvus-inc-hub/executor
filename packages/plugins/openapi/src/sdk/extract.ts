@@ -495,6 +495,49 @@ const operationServers = (
   return docServers;
 };
 
+/** OAuth scope requirements an operation declares via `security`, with the
+ *  spec's semantics preserved (OpenAPI 3.x Security Requirement Objects):
+ *
+ *  - Each requirement object is one acceptable ALTERNATIVE; the array is an
+ *    OR. Alternatives stay separate — unioning them would tell a user to
+ *    grant scopes from mutually alternative schemes at once.
+ *  - Within one requirement object the schemes are ANDed, so their scopes
+ *    union into that alternative's set (sorted, deduped).
+ *  - An ABSENT operation `security` inherits the document-level default;
+ *    an explicit `security: []` disables auth. Both yield `undefined` only
+ *    when nothing (or nothing scoped) is genuinely declared. */
+const securityScopeAlternatives = (
+  operation: OperationObject,
+  documentSecurity: unknown,
+): readonly (readonly string[])[] | undefined => {
+  const security = operation.security !== undefined ? operation.security : documentSecurity;
+  if (!Array.isArray(security) || security.length === 0) return undefined;
+  const alternatives: (readonly string[])[] = [];
+  const seen = new Set<string>();
+  for (const requirement of security) {
+    if (requirement === null || typeof requirement !== "object") continue;
+    const scopes = new Set<string>();
+    for (const schemeScopes of Object.values(requirement)) {
+      if (!Array.isArray(schemeScopes)) continue;
+      for (const scope of schemeScopes) {
+        if (typeof scope === "string" && scope.trim().length > 0) scopes.add(scope);
+      }
+    }
+    if (scopes.size === 0) continue;
+    const alternative = [...scopes].sort();
+    const key = alternative.join(" ");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    alternatives.push(alternative);
+  }
+  return alternatives.length > 0 ? alternatives : undefined;
+};
+
+const documentSecurityOf = (doc: unknown): unknown =>
+  doc !== null && typeof doc === "object" && !Array.isArray(doc)
+    ? (doc as Record<string, unknown>).security
+    : undefined;
+
 // ---------------------------------------------------------------------------
 // Main extraction
 // ---------------------------------------------------------------------------
@@ -530,6 +573,10 @@ export const extract = Effect.fn("OpenApi.extract")(function* (doc: ParsedDocume
       const tags = (operation.tags ?? []).filter((t) => t.trim().length > 0);
       const operationPathTemplate = explicitPathTemplate(operation) ?? pathTemplate;
 
+      const requiredScopeAlternatives = securityScopeAlternatives(
+        operation,
+        documentSecurityOf(doc),
+      );
       operations.push(
         ExtractedOperation.make({
           operationId: OperationId.make(deriveOperationId(method, pathTemplate, operation)),
@@ -546,6 +593,7 @@ export const extract = Effect.fn("OpenApi.extract")(function* (doc: ParsedDocume
           inputSchema: Option.fromNullishOr(inputSchema),
           outputSchema: Option.fromNullishOr(outputSchema),
           deprecated: operation.deprecated === true,
+          ...(requiredScopeAlternatives ? { requiredScopeAlternatives } : {}),
         }),
       );
     }
@@ -661,6 +709,10 @@ export const streamOperationBindings = <E, R>(
       const requestBody = extractRequestBody(ref.operation, r);
       const responseBody = extractResponseBody(ref.operation, r);
       const servers = operationServers(ref.pathItem, ref.operation, docServers);
+      const requiredScopeAlternatives = securityScopeAlternatives(
+        ref.operation,
+        documentSecurityOf(doc),
+      );
       chunk.push({
         toolName: plan.toolPath,
         description:
@@ -674,6 +726,7 @@ export const streamOperationBindings = <E, R>(
           parameters,
           requestBody: Option.fromNullishOr(requestBody),
           responseBody: Option.fromNullishOr(responseBody),
+          ...(requiredScopeAlternatives ? { requiredScopeAlternatives } : {}),
         }),
       });
       if (chunk.length >= chunkSize) {
@@ -791,6 +844,10 @@ export const streamOperationBindingsFromStructure = <E, R>(
         const requestBody = extractRequestBody(operation, r);
         const responseBody = extractResponseBody(operation, r);
         const servers = operationServers(pathItem, operation, docServers);
+        const requiredScopeAlternatives = securityScopeAlternatives(
+          operation,
+          documentSecurityOf(resolverDoc),
+        );
         chunk.push({
           toolName: plan.toolPath,
           description:
@@ -804,6 +861,7 @@ export const streamOperationBindingsFromStructure = <E, R>(
             parameters,
             requestBody: Option.fromNullishOr(requestBody),
             responseBody: Option.fromNullishOr(responseBody),
+            ...(requiredScopeAlternatives ? { requiredScopeAlternatives } : {}),
           }),
         });
         if (chunk.length >= chunkSize) {

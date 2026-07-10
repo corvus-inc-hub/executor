@@ -480,6 +480,140 @@ describe("graphqlPlugin real protocol server", () => {
     }),
   );
 
+  it.effect("classifies a 401 as connection_rejected even when the body is GraphQL-shaped", () =>
+    Effect.gen(function* () {
+      // An auth gateway may answer with a GraphQL-style errors array AND a
+      // 401 status. The transport status is authoritative: the failure must
+      // reach the agent as a credential problem, not as graphql_errors.
+      const server = yield* serveTestHttpApp((request) =>
+        Effect.gen(function* () {
+          const webRequest = yield* HttpServerRequest.toWeb(request);
+          const body = yield* Effect.promise(() => webRequest.text());
+          if (body.includes("__schema")) {
+            return HttpServerResponse.jsonUnsafe({ data: introspectionResult });
+          }
+          return HttpServerResponse.jsonUnsafe(
+            { errors: [{ message: "Not authenticated" }] },
+            { status: 401 },
+          );
+        }),
+      );
+      const executor = yield* makeExecutor();
+
+      yield* executor.graphql.addIntegration({
+        endpoint: server.url("/graphql"),
+        slug: "auth_wall_graph",
+      });
+      yield* createOrgConnection(executor, {
+        integration: "auth_wall_graph",
+        name: "main",
+        template: "none",
+        value: "unused",
+      });
+
+      const result = yield* executor.execute(toolAddr("auth_wall_graph", "main", "query.hello"), {
+        name: "Ada",
+      });
+
+      expect(result).toMatchObject({
+        ok: false,
+        error: { code: "connection_rejected", status: 401 },
+      });
+    }),
+  );
+
+  it.effect(
+    "classifies a scope-insufficient 403 (OAuth error body) as oauth_scope_insufficient",
+    () =>
+      Effect.gen(function* () {
+        // The 403 body is an OAuth error object, not GraphQL-shaped at all —
+        // exactly what an auth gateway in front of a GraphQL API returns.
+        const server = yield* serveTestHttpApp((request) =>
+          Effect.gen(function* () {
+            const webRequest = yield* HttpServerRequest.toWeb(request);
+            const body = yield* Effect.promise(() => webRequest.text());
+            if (body.includes("__schema")) {
+              return HttpServerResponse.jsonUnsafe({ data: introspectionResult });
+            }
+            return HttpServerResponse.jsonUnsafe(
+              { error: "insufficient_scope", error_description: "needs repo scope" },
+              { status: 403 },
+            );
+          }),
+        );
+        const executor = yield* makeExecutor();
+
+        yield* executor.graphql.addIntegration({
+          endpoint: server.url("/graphql"),
+          slug: "scope_graph",
+        });
+        yield* createOrgConnection(executor, {
+          integration: "scope_graph",
+          name: "main",
+          template: "none",
+          value: "unused",
+        });
+
+        const result = yield* executor.execute(toolAddr("scope_graph", "main", "query.hello"), {
+          name: "Ada",
+        });
+
+        expect(result).toMatchObject({
+          ok: false,
+          error: { code: "oauth_scope_insufficient", status: 403 },
+        });
+        const recovery = (result as { error: { details: { recovery: Record<string, string> } } })
+          .error.details.recovery;
+        expect(
+          recovery.startOAuthTool,
+          "no oauth.start hint: re-running the identical grant cannot satisfy the scope",
+        ).toBeUndefined();
+      }),
+  );
+
+  it.effect(
+    "classifies a scope-insufficient 403 challenge header as oauth_scope_insufficient",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* serveTestHttpApp((request) =>
+          Effect.gen(function* () {
+            const webRequest = yield* HttpServerRequest.toWeb(request);
+            const body = yield* Effect.promise(() => webRequest.text());
+            if (body.includes("__schema")) {
+              return HttpServerResponse.jsonUnsafe({ data: introspectionResult });
+            }
+            return HttpServerResponse.text("forbidden", {
+              status: 403,
+              headers: {
+                "www-authenticate": 'Bearer realm="api", error="insufficient_scope"',
+              },
+            });
+          }),
+        );
+        const executor = yield* makeExecutor();
+
+        yield* executor.graphql.addIntegration({
+          endpoint: server.url("/graphql"),
+          slug: "scope_hdr_graph",
+        });
+        yield* createOrgConnection(executor, {
+          integration: "scope_hdr_graph",
+          name: "main",
+          template: "none",
+          value: "unused",
+        });
+
+        const result = yield* executor.execute(toolAddr("scope_hdr_graph", "main", "query.hello"), {
+          name: "Ada",
+        });
+
+        expect(result).toMatchObject({
+          ok: false,
+          error: { code: "oauth_scope_insufficient", status: 403 },
+        });
+      }),
+  );
+
   it.effect("invokes OAuth-backed integrations with a rendered bearer token", () =>
     Effect.gen(function* () {
       const server = yield* serveGraphqlTestServer({

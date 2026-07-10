@@ -292,8 +292,22 @@ const mcpInvocationAuthFailure = (input: {
   readonly status: 401 | 403;
   readonly integration: string;
   readonly connection: string;
-}) =>
-  authToolFailure({
+  readonly insufficientScope?: boolean;
+}) => {
+  // A 403 that named a scope shortfall is unfixable by re-running the same
+  // grant, so it carries its own code (and recovery without the oauth.start
+  // hint) instead of the re-authenticate loop.
+  if (input.status === 403 && input.insufficientScope === true) {
+    return authToolFailure({
+      code: "oauth_scope_insufficient",
+      message: `MCP server rejected connection "${input.connection}" with HTTP 403: the connection's OAuth grant does not cover the scope this tool requires. Re-authenticating with the same grant will return the same error; reconnect with broader access.`,
+      integration: { id: input.integration },
+      credential: { kind: "oauth", label: input.connection },
+      status: input.status,
+      upstream: { status: input.status },
+    });
+  }
+  return authToolFailure({
     code: "connection_rejected",
     message:
       input.status === 403
@@ -304,6 +318,7 @@ const mcpInvocationAuthFailure = (input: {
     status: input.status,
     upstream: { status: input.status },
   });
+};
 
 const mcpInvocationOAuthReauthFailure = (input: {
   readonly integration: string;
@@ -1328,6 +1343,7 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
                 status: error.httpStatus,
                 integration: String(credential.integration),
                 connection: String(credential.connection),
+                ...(error.insufficientScope === true ? { insufficientScope: true } : {}),
               }),
             );
           }
@@ -1347,6 +1363,7 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
                 status: error.status,
                 integration: String(credential.integration),
                 connection: String(credential.connection),
+                ...(error.insufficientScope === true ? { insufficientScope: true } : {}),
               }),
             );
           }
