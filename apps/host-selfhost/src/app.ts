@@ -23,6 +23,7 @@ import {
 } from "./auth";
 import { serializeCookie } from "./auth/cookies";
 import { WORKOS_SESSION_COOKIE } from "./auth/workos";
+import { isEncryptedOrgAwsRoleConnection } from "./aws-role-integration";
 import {
   loadConfig,
   loadWorkOSConfig,
@@ -102,9 +103,12 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
             .pipe(
               Effect.flatMap((connection) =>
                 connection
-                  ? executor.connections
-                      .resolveValues(ref)
-                      .pipe(Effect.map((values) => ({ connection, values })))
+                  ? String(ref.integration) === "amazonaws.com" &&
+                    !isEncryptedOrgAwsRoleConnection(connection)
+                    ? Effect.succeed(null)
+                    : executor.connections
+                        .resolveValues(ref)
+                        .pipe(Effect.map((values) => ({ connection, values })))
                   : Effect.succeed(null),
               ),
             ),
