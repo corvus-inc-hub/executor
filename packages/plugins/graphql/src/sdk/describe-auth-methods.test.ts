@@ -120,7 +120,7 @@ describe("describeGraphqlAuthMethods", () => {
       recordWith({
         endpoint: "https://x.example/graphql",
         name: "x",
-        authenticationTemplate: [{ kind: "oauth2", slug: "oauth" }],
+        authenticationTemplate: [{ kind: "oauth2", slug: "oauth", scopes: ["repo"] }],
       }),
     );
 
@@ -130,7 +130,7 @@ describe("describeGraphqlAuthMethods", () => {
         label: "OAuth",
         kind: "oauth",
         template: "oauth",
-        oauth: {},
+        oauth: { scopes: ["repo"] },
       },
     ]);
   });
