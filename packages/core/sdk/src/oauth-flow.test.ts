@@ -1219,4 +1219,12 @@ describe("missingGrantedOAuthScopes canonicalization", () => {
     );
     expect(missing).toEqual([]);
   });
+
+  it("accepts GitHub's comma-separated granted scope response", () => {
+    const missing = missingGrantedOAuthScopes(
+      ["repo", "read:org", "user:email"],
+      "read:org,repo,user:email",
+    );
+    expect(missing).toEqual([]);
+  });
 });

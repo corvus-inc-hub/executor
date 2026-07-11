@@ -232,11 +232,14 @@ const isMetaOAuthScope = (scope: string): boolean => scope.toLowerCase().endsWit
 const normalizedOAuthScopeSet = (scopes: readonly string[]): ReadonlySet<string> =>
   new Set(scopes.map((scope) => canonicalOAuthScope(scope.trim())).filter(Boolean));
 
+const splitOAuthScopes = (scope: string | null): readonly string[] =>
+  scope?.split(/[\s,]+/).filter(Boolean) ?? [];
+
 export const missingGrantedOAuthScopes = (
   requestedScopes: readonly string[],
   recordedScope: string | null,
 ): readonly string[] => {
-  const granted = normalizedOAuthScopeSet(recordedScope?.split(/\s+/).filter(Boolean) ?? []);
+  const granted = normalizedOAuthScopeSet(splitOAuthScopes(recordedScope));
   const seen = new Set<string>();
   const out: string[] = [];
   for (const raw of requestedScopes) {
