@@ -30,8 +30,8 @@ const config: WorkOSConfig = {
   connectAudience: "client_executor",
   m2mAllowedClientIds: new Set(["client_trigger"]),
   leaseRequiredScope: "credentials:lease",
-  leaseDefaultTtlSeconds: 300,
-  leaseMaxTtlSeconds: 900,
+  leaseDefaultTtlSeconds: 3600,
+  leaseMaxTtlSeconds: 3600,
   mcpScopes: ["openid"],
 };
 
@@ -117,7 +117,6 @@ const awsInput: CredentialLeaseRequest = {
   credential: { integration: "amazonaws.com", name: "bedrock-production" },
   purpose: "Run approved Bedrock inference",
   scopes: ["inference"],
-  ttlSeconds: 120,
   delivery: {
     environment: {
       AWS_ACCESS_KEY_ID: "AWS_ACCESS_KEY_ID",
@@ -306,7 +305,7 @@ describe("credential lease service", () => {
                 accessKeyId: "ASIA_TEMPORARY",
                 secretAccessKey: "temporary-secret",
                 sessionToken: "temporary-session",
-                expiresAt: Date.parse("2026-07-10T12:15:00.000Z"),
+                expiresAt: Date.parse("2026-07-10T13:00:00.000Z"),
               });
             },
             verifyM2mToken: verified(),
@@ -328,7 +327,7 @@ describe("credential lease service", () => {
             roleArn: "arn:aws:iam::123456789012:role/executor-bedrock",
             region: "us-east-1",
             externalId: "manifest-production",
-            durationSeconds: 900,
+            durationSeconds: 3600,
           });
           expect(assumption?.roleSessionName).toMatch(/^executor-[a-f0-9]{32}$/);
           expect(response.material).toEqual({
@@ -341,8 +340,8 @@ describe("credential lease service", () => {
             secretFiles: [],
           });
           expect(response.lease).toMatchObject({
-            disposeAfter: "2026-07-10T12:02:00.000Z",
-            sourceCredentialExpiresAt: "2026-07-10T12:15:00.000Z",
+            disposeAfter: "2026-07-10T13:00:00.000Z",
+            sourceCredentialExpiresAt: "2026-07-10T13:00:00.000Z",
           });
 
           const receipt = yield* Effect.promise(() =>

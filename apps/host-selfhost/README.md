@@ -68,8 +68,8 @@ or invalid.
 | `WORKOS_CONNECT_AUDIENCE`                       | no          | JWT audience, defaulting to `WORKOS_CLIENT_ID`.                                 |
 | `WORKOS_M2M_ALLOWED_CLIENT_IDS`                 | for M2M     | Comma-separated service client allowlist. Empty denies all M2M.                 |
 | `WORKOS_CREDENTIAL_LEASE_SCOPE`                 | no          | Required M2M scope, default `credentials:lease`.                                |
-| `EXECUTOR_CREDENTIAL_LEASE_DEFAULT_TTL_SECONDS` | no          | Default lease TTL, 300 seconds.                                                 |
-| `EXECUTOR_CREDENTIAL_LEASE_MAX_TTL_SECONDS`     | no          | Maximum lease TTL, 900 seconds.                                                 |
+| `EXECUTOR_CREDENTIAL_LEASE_DEFAULT_TTL_SECONDS` | no          | Default lease TTL, 3600 seconds.                                                |
+| `EXECUTOR_CREDENTIAL_LEASE_MAX_TTL_SECONDS`     | no          | Maximum lease TTL, 3600 seconds.                                                |
 | `EXECUTOR_SECRET_KEY`                           | recommended | Encrypts Executor credentials. Otherwise generated under `/data`.               |
 
 `WORKOS_API_URL` is an optional WorkOS API override intended for a local
@@ -119,7 +119,7 @@ Content-Type: application/json
   },
   "purpose": "Run approved release workflow",
   "scopes": ["github:read"],
-  "ttlSeconds": 300,
+  "ttlSeconds": 3600,
   "delivery": {
     "environment": {
       "GITHUB_TOKEN": "token"

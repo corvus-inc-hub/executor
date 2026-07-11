@@ -57,8 +57,8 @@ permissions.
 | `WORKOS_CONNECT_AUDIENCE`                       | no          | Connect JWT audience, default `WORKOS_CLIENT_ID`.            |
 | `WORKOS_M2M_ALLOWED_CLIENT_IDS`                 | for M2M     | Allowed service client IDs. Empty denies all M2M identities. |
 | `WORKOS_CREDENTIAL_LEASE_SCOPE`                 | no          | Required lease scope, default `credentials:lease`.           |
-| `EXECUTOR_CREDENTIAL_LEASE_DEFAULT_TTL_SECONDS` | no          | Default 300.                                                 |
-| `EXECUTOR_CREDENTIAL_LEASE_MAX_TTL_SECONDS`     | no          | Default 900.                                                 |
+| `EXECUTOR_CREDENTIAL_LEASE_DEFAULT_TTL_SECONDS` | no          | Default 3600 seconds.                                        |
+| `EXECUTOR_CREDENTIAL_LEASE_MAX_TTL_SECONDS`     | no          | Maximum 3600 seconds.                                        |
 | `EXECUTOR_SECRET_KEY`                           | recommended | Master key for encrypted Executor credentials.               |
 | `EXECUTOR_ALLOW_LOCAL_NETWORK`                  | no          | Allow sandbox access to private networks. Default `false`.   |
 

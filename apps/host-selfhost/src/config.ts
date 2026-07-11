@@ -147,8 +147,8 @@ export const loadWorkOSConfig = (selfHost = loadConfig()): WorkOSConfig => {
     throw new Error("WORKOS_COOKIE_PASSWORD must be at least 32 characters");
   }
 
-  const maxTtl = positiveInteger("EXECUTOR_CREDENTIAL_LEASE_MAX_TTL_SECONDS", 900);
-  const defaultTtl = positiveInteger("EXECUTOR_CREDENTIAL_LEASE_DEFAULT_TTL_SECONDS", 300);
+  const maxTtl = positiveInteger("EXECUTOR_CREDENTIAL_LEASE_MAX_TTL_SECONDS", 3600);
+  const defaultTtl = positiveInteger("EXECUTOR_CREDENTIAL_LEASE_DEFAULT_TTL_SECONDS", 3600);
   if (defaultTtl > maxTtl) {
     // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: invalid lease bounds must fail at boot
     throw new Error(
