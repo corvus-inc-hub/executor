@@ -513,7 +513,7 @@ export const makeCredentialLeaseService = (deps: CredentialLeaseDeps) => ({
           "M2M application lacks the credential lease permission",
         );
       }
-      if (verified.scopes.length > 0 && !verified.scopes.includes(authorizationScope)) {
+      if (!verified.scopes.includes(authorizationScope)) {
         return yield* leaseFailure(403, "forbidden", "M2M token lacks the credential lease scope");
       }
 
@@ -548,7 +548,7 @@ export const makeCredentialLeaseService = (deps: CredentialLeaseDeps) => ({
       }
       const prepared = yield* prepareCredential(input, resolved);
       const grantedCredentialScopes = new Set(
-        (resolved.connection.oauthScope ?? "").split(/\s+/).filter(Boolean),
+        (resolved.connection.oauthScope ?? "").split(/[\s,]+/).filter(Boolean),
       );
       if (
         grantedCredentialScopes.size > 0 &&
