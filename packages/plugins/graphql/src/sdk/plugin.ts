@@ -608,7 +608,7 @@ export const describeGraphqlAuthMethods = (
         label: "OAuth",
         kind: "oauth",
         template: method.slug,
-        oauth: {},
+        oauth: method.scopes?.length ? { scopes: method.scopes } : {},
       };
     }
     return describeNoneAuthMethod(method.slug);

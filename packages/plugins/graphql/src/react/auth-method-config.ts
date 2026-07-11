@@ -24,14 +24,14 @@ import type {
   GraphqlCanonicalAuthMethodInput,
 } from "../sdk/types";
 
-const oauthAuthMethod = (slug: string): AuthMethod => ({
+const oauthAuthMethod = (slug: string, scopes: readonly string[] = []): AuthMethod => ({
   id: slug,
   label: "OAuth",
   kind: "oauth",
   source: slug.startsWith("custom_") ? "custom" : "spec",
   template: AuthTemplateSlug.make(slug),
   placements: [],
-  oauth: {},
+  oauth: scopes.length ? { scopes: [...scopes] } : {},
 });
 
 /** Convert a generic editor value into one GraphQL auth-method input (no slug
@@ -41,7 +41,7 @@ const oauthAuthMethod = (slug: string): AuthMethod => ({
 export function graphqlAuthMethodInputFromEditorValue(
   value: AuthTemplateEditorValue,
 ): GraphqlAuthMethodInput {
-  if (value.kind === "oauth") return { kind: "oauth2" };
+  if (value.kind === "oauth") return { kind: "oauth2", scopes: value.scopes };
   return (sharedMethodInputFromEditorValue(value) ?? { kind: "none" }) as GraphqlAuthMethodInput;
 }
 
@@ -50,8 +50,9 @@ export function editorValueFromGraphqlAuthMethod(
   method: GraphqlAuthMethod,
 ): AuthTemplateEditorValue {
   if (method.kind === "oauth2") {
-    // GraphQL oauth methods store no endpoints — only the bearer rendering.
-    return { kind: "oauth", authorizationUrl: "", tokenUrl: "", scopes: [] };
+    // GraphQL OAuth methods store request scopes and bearer rendering, while
+    // the registered OAuth client owns the authorization and token endpoints.
+    return { kind: "oauth", authorizationUrl: "", tokenUrl: "", scopes: method.scopes ?? [] };
   }
   return editorValueFromSharedMethod(method);
 }
@@ -61,7 +62,7 @@ export function editorValueFromGraphqlAuthMethod(
  *  user-created methods (removable from the hub). */
 export function authMethodsFromConfig(methods: readonly GraphqlAuthMethod[]): AuthMethod[] {
   return methods.map((method: GraphqlAuthMethod): AuthMethod => {
-    if (method.kind === "oauth2") return oauthAuthMethod(method.slug);
+    if (method.kind === "oauth2") return oauthAuthMethod(method.slug, method.scopes);
     return authMethodFromSharedTemplate(method);
   });
 }

@@ -94,6 +94,9 @@ export type OperationBinding = typeof OperationBinding.Type;
 export const GraphqlOAuthMethod = Schema.Struct({
   kind: Schema.Literal("oauth2"),
   slug: Schema.String,
+  /** OAuth scopes declared by this integration. These are requested when a
+   * connection is authorized; an omitted list means the provider default. */
+  scopes: Schema.optional(Schema.Array(Schema.String)),
   /** The header to write the bearer token to. Defaults to `Authorization`. */
   header: Schema.optional(Schema.String),
   /** The token prefix. Defaults to `Bearer `. */
@@ -115,6 +118,7 @@ export const GraphqlAuthMethodInput = Schema.Union([
   Schema.Struct({
     slug: Schema.optional(Schema.String),
     kind: Schema.Literal("oauth2"),
+    scopes: Schema.optional(Schema.Array(Schema.String)),
     header: Schema.optional(Schema.String),
     prefix: Schema.optional(Schema.String),
   }),
@@ -165,7 +169,14 @@ export const normalizeGraphqlAuthMethods = (
   methods: readonly GraphqlAuthMethodInput[],
 ): readonly GraphqlAuthMethod[] =>
   normalizeAuthMethodSlugs(
-    expandGraphqlAuthMethodInputs(methods),
+    expandGraphqlAuthMethodInputs(methods).map((method) =>
+      method.kind === "oauth2" && method.scopes
+        ? {
+            ...method,
+            scopes: [...new Set(method.scopes.map((scope) => scope.trim()).filter(Boolean))],
+          }
+        : method,
+    ),
     defaultGraphqlAuthSlug,
   ) as readonly GraphqlAuthMethod[];
 

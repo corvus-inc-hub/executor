@@ -13,14 +13,17 @@ describe("graphqlAuthMethodInputFromEditorValue", () => {
     expect(graphqlAuthMethodInputFromEditorValue({ kind: "none" })).toEqual({ kind: "none" });
   });
 
-  it("maps 'oauth' → { kind: 'oauth2' } (graphql oauth stores no endpoints)", () => {
+  it("maps OAuth scopes without copying client-owned endpoints", () => {
     const value: AuthTemplateEditorValue = {
       kind: "oauth",
       authorizationUrl: "https://a.example.com/auth",
       tokenUrl: "https://a.example.com/token",
       scopes: ["read"],
     };
-    expect(graphqlAuthMethodInputFromEditorValue(value)).toEqual({ kind: "oauth2" });
+    expect(graphqlAuthMethodInputFromEditorValue(value)).toEqual({
+      kind: "oauth2",
+      scopes: ["read"],
+    });
   });
 
   it("maps a header placement to an apikey method (prefix preserved)", () => {
