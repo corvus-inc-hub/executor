@@ -1,4 +1,4 @@
-import { Duration, Effect, Match, Option, Schema } from "effect";
+import { Clock, Duration, Effect, Match, Option, Schema } from "effect";
 import * as Cause from "effect/Cause";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ContentBlockSchema, type ContentBlock } from "@modelcontextprotocol/sdk/types.js";
@@ -746,10 +746,35 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
       const parent = resolveParentSpan();
       return parent ? Effect.withParentSpan(effect, parent) : effect;
     };
-    const runToolEffect = <EffE>(effect: Effect.Effect<McpToolResult, EffE>) =>
+    const runToolEffect = <EffE>(
+      effect: Effect.Effect<McpToolResult, EffE>,
+      receiptTarget?: string,
+    ) =>
       Effect.runPromiseWith(context)(
-        anchor(effect).pipe(
-          Effect.catchCause((cause) => Effect.succeed(toMcpFailureResult(cause))),
+        anchor(
+          Effect.gen(function* () {
+            const executionId = receiptTarget ? `mcp_${crypto.randomUUID()}` : undefined;
+            const startedAt = receiptTarget ? yield* Clock.currentTimeMillis : undefined;
+            const result = yield* effect.pipe(
+              Effect.catchCause((cause) => Effect.succeed(toMcpFailureResult(cause))),
+            );
+            if (!receiptTarget || !executionId || startedAt === undefined) return result;
+            const completedAt = yield* Clock.currentTimeMillis;
+            return {
+              ...result,
+              structuredContent: {
+                ...result.structuredContent,
+                receipt: {
+                  executionId,
+                  status: result.structuredContent?.status,
+                  durationMs: Math.max(0, completedAt - startedAt),
+                  target: receiptTarget,
+                  startedAt: new Date(startedAt).toISOString(),
+                  completedAt: new Date(completedAt).toISOString(),
+                },
+              },
+            };
+          }),
         ),
       );
 
@@ -937,7 +962,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           description,
           inputSchema: { code: z.string().trim().min(1) },
         },
-        ({ code }) => runToolEffect(executeCode(code)),
+        ({ code }) => runToolEffect(executeCode(code), "execute"),
       ),
     ).pipe(
       Effect.withSpan("mcp.host.register_tool", {
