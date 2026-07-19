@@ -117,3 +117,103 @@ test("a connection value is stored encrypted at rest by the 'encrypted' provider
   expect(cells.some((c) => c.includes(NEEDLE))).toBe(false);
   expect(cells.some((c) => c.includes("v1."))).toBe(true);
 });
+
+// Regression (credential custody): an org-owned connection saved by a signed-in
+// USER must be resolvable by every other subject in the same tenant, in
+// particular the M2M service-account subject the credential-lease path binds.
+// Pre-fix, the encrypted provider captured the writer's binding owner and filed
+// the material under (owner=user, subject=<creator>), so any other subject
+// resolved `{ token: null }` and leases failed 409 "Credential material is
+// incomplete".
+test("org connection material saved by one subject resolves for another subject in the tenant", async () => {
+  const values = await Effect.runPromise(
+    Effect.gen(function* () {
+      const creator = yield* createScopedExecutor("user_creator", "default-org", "Default");
+      yield* creator.openapi.addSpec({
+        spec: { kind: "blob", value: TINY_SPEC },
+        slug: "tiny-shared",
+        baseUrl: "",
+      });
+      yield* creator.connections.create({
+        owner: "org",
+        name: ConnectionName.make("shared"),
+        integration: IntegrationSlug.make("tiny-shared"),
+        template: AuthTemplateSlug.make("bearer"),
+        value: "org-shared-token",
+      });
+      // A DIFFERENT subject (shaped like a WorkOS M2M service-account client id)
+      // bound to the same tenant resolves the org connection's material.
+      const service = yield* createScopedExecutor("client_test_01ABCDEF", "default-org", "Default");
+      return yield* service.connections.resolveValues({
+        owner: "org",
+        integration: IntegrationSlug.make("tiny-shared"),
+        name: ConnectionName.make("shared"),
+      });
+    }).pipe(Effect.provide(dbLayer), Effect.scoped),
+  );
+  expect(values).toEqual({ token: "org-shared-token" });
+
+  // The material's storage row itself sits in the org partition (owner='org',
+  // subject=''), not the creating user's: that is what makes it visible to
+  // every subject in the tenant. Resolve the (namespaced) table name from
+  // sqlite_master rather than hard-coding the FumaDB prefix.
+  const db = createClient({ url: `file:${dbPath}` });
+  const [table] = (
+    await db.execute(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%plugin_storage%'",
+    )
+  ).rows;
+  expect(table).toBeDefined();
+  const rows = (
+    await db.execute(
+      `SELECT owner, subject FROM "${String(table!.name)}" WHERE key LIKE 'connection:org:tiny-shared:%'`,
+    )
+  ).rows;
+  db.close();
+  expect(rows.length).toBeGreaterThan(0);
+  for (const row of rows) {
+    expect(row.owner).toBe("org");
+    expect(row.subject).toBe("");
+  }
+});
+
+// The org-sharing fix must not widen user-owned connections: a personal
+// connection (row and material both under the creating subject's partition)
+// stays invisible to every other subject in the tenant.
+test("a user-owned connection's material stays invisible to other subjects", async () => {
+  const { own, other } = await Effect.runPromise(
+    Effect.gen(function* () {
+      const creator = yield* createScopedExecutor("user_private", "default-org", "Default");
+      yield* creator.openapi.addSpec({
+        spec: { kind: "blob", value: TINY_SPEC },
+        slug: "tiny-private",
+        baseUrl: "",
+      });
+      yield* creator.connections.create({
+        owner: "user",
+        name: ConnectionName.make("mine"),
+        integration: IntegrationSlug.make("tiny-private"),
+        template: AuthTemplateSlug.make("bearer"),
+        value: "user-private-token",
+      });
+      const ref = {
+        owner: "user",
+        integration: IntegrationSlug.make("tiny-private"),
+        name: ConnectionName.make("mine"),
+      } as const;
+      const stranger = yield* createScopedExecutor(
+        "client_test_01ABCDEF",
+        "default-org",
+        "Default",
+      );
+      return {
+        own: yield* creator.connections.resolveValues(ref),
+        other: yield* stranger.connections.resolveValues(ref),
+      };
+    }).pipe(Effect.provide(dbLayer), Effect.scoped),
+  );
+  // Positive control: the owner resolves their own material.
+  expect(own).toEqual({ token: "user-private-token" });
+  // Another subject cannot even see the connection row, let alone the value.
+  expect(other).toEqual({});
+});

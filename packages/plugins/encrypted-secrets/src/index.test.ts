@@ -7,19 +7,23 @@ import { decryptSecret, deriveKey, encryptSecret, encryptedSecretsPlugin } from 
 
 // ---------------------------------------------------------------------------
 // In-memory PluginStorageFacade fake (owner-partitioned), enough to exercise
-// the provider exactly as the executor's plugin-storage table would.
+// the provider exactly as the executor's plugin-storage table would: rows are
+// keyed by (owner, collection, key); `get` is not owner-filtered and searches
+// the user partition before the org one (the executor's read precedence),
+// while `put`/`remove` target exactly the owner they are handed.
 //
 // v2: the provider keys values by the opaque `ProviderItemId` (the storage
-// `key`); writes carry an `owner` the host supplies. Reads via `get`/`list`
-// are not owner-filtered — the connection row that references the id owns the
-// partition.
+// `key`); the connection row that references the id owns the partition.
 // ---------------------------------------------------------------------------
+
+const READ_OWNERS: readonly Owner[] = [Owner.make("user"), Owner.make("org")];
 
 const makeFakeStorage = () => {
   const rows = new Map<string, { owner: Owner; key: string; collection: string; data: unknown }>();
-  const composite = (collection: string, key: string) => `${collection} ${key}`;
+  const composite = (owner: Owner, collection: string, key: string) =>
+    `${owner} ${collection} ${key}`;
   const toEntry = (row: { owner: Owner; key: string; collection: string; data: unknown }) => ({
-    id: composite(row.collection, row.key),
+    id: composite(row.owner, row.collection, row.key),
     owner: row.owner,
     pluginId: "encryptedSecrets",
     collection: row.collection,
@@ -28,16 +32,23 @@ const makeFakeStorage = () => {
     createdAt: new Date(0),
     updatedAt: new Date(0),
   });
+  const visible = (collection: string, key: string) => {
+    for (const owner of READ_OWNERS) {
+      const row = rows.get(composite(owner, collection, key));
+      if (row) return row;
+    }
+    return null;
+  };
   const facade = {
     get: (input: { collection: string; key: string }) =>
       Effect.sync(() => {
-        const row = rows.get(composite(input.collection, input.key));
+        const row = visible(input.collection, input.key);
         return row ? (toEntry(row) as never) : null;
       }),
     getForOwner: (input: { collection: string; key: string; owner: Owner }) =>
       Effect.sync(() => {
-        const row = rows.get(composite(input.collection, input.key));
-        return row && row.owner === input.owner ? (toEntry(row) as never) : null;
+        const row = rows.get(composite(input.owner, input.collection, input.key));
+        return row ? (toEntry(row) as never) : null;
       }),
     list: (input: { collection: string }) =>
       Effect.sync(
@@ -54,12 +65,12 @@ const makeFakeStorage = () => {
           collection: input.collection,
           data: input.data,
         };
-        rows.set(composite(input.collection, input.key), row);
+        rows.set(composite(input.owner, input.collection, input.key), row);
         return toEntry(row) as never;
       }),
     remove: (input: { collection: string; key: string; owner: Owner }) =>
       Effect.sync(() => {
-        rows.delete(composite(input.collection, input.key));
+        rows.delete(composite(input.owner, input.collection, input.key));
       }),
   };
   return { facade, rows };
@@ -69,7 +80,10 @@ const makeProvider = (key: string, owner: Owner = Owner.make("org")) => {
   const { facade, rows } = makeFakeStorage();
   // oxlint-disable-next-line executor/no-double-cast -- test boundary: minimal PluginCtx fake for the provider under test
   const ctx = {
-    owner: { tenant: "tenant-a", subject: owner === Owner.make("user") ? "subject-a" : null },
+    owner: {
+      tenant: "tenant-a",
+      subject: owner === Owner.make("user") ? "subject-a" : null,
+    },
     pluginStorage: facade,
   } as unknown as PluginCtx<unknown>;
   const plugin = encryptedSecretsPlugin({ key });
@@ -160,5 +174,68 @@ describe("provider", () => {
     await Effect.runPromise(provider.set!(id("beta"), "b"));
     const entries = await Effect.runPromise(provider.list!());
     expect(entries.map((e) => e.id).sort()).toEqual(["alpha", "beta"]);
+  });
+});
+
+describe("partition derivation", () => {
+  const orgItem = id("connection:org:tiny:gh:token");
+  const userItem = id("connection:user:tiny:gh:token");
+
+  test("an org connection item written by a user-bound executor lands in the org partition", async () => {
+    const { provider, rows } = makeProvider("master", Owner.make("user"));
+    await Effect.runPromise(provider.set!(orgItem, "org-secret"));
+    const stored = [...rows.values()];
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.owner).toBe("org");
+    expect(await Effect.runPromise(provider.get(orgItem))).toBe("org-secret");
+  });
+
+  test("a user connection item stays in the writing subject's user partition", async () => {
+    const { provider, rows } = makeProvider("master", Owner.make("user"));
+    await Effect.runPromise(provider.set!(userItem, "user-secret"));
+    const stored = [...rows.values()];
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.owner).toBe("user");
+  });
+
+  test("a non-connection item keeps the binding-derived owner", async () => {
+    const { provider, rows } = makeProvider("master", Owner.make("user"));
+    await Effect.runPromise(provider.set!(id("plain"), "v"));
+    expect([...rows.values()][0]!.owner).toBe("user");
+  });
+
+  test("re-saving an org item clears a stray pre-fix user-partition copy", async () => {
+    const { provider, rows } = makeProvider("master", Owner.make("user"));
+    // Simulate a pre-fix write: the org item's payload stranded in the writing
+    // subject's user partition, where it shadows the org row on read.
+    rows.set(`user secrets ${orgItem}`, {
+      owner: Owner.make("user"),
+      key: orgItem,
+      collection: "secrets",
+      data: "v1.stale",
+    });
+    await Effect.runPromise(provider.set!(orgItem, "fresh"));
+    const stored = [...rows.values()];
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.owner).toBe("org");
+    expect(await Effect.runPromise(provider.get(orgItem))).toBe("fresh");
+  });
+
+  test("deleting an org item clears both the org row and a stray user copy", async () => {
+    const { provider, rows } = makeProvider("master", Owner.make("user"));
+    rows.set(`org secrets ${orgItem}`, {
+      owner: Owner.make("org"),
+      key: orgItem,
+      collection: "secrets",
+      data: "v1.current",
+    });
+    rows.set(`user secrets ${orgItem}`, {
+      owner: Owner.make("user"),
+      key: orgItem,
+      collection: "secrets",
+      data: "v1.stale",
+    });
+    await Effect.runPromise(provider.delete!(orgItem));
+    expect(rows.size).toBe(0);
   });
 });
