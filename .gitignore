@@ -88,6 +88,7 @@ executor.jsonc
 # reference repos (pulled via `bun run pull:references`)
 .reference
 .reference/
+.repos/effect/
 .worktrees/
 
 .mcp.json
@@ -114,4 +115,3 @@ scratch/
 
 # Throwaway UX prototype (not part of the app)
 ux-demo/
-
