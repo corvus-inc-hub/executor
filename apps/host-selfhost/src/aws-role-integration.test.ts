@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Predicate } from "effect";
 import { afterAll, beforeAll, expect, test } from "@effect/vitest";
 
 import { makeScopedExecutor } from "@executor-js/api/server";
@@ -108,7 +108,7 @@ test("rejects and removes static AWS access-key material", async () => {
           },
         })
         .pipe(Effect.flip);
-      expect(failure._tag).toBe("StorageError");
+      expect(Predicate.isTagged(failure, "StorageError")).toBe(true);
 
       const ref = { owner: "org" as const, integration: AWS_ROLE_INTEGRATION_SLUG, name };
       const rejectedConnection = yield* executor.connections.get(ref);

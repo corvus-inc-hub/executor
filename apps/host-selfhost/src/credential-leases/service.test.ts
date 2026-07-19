@@ -87,7 +87,7 @@ const connection: Connection = {
 };
 
 const input: CredentialLeaseRequest = {
-  organizationId: "org_allowed",
+  organizationId: "org_platform",
   workspaceId: "workspace_manifest",
   runId: "run_123",
   credential: { integration: "github", name: "github-prod" },
@@ -111,7 +111,7 @@ const awsConnection: Connection = {
 };
 
 const awsInput: CredentialLeaseRequest = {
-  organizationId: "org_allowed",
+  organizationId: "org_platform",
   workspaceId: "workspace_manifest",
   runId: "run_bedrock_123",
   credential: { integration: "amazonaws.com", name: "bedrock-production" },
@@ -254,6 +254,39 @@ describe("credential lease service", () => {
     ),
   );
 
+  it.effect("rejects a foreign request organization before credential resolution", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(async () => {
+        const db = createClient({ url: ":memory:" });
+        await Effect.runPromise(ensureWorkOSIdentityTables(db));
+        return db;
+      }),
+      (db) =>
+        Effect.gen(function* () {
+          let resolved = false;
+          const service = makeCredentialLeaseService({
+            config,
+            workos,
+            db,
+            assumeAwsRole: assumeAwsRoleUnused,
+            verifyM2mToken: verified(),
+            resolveCredential: () => {
+              resolved = true;
+              return Effect.succeed({ connection, values: { token: "should-not-resolve" } });
+            },
+          });
+          const result = yield* Effect.result(
+            service.lease(request, { ...input, organizationId: "org_foreign" }),
+          );
+          expect(Result.isFailure(result)).toBe(true);
+          if (!Result.isFailure(result)) return;
+          expect(result.failure).toMatchObject({ code: "forbidden", status: 403 });
+          expect(resolved).toBe(false);
+        }),
+      (db) => Effect.sync(() => db.close()),
+    ),
+  );
+
   it.effect("rejects a token without the credential lease permission", () =>
     Effect.acquireUseRelease(
       Effect.promise(async () => {
@@ -269,7 +302,7 @@ describe("credential lease service", () => {
             workos,
             db,
             assumeAwsRole: assumeAwsRoleUnused,
-            verifyM2mToken: verified("org_allowed", ["github:read"]),
+            verifyM2mToken: verified("org_platform", ["github:read"]),
             resolveCredential: () => {
               resolved = true;
               return Effect.succeed({ connection, values: { token: "should-not-resolve" } });

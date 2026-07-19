@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Client } from "@libsql/client";
-import { Data, Effect } from "effect";
+import { Data, Effect, Predicate } from "effect";
 
 import {
   ConnectionName,
@@ -338,7 +338,7 @@ const materializeCredential = (
   { readonly values: Readonly<Record<string, string>>; readonly sourceExpiration: number | null },
   CredentialLeaseError
 > => {
-  if (prepared._tag === "Resolved") return Effect.succeed(prepared);
+  if (Predicate.isTagged(prepared, "Resolved")) return Effect.succeed(prepared);
   const roleSessionName = `executor-${sha256(
     `${input.organizationId}:${input.workspaceId}:${input.runId}`,
   ).slice(0, 32)}`;
@@ -471,6 +471,16 @@ export const makeCredentialLeaseService = (deps: CredentialLeaseDeps) => ({
         verified.organizationId !== deps.config.serviceOrganizationId
       ) {
         return yield* leaseFailure(403, "forbidden", "M2M platform identity is not authorized");
+      }
+      if (
+        input.organizationId !== verified.organizationId ||
+        input.organizationId !== deps.config.serviceOrganizationId
+      ) {
+        return yield* leaseFailure(
+          403,
+          "forbidden",
+          "Credential lease organization does not match the verified platform identity",
+        );
       }
       if (
         deps.config.m2mAllowedClientIds.size === 0 ||

@@ -77,6 +77,8 @@ type DescribedTool = {
   readonly inputTypeScript?: string;
   readonly outputTypeScript?: string;
   readonly typeScriptDefinitions?: Record<string, string>;
+  readonly schemaVersion?: string;
+  readonly guarantees?: Readonly<Record<string, boolean>>;
   /** Set when the path resolves to no tool — mirrors invoke's tool_not_found. */
   readonly error?: {
     readonly code: "tool_not_found";
@@ -130,11 +132,34 @@ const BUILTIN_TOOL_DESCRIPTIONS: ReadonlyMap<string, DescribedTool> = new Map<
       outputTypeScript: "DescribedTool",
       typeScriptDefinitions: {
         DescribedTool:
-          '{ path: string; name: string; description?: string; inputTypeScript?: string; outputTypeScript?: string; typeScriptDefinitions?: { [k: string]: string; }; error?: { code: "tool_not_found"; message: string; suggestions?: string[]; }; }',
+          '{ path: string; name: string; description?: string; inputTypeScript?: string; outputTypeScript?: string; typeScriptDefinitions?: { [k: string]: string; }; schemaVersion?: string; guarantees?: { [k: string]: boolean; }; error?: { code: "tool_not_found"; message: string; suggestions?: string[]; }; }',
       },
     },
   ],
 ]);
+
+const toolCapability = (
+  outputSchema: unknown,
+): Pick<DescribedTool, "schemaVersion" | "guarantees"> => {
+  if (typeof outputSchema !== "object" || outputSchema === null) return {};
+  const extension = Reflect.get(outputSchema, "x-executor-capability");
+  if (typeof extension !== "object" || extension === null) return {};
+  const schemaVersion = Reflect.get(extension, "schemaVersion");
+  const rawGuarantees = Reflect.get(extension, "guarantees");
+  if (
+    typeof schemaVersion !== "string" ||
+    typeof rawGuarantees !== "object" ||
+    rawGuarantees === null
+  ) {
+    return {};
+  }
+  const guarantees: Record<string, boolean> = {};
+  for (const [name, value] of Object.entries(rawGuarantees)) {
+    if (typeof value !== "boolean") return {};
+    guarantees[name] = value;
+  }
+  return { schemaVersion, guarantees };
+};
 
 const newCorrelationId = (): string => {
   // 8-hex-char correlation id; enough entropy to disambiguate within a
@@ -859,6 +884,7 @@ export const describeTool = Effect.fn("executor.tools.describe")(function* (
     inputTypeScript: schema.inputTypeScript,
     outputTypeScript: wrapOutputTypeScript(schema.outputTypeScript),
     typeScriptDefinitions: withToolResultDefinitions(schema.typeScriptDefinitions),
+    ...toolCapability(schema.outputSchema),
   };
   return described;
 });

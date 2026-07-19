@@ -11,6 +11,12 @@ export {
   type GraphqlConfigureAuthInput,
 } from "./plugin";
 export { makeDefaultGraphqlStore, type GraphqlStore, type StoredOperation } from "./store";
+export {
+  CommitArtifact,
+  PushCommitArtifactInput,
+  PushCommitArtifactReceipt,
+  RepositoryDeliveryPolicy,
+} from "./github-governed-commit";
 
 export {
   GraphqlIntrospectionError,

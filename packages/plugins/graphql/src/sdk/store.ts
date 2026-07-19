@@ -21,6 +21,7 @@ import { OperationBinding } from "./types";
 
 const CATALOG_OWNER: Owner = "org";
 const OPERATION_COLLECTION = "operation";
+const GOVERNED_EFFECT_COLLECTION = "governedEffect";
 
 export interface StoredOperation {
   /** The tool's leaf name, e.g. `query.hello`. */
@@ -102,6 +103,16 @@ export interface GraphqlStore {
   readonly getIntrospection: (
     introspectionHash: string,
   ) => Effect.Effect<string | null, StorageFailure>;
+  /** Durable idempotency state for host-governed GitHub effects. The value is
+   *  schema-decoded by the capability that owns it, so this store remains a
+   *  persistence adapter rather than a second domain authority. */
+  readonly getGovernedEffect: (
+    idempotencyKey: string,
+  ) => Effect.Effect<unknown | null, StorageFailure>;
+  readonly putGovernedEffect: (
+    idempotencyKey: string,
+    value: unknown,
+  ) => Effect.Effect<void, StorageFailure>;
 }
 
 export const makeDefaultGraphqlStore = ({ pluginStorage, blobs }: StorageDeps): GraphqlStore => {
@@ -161,5 +172,20 @@ export const makeDefaultGraphqlStore = ({ pluginStorage, blobs }: StorageDeps): 
       }),
 
     getIntrospection: (introspectionHash) => blobs.get(introspectionBlobKey(introspectionHash)),
+
+    getGovernedEffect: (idempotencyKey) =>
+      pluginStorage
+        .get({ collection: GOVERNED_EFFECT_COLLECTION, key: idempotencyKey })
+        .pipe(Effect.map((row) => row?.data ?? null)),
+
+    putGovernedEffect: (idempotencyKey, value) =>
+      pluginStorage
+        .put({
+          owner: CATALOG_OWNER,
+          collection: GOVERNED_EFFECT_COLLECTION,
+          key: idempotencyKey,
+          data: value,
+        })
+        .pipe(Effect.asVoid),
   };
 };

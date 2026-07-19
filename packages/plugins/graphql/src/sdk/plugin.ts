@@ -53,6 +53,11 @@ import { validateOperationString } from "./validate-selection";
 import { graphqlPresets } from "./presets";
 import { makeDefaultGraphqlStore, type GraphqlStore, type StoredOperation } from "./store";
 import {
+  GITHUB_GOVERNED_COMMIT_TOOL,
+  isGithubGraphqlEndpoint,
+  pushCommitArtifact,
+} from "./github-governed-commit";
+import {
   GraphqlAuthMethodInput,
   decodeGraphqlIntegrationConfig,
   decodeGraphqlIntegrationConfigOption,
@@ -1010,8 +1015,16 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
           return incomplete("GraphQL introspection result could not be converted to tools.");
         }
         const prepared = prepareOperations(extracted.value.result.fields, introspection.value);
+        const tools = buildToolDefs(prepared);
         return {
-          tools: buildToolDefs(prepared),
+          tools: isGithubGraphqlEndpoint(graphqlConfig.endpoint)
+            ? [
+                ...tools.filter(
+                  (tool) => String(tool.name) !== String(GITHUB_GOVERNED_COMMIT_TOOL.name),
+                ),
+                GITHUB_GOVERNED_COMMIT_TOOL,
+              ]
+            : tools,
           definitions: extracted.value.definitions,
         };
       }).pipe(
@@ -1044,6 +1057,43 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
               }),
           ),
         );
+
+        if (
+          toolName === String(GITHUB_GOVERNED_COMMIT_TOOL.name) &&
+          isGithubGraphqlEndpoint(config.endpoint)
+        ) {
+          const token = credential.values[TOKEN_VARIABLE];
+          if (token == null || token.length === 0) {
+            return yield* new GraphqlAuthRequiredError({
+              code: "oauth_connection_missing",
+              message: `Missing OAuth connection value for GraphQL integration "${integration}" (connection "${credential.connection}")`,
+              owner: credential.owner,
+              integration,
+              connection: String(credential.connection),
+              credentialKind: "oauth",
+              credentialLabel: "OAuth sign-in",
+              template: String(credential.template),
+            });
+          }
+          return yield* pushCommitArtifact(args, token, ctx.storage).pipe(
+            Effect.provide(httpClientLayer),
+            Effect.map(ToolResult.ok),
+            Effect.catchTag("GithubGovernedCommitError", (error) =>
+              Effect.succeed(
+                ToolResult.fail({
+                  code: error.code,
+                  message: error.message,
+                  ...(error.status === null ? {} : { status: error.status }),
+                  retryable: error.retryable,
+                  details: {
+                    stage: error.stage,
+                    ambiguous: error.ambiguous,
+                  },
+                }),
+              ),
+            ),
+          );
+        }
 
         // Operation bindings are produced lazily for integrations registered
         // without an add-time schema (no network at catalog registration). On a

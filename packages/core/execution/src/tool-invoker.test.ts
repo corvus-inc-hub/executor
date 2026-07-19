@@ -74,6 +74,13 @@ const RepoDetailsOutputJson = {
   type: "object",
   properties: { defaultBranch: { type: "string" } },
   required: ["defaultBranch"],
+  "x-executor-capability": {
+    schemaVersion: "mnfst.executor.push-commit-artifact-capability.v1",
+    guarantees: {
+      exactCommitSha: true,
+      idempotencyKey: true,
+    },
+  },
 } as const;
 const ContactInputJson = {
   type: "object",
@@ -873,6 +880,12 @@ describe("tool discovery", () => {
         ToolFile:
           '{ _tag: "ToolFile"; name?: string; mimeType: string; encoding: "base64"; data: string; byteLength: number; }',
         ToolHttpMeta: "{ status: number; headers: { [k: string]: string; } }",
+      });
+      const capability = yield* describeTool(executor, "github.org.main.getRepositoryDetails");
+      expect(capability.schemaVersion).toBe("mnfst.executor.push-commit-artifact-capability.v1");
+      expect(capability.guarantees).toEqual({
+        exactCommitSha: true,
+        idempotencyKey: true,
       });
     }),
   );
