@@ -96,6 +96,9 @@ export interface OAuthClientSummary {
   readonly tokenUrl: string;
   readonly resource?: string | null;
   readonly clientId: string;
+  /** True when the confidential client has a stored secret reference. The
+   *  reference and secret remain private; callers can only verify presence. */
+  readonly credentialReferencePresent: boolean;
   readonly origin: OAuthClientOrigin;
 }
 

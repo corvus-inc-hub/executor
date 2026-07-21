@@ -916,6 +916,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               tokenUrl: String(row.token_url),
               resource: row.resource == null ? null : String(row.resource),
               clientId: String(row.client_id),
+              credentialReferencePresent: row.client_secret_item_id != null,
               origin: parseOAuthClientOrigin(row),
             } satisfies OAuthClientSummary);
           }),

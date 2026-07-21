@@ -91,6 +91,7 @@ describe("oauth.listClients", () => {
           tokenUrl: "https://acme.test/token",
           resource: null,
           clientId: "org-client-id",
+          credentialReferencePresent: true,
           // Manual apps carry a nullable recorded-intent integration; a client
           // created outside any integration dialog stamps null.
           origin: { kind: "manual", integration: null },

@@ -115,8 +115,12 @@ const OAuthClientSummaryResponse = Schema.Struct({
   tokenUrl: Schema.String,
   resource: Schema.optional(Schema.NullOr(Schema.String)),
   clientId: Schema.String,
+  credentialReferencePresent: Schema.Boolean,
   origin: Schema.Union([
-    Schema.Struct({ kind: Schema.Literal("manual") }),
+    Schema.Struct({
+      kind: Schema.Literal("manual"),
+      integration: Schema.optional(Schema.NullOr(IntegrationSlug)),
+    }),
     Schema.Struct({
       kind: Schema.Literal("dynamic_client_registration"),
       integration: Schema.optional(Schema.NullOr(IntegrationSlug)),
