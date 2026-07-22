@@ -1,5 +1,37 @@
 # executor
 
+## 1.5.35
+
+### Patch Changes
+
+- Updated dependencies [[`1b9b1f1`](https://github.com/UsefulSoftwareCo/executor/commit/1b9b1f10313834a625a411169ebf83f6181589df), [`99c808f`](https://github.com/UsefulSoftwareCo/executor/commit/99c808f09d3cf2263945efa4f6592cc4e78c9e08)]:
+  - @executor-js/sdk@1.5.35
+  - @executor-js/runtime-quickjs@1.5.35
+  - @executor-js/local@1.4.4
+  - @executor-js/api@1.4.55
+
+## 1.5.34
+
+### Patch Changes
+
+- Updated dependencies [[`e2712db`](https://github.com/UsefulSoftwareCo/executor/commit/e2712dbff98145c5c340832ffbdcb21113b9dd78), [`7207347`](https://github.com/UsefulSoftwareCo/executor/commit/720734756a70b1b4f1564bdf82dc4118e5de2b76), [`0c4e9b4`](https://github.com/UsefulSoftwareCo/executor/commit/0c4e9b49fecb35ad71c92a464c3ea01131ff9d6f)]:
+  - @executor-js/sdk@1.5.34
+  - @executor-js/local@1.4.4
+  - @executor-js/api@1.4.54
+  - @executor-js/runtime-quickjs@1.5.34
+
+## 1.5.33
+
+### Patch Changes
+
+- [#1404](https://github.com/UsefulSoftwareCo/executor/pull/1404) [`5e0dd15`](https://github.com/UsefulSoftwareCo/executor/commit/5e0dd15291daaedf10f6eb8e03c5afdca8787764) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - The provider service split boot migration now skips an org whose Google or Microsoft integration cannot be migrated (for example a config without a stored specHash) instead of failing the whole migration and blocking server startup. A daemon that does fail during boot now exits with the underlying error message instead of hanging with a generic "Unknown error".
+
+- Updated dependencies []:
+  - @executor-js/local@1.4.4
+  - @executor-js/sdk@1.5.33
+  - @executor-js/runtime-quickjs@1.5.33
+  - @executor-js/api@1.4.53
+
 ## 1.5.32
 
 ### Patch Changes
