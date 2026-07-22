@@ -79,20 +79,20 @@ const workos: WorkOSClient = {
 const connection: Connection = {
   owner: "org",
   name: ConnectionName.make("github-prod"),
-  integration: IntegrationSlug.make("github"),
+  integration: IntegrationSlug.make("github_graphql"),
   template: AuthTemplateSlug.make("oauth"),
   provider: ProviderKey.make("default"),
   address: ConnectionAddress.make("tools.github.org.github-prod"),
-  oauthScope: "github:read",
+  oauthScope: "read:org,repo",
 };
 
 const input: CredentialLeaseRequest = {
   organizationId: "org_platform",
   workspaceId: "workspace_manifest",
   runId: "run_123",
-  credential: { integration: "github", name: "github-prod" },
+  credential: { integration: "github_graphql", name: "github-prod" },
   purpose: "Run approved GitHub release workflow",
-  scopes: ["github:read"],
+  scopes: ["contents:read"],
   ttlSeconds: 120,
   delivery: {
     environment: { GITHUB_TOKEN: "token" },
@@ -214,6 +214,39 @@ describe("credential lease service", () => {
             code: "credential_unavailable",
             status: 409,
           });
+          const receipts = yield* Effect.promise(() =>
+            db.execute("SELECT id FROM credential_lease_receipt"),
+          );
+          expect(receipts.rows).toHaveLength(0);
+        }),
+      (db) => Effect.sync(() => db.close()),
+    ),
+  );
+
+  it.effect("rejects a GitHub capability not implied by the recorded OAuth grant", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(async () => {
+        const db = createClient({ url: ":memory:" });
+        await Effect.runPromise(ensureWorkOSIdentityTables(db));
+        return db;
+      }),
+      (db) =>
+        Effect.gen(function* () {
+          const service = makeCredentialLeaseService({
+            config,
+            workos,
+            db,
+            assumeAwsRole: assumeAwsRoleUnused,
+            verifyM2mToken: verified(),
+            resolveCredential: () =>
+              Effect.succeed({ connection, values: { token: "should-not-resolve" } }),
+          });
+          const result = yield* Effect.result(
+            service.lease(request, { ...input, scopes: ["contents:write"] }),
+          );
+          expect(Result.isFailure(result)).toBe(true);
+          if (!Result.isFailure(result)) return;
+          expect(result.failure).toMatchObject({ code: "forbidden", status: 403 });
           const receipts = yield* Effect.promise(() =>
             db.execute("SELECT id FROM credential_lease_receipt"),
           );

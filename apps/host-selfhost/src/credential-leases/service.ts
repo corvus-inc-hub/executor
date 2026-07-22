@@ -23,12 +23,26 @@ const ENV_NAME = /^[A-Z_][A-Z0-9_]{0,127}$/;
 const FILE_NAME = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const ID = /^[A-Za-z0-9][A-Za-z0-9_:./-]{0,127}$/;
 const AWS_INTEGRATION = "amazonaws.com";
+const GITHUB_GRAPHQL_INTEGRATION = "github_graphql";
 const AWS_ROLE_ARN = /^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role\/[A-Za-z0-9_+=,.@/-]+$/;
 const AWS_REGION = /^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$/;
 const AWS_EXTERNAL_ID = /^[A-Za-z0-9_+=,.@:/-]{2,1224}$/;
 const AWS_ROLE_CONFIGURATION = new Set(["AWS_ROLE_ARN", "AWS_REGION", "AWS_EXTERNAL_ID"]);
 const AWS_MIN_SESSION_SECONDS = 900;
 const AWS_ROLE_CHAIN_MAX_SESSION_SECONDS = 3600;
+
+const credentialGrantCoversScope = (
+  integration: string,
+  grantedScopes: ReadonlySet<string>,
+  requestedScope: string,
+): boolean => {
+  if (grantedScopes.has(requestedScope)) return true;
+  return (
+    integration === GITHUB_GRAPHQL_INTEGRATION &&
+    requestedScope === "contents:read" &&
+    grantedScopes.has("repo")
+  );
+};
 
 export interface CredentialLeaseRequest {
   readonly organizationId: string;
@@ -562,7 +576,14 @@ export const makeCredentialLeaseService = (deps: CredentialLeaseDeps) => ({
       );
       if (
         grantedCredentialScopes.size > 0 &&
-        input.scopes.some((scope) => !grantedCredentialScopes.has(scope))
+        input.scopes.some(
+          (scope) =>
+            !credentialGrantCoversScope(
+              input.credential.integration,
+              grantedCredentialScopes,
+              scope,
+            ),
+        )
       ) {
         return yield* leaseFailure(
           403,
