@@ -19,6 +19,7 @@ permissions:
 jobs:
   sweep:
     name: Destroy previews for closed PRs
+    if: github.repository == 'UsefulSoftwareCo/executor'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
