@@ -5,8 +5,8 @@ QuickJS execution runtime, and web console in one container. SQLite data and the
 Executor secret-encryption key remain local. WorkOS AuthKit is the only identity
 provider.
 
-The fork is based on upstream Executor `v1.5.31` at
-`04ce4b4ae53a900f9c28276c300f3c8d5010472b`.
+The fork is based on upstream Executor `v1.5.35` at the exact commit recorded in
+[`upstream-baseline.txt`](./upstream-baseline.txt).
 
 ## Identity contract
 
@@ -168,7 +168,7 @@ docker buildx build \
   --file apps/host-selfhost/Dockerfile \
   --build-arg EXECUTOR_IMAGE_SOURCE="$SOURCE_URL" \
   --build-arg EXECUTOR_SOURCE_REVISION="$SOURCE_REVISION" \
-  --build-arg EXECUTOR_UPSTREAM_REVISION=04ce4b4ae53a900f9c28276c300f3c8d5010472b \
+  --build-arg EXECUTOR_UPSTREAM_REVISION="$(cat apps/host-selfhost/upstream-baseline.txt)" \
   --tag "$IMAGE" \
   --push \
   .
@@ -183,7 +183,7 @@ Before changing the digest consumed by infrastructure, verify the image is
 org.opencontainers.image.source=<owned fork URL>
 org.opencontainers.image.revision=<full owned-fork commit SHA>
 io.mnfst.executor.auth-provider=workos-authkit
-io.mnfst.executor.upstream-revision=04ce4b4ae53a900f9c28276c300f3c8d5010472b
+io.mnfst.executor.upstream-revision=<exact commit in upstream-baseline.txt>
 ```
 
 Publishing an image does not deploy it. Deployment and digest updates belong to
