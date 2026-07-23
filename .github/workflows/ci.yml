@@ -182,6 +182,10 @@ jobs:
 
   e2e:
     name: E2E (${{ matrix.target }}${{ matrix['shard-name'] && format(' {0}', matrix['shard-name']) || '' }})
+    # Manifest deploys only the owned self-host image and proves real WorkOS
+    # identity in G2/production. The upstream suites exercise Cloudflare and
+    # legacy password sign-in contracts that the fork intentionally removed.
+    if: github.repository == 'UsefulSoftwareCo/executor'
     strategy:
       fail-fast: false
       matrix:
@@ -265,7 +269,7 @@ jobs:
     name: E2E (stdio MCP)
     # Skipped on pull_request: the local scenario boots a real `executor web`
     # plus a browser and is currently flaky on PRs. Still runs on push to main.
-    if: github.event_name != 'pull_request'
+    if: github.repository == 'UsefulSoftwareCo/executor' && github.event_name != 'pull_request'
     runs-on: ${{ github.repository == 'UsefulSoftwareCo/executor' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
@@ -322,7 +326,7 @@ jobs:
   desktop-smoke:
     name: Desktop smoke build
     needs: changes
-    if: needs.changes.outputs.desktop_smoke == 'true'
+    if: github.repository == 'UsefulSoftwareCo/executor' && needs.changes.outputs.desktop_smoke == 'true'
     runs-on: ${{ github.repository == 'UsefulSoftwareCo/executor' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
@@ -441,10 +445,12 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d --name selfhost-smoke -p 4788:4788 \
-            -e BETTER_AUTH_SECRET="$(openssl rand -hex 32)" \
-            -e EXECUTOR_BOOTSTRAP_ADMIN_EMAIL=smoke@example.com \
-            -e EXECUTOR_BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -hex 16)" \
             -e EXECUTOR_WEB_BASE_URL=http://localhost:4788 \
+            -e WORKOS_API_KEY=sk_test_smoke \
+            -e WORKOS_CLIENT_ID=client_smoke \
+            -e WORKOS_COOKIE_PASSWORD="$(openssl rand -hex 32)" \
+            -e WORKOS_SERVICE_ORGANIZATION_ID=org_smoke \
+            -e WORKOS_AUTHKIT_DOMAIN=https://authkit.example.com \
             executor-selfhost:ci
           for i in $(seq 1 30); do
             if [ "$(docker inspect -f '{{.State.Running}}' selfhost-smoke)" != "true" ]; then
