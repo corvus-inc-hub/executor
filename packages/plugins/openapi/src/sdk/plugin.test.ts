@@ -1135,7 +1135,10 @@ paths:
 
         expect(added.toolCount).toBe(MICROSOFT_GRAPH_V1_OPERATION_COUNT);
       }),
-    30_000,
+    // GitHub-hosted arm64 emulation and the concurrent workspace test matrix can
+    // push the full Graph catalog just beyond 30 seconds. Keep the production-
+    // scale contract, but give the fixture enough CI headroom to be meaningful.
+    60_000,
   );
 
   it.effect("removeSpec cleans up the integration and its tools", () =>

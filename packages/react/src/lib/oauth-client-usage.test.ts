@@ -22,6 +22,7 @@ const app = (slug: string, opts?: { readonly owner?: Owner }): OAuthClientSummar
   tokenUrl: "https://issuer.example.com/token",
   resource: null,
   clientId: "client-id",
+  credentialReferencePresent: true,
   origin: { kind: "manual" },
 });
 

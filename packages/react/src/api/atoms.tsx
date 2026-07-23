@@ -514,6 +514,7 @@ export const createOAuthClientOptimistic = oauthClientsOptimisticAtom.pipe(
           tokenUrl: arg.payload.tokenUrl,
           resource: arg.payload.resource ?? null,
           clientId: arg.payload.clientId,
+          credentialReferencePresent: true,
           // Mirror the server's stamp so the just-registered app matches its
           // integration in the picker immediately (before the refetch lands).
           origin: { kind: "manual", integration: arg.payload.originIntegration ?? null },
