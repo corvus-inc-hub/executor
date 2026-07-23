@@ -13,7 +13,7 @@ concurrency:
 jobs:
   changes:
     name: Changed paths
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'UsefulSoftwareCo/executor' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     outputs:
       desktop_smoke: ${{ github.event_name != 'pull_request' || steps.filter.outputs.desktop_smoke == 'true' }}
@@ -57,7 +57,7 @@ jobs:
 
   format:
     name: Format
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'UsefulSoftwareCo/executor' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +80,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'UsefulSoftwareCo/executor' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -103,7 +103,7 @@ jobs:
 
   typecheck:
     name: Typecheck
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'UsefulSoftwareCo/executor' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     env:
       TURBO_API: ${{ vars.TURBO_API }}
@@ -138,7 +138,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'UsefulSoftwareCo/executor' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     # Tuned for Blacksmith's 4 vCPU runners.
     env:
@@ -194,7 +194,7 @@ jobs:
           - { target: cloud, shard: 3/4, shard-name: 3of4 }
           - { target: cloud, shard: 4/4, shard-name: 4of4 }
           - target: selfhost
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'UsefulSoftwareCo/executor' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -266,7 +266,7 @@ jobs:
     # Skipped on pull_request: the local scenario boots a real `executor web`
     # plus a browser and is currently flaky on PRs. Still runs on push to main.
     if: github.event_name != 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'UsefulSoftwareCo/executor' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -323,7 +323,7 @@ jobs:
     name: Desktop smoke build
     needs: changes
     if: needs.changes.outputs.desktop_smoke == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'UsefulSoftwareCo/executor' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -400,16 +400,32 @@ jobs:
     name: Self-host Docker image
     needs: changes
     if: needs.changes.outputs.selfhost_docker_smoke == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'UsefulSoftwareCo/executor' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Blacksmith Builder
+        if: github.repository == 'UsefulSoftwareCo/executor'
         uses: useblacksmith/setup-docker-builder@v1
 
+      - name: Setup Docker Buildx
+        if: github.repository != 'UsefulSoftwareCo/executor'
+        uses: docker/setup-buildx-action@v3
+
       - name: Build self-host image
+        if: github.repository == 'UsefulSoftwareCo/executor'
         uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: apps/host-selfhost/Dockerfile
+          push: false
+          load: true
+          tags: executor-selfhost:ci
+
+      - name: Build self-host image on GitHub Actions
+        if: github.repository != 'UsefulSoftwareCo/executor'
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: apps/host-selfhost/Dockerfile
