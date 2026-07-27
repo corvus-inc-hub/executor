@@ -285,8 +285,21 @@ export const GITHUB_GOVERNED_COMMIT_TOOL: ToolDef = {
       guarantees: GITHUB_GOVERNED_COMMIT_GUARANTEES,
     },
   },
+  // No interactive approval. Unlike the generated GraphQL mutations, this tool cannot be pointed at
+  // an arbitrary effect: every byte it writes is fixed by `artifactSha256` before the call, and the
+  // push aborts on `blob_sha_mismatch`, `tree_sha_mismatch`, or `commit_sha_mismatch` if GitHub
+  // produces anything else. An approval prompt here cannot narrow what happens -- it can only ask a
+  // human to re-consent to an effect that is already pinned to a hash.
+  //
+  // The consent lives with the caller, which is the only party that knows what the artifact means.
+  // Manifest parks a signed governed action bound to this exact input hash, with a one-use grant
+  // capped at a single call, write, and external effect, before it ever opens this session. Asking
+  // again in the Executor console put a second gate in front of that one -- a gate no customer can
+  // reach, on a per-run basis, which is not something a multi-tenant product can ship.
+  //
+  // What still bounds the effect: the artifact hash binding above, the caller's branch-prefix
+  // confinement, and the fact that this opens a pull request rather than merging one.
   annotations: {
-    requiresApproval: true,
     approvalDescription: "Push an exact governed commit and open its pull request",
   },
 };

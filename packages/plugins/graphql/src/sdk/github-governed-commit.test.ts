@@ -16,6 +16,7 @@ import { makeTestConfig, memoryCredentialsPlugin } from "@executor-js/sdk/testin
 import type { GraphqlStore } from "./store";
 import { graphqlPlugin } from "./plugin";
 import {
+  GITHUB_GOVERNED_COMMIT_TOOL,
   pushCommitArtifact,
   sha256Canonical,
   type PushCommitArtifactInput,
@@ -392,4 +393,21 @@ describe("GitHub governed commit capability", () => {
       expect(result.failure).toMatchObject({ code: "idempotency_key_conflict" });
     }),
   );
+});
+
+describe("governed commit approval posture", () => {
+  it("does not ask for an interactive approval it cannot use", () => {
+    // Every byte this tool writes is pinned by `artifactSha256` before the call, and the push
+    // aborts if GitHub returns a different blob, tree, or commit. A prompt here cannot narrow the
+    // effect -- it can only add a second gate in front of the caller's own signed authorization,
+    // in a console no customer of that caller can reach. Regression: this annotation was `true`,
+    // and every governed run parked forever waiting for a click that never came.
+    expect(GITHUB_GOVERNED_COMMIT_TOOL.annotations?.requiresApproval).toBeFalsy();
+  });
+
+  it("still names the effect for any surface that shows pending work", () => {
+    expect(GITHUB_GOVERNED_COMMIT_TOOL.annotations?.approvalDescription).toBe(
+      "Push an exact governed commit and open its pull request",
+    );
+  });
 });
