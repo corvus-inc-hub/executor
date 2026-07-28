@@ -1,4 +1,4 @@
-import { Effect, Option, Schema } from "effect";
+import { Effect, Option, Schedule, Schema } from "effect";
 import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 
 import { ToolName, type ToolDef } from "@executor-js/sdk/core";
@@ -772,6 +772,21 @@ type TreeWrite = Readonly<{
   sha: string | null;
 }>;
 
+// A tree is created immediately after its blobs, and it names them by SHA. GitHub has answered
+// that POST with 404 while every blob had just been written successfully and the credential was
+// demonstrably admitted to the endpoint -- sending a deliberately invalid body with the same token
+// returns 422, not 404, so authorization is not in question. Replaying the identical request later
+// returns 201. That is a freshly-written object not yet visible to the replica serving the write.
+//
+// 404 is not retryable in general, and it stays that way everywhere else. It is retryable here for
+// one specific reason: creating a tree is idempotent. Trees are content-addressed, the caller
+// verifies the returned SHA against the artifact's head tree, and an identical request either
+// yields the identical tree or fails the comparison. Nothing is duplicated by asking twice.
+//
+// The cost of not retrying is not a slower run. It is a governed push discarded after a person has
+// already spent a signed, one-time approval on it.
+const TREE_CREATE_VISIBILITY_ATTEMPTS = 4;
+
 const createTree = (
   token: string,
   repository: typeof RepositoryIdentity.Type,
@@ -788,6 +803,12 @@ const createTree = (
   }).pipe(
     Effect.flatMap((response) => requireStatus(response, [201], "tree-create")),
     Effect.flatMap(decodeResponse(GitTreeResponse, "tree")),
+    Effect.retry({
+      schedule: Schedule.exponential("500 millis").pipe(Schedule.jittered),
+      times: TREE_CREATE_VISIBILITY_ATTEMPTS - 1,
+      while: (error: GithubGovernedCommitError) =>
+        error.stage === "tree-create" && error.status === 404,
+    }),
   );
 
 const createCommit = (
