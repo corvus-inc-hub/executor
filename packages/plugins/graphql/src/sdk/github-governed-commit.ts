@@ -508,11 +508,26 @@ const requireStatus = (response: GithubResponse, expected: readonly number[], st
         }),
       );
 
+// GitHub answers 404 rather than 403 for anything a token may not do on a private repository, so
+// the status alone cannot separate "the object is missing" from "you may not do this". It does
+// return the token's granted scopes on every authenticated response -- including the refusal --
+// and that is the field that tells an operator whether to go fix a grant or look elsewhere.
+//
+// Worth carrying because a governed push failed here while the identical request succeeded by
+// hand, and the two were never using the same credential. The scopes say so immediately.
 const requestIdSuffix = (headers: Readonly<Record<string, string>>): string => {
-  const requestId = headers["x-github-request-id"] ?? headers["X-GitHub-Request-Id"];
-  return typeof requestId === "string" && requestId.length > 0
-    ? ` | github-request-id=${requestId}`
-    : "";
+  const header = (name: string): string | undefined => {
+    const value = headers[name.toLowerCase()] ?? headers[name];
+    return typeof value === "string" && value.length > 0 ? value : undefined;
+  };
+  const labelled = (label: string, value: string | undefined) =>
+    value === undefined ? undefined : `${label}=${value}`;
+  const parts = [
+    labelled("github-request-id", header("X-GitHub-Request-Id")),
+    labelled("granted-scopes", header("X-OAuth-Scopes")),
+    labelled("accepted-scopes", header("X-Accepted-OAuth-Scopes")),
+  ].filter((part): part is string => part !== undefined);
+  return parts.length > 0 ? ` | ${parts.join(" | ")}` : "";
 };
 
 const decodeResponse =
