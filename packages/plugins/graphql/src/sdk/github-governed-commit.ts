@@ -397,11 +397,23 @@ const gitBlobSha = (bytes: Uint8Array) => {
   return digest("SHA-1", object);
 };
 
+// GitHub's `message` alone is frequently just "Not Found", which names no cause an operator can
+// act on -- and on a private repository GitHub deliberately returns 404 for anything the token may
+// not do, so the one word covers both "the object is missing" and "you may not do this". The rest
+// of the body separates those: `errors[]` carries the specific field GitHub rejected, and
+// `documentation_url` names the endpoint it thought it was serving. Carry all of it.
 const bodyText = (body: unknown): string => {
   if (typeof body === "string") return body.slice(0, 500);
   if (typeof body === "object" && body !== null) {
     const message = Reflect.get(body, "message");
-    if (typeof message === "string") return message.slice(0, 500);
+    const errors = Reflect.get(body, "errors");
+    const documentation = Reflect.get(body, "documentation_url");
+    const parts = [
+      typeof message === "string" ? message : undefined,
+      Array.isArray(errors) && errors.length > 0 ? `errors=${JSON.stringify(errors)}` : undefined,
+      typeof documentation === "string" ? `doc=${documentation}` : undefined,
+    ].filter((part): part is string => part !== undefined);
+    if (parts.length > 0) return parts.join(" | ").slice(0, 500);
   }
   return "GitHub rejected the request.";
 };
