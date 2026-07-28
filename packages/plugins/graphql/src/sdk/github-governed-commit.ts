@@ -496,12 +496,24 @@ const requireStatus = (response: GithubResponse, expected: readonly number[], st
         failure({
           stage,
           code: "github_rejected",
-          message: `${stage} failed with HTTP ${response.status}: ${bodyText(response.body)}`,
+          // x-github-request-id is the only field that settles whether GitHub's own backend
+          // produced the response. Without it, a 404 from GitHub and a 404 from anything between
+          // us and GitHub read identically, and the difference decides whether the answer is
+          // "retry this" or "fix the request". We had that header in hand and dropped it, and a
+          // real governed push then failed for a reason nobody could name afterwards.
+          message: `${stage} failed with HTTP ${response.status}: ${bodyText(response.body)}${requestIdSuffix(response.headers)}`,
           status: response.status,
           ambiguous: false,
           retryable: response.status === 429 || response.status >= 500,
         }),
       );
+
+const requestIdSuffix = (headers: Readonly<Record<string, string>>): string => {
+  const requestId = headers["x-github-request-id"] ?? headers["X-GitHub-Request-Id"];
+  return typeof requestId === "string" && requestId.length > 0
+    ? ` | github-request-id=${requestId}`
+    : "";
+};
 
 const decodeResponse =
   <S extends Schema.Top>(schema: S, stage: string) =>
