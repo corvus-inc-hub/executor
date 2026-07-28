@@ -31,6 +31,18 @@ const AWS_ROLE_CONFIGURATION = new Set(["AWS_ROLE_ARN", "AWS_REGION", "AWS_EXTER
 const AWS_MIN_SESSION_SECONDS = 900;
 const AWS_ROLE_CHAIN_MAX_SESSION_SECONDS = 3600;
 
+// GitHub's classic `repo` scope is read AND write on repository contents. It is the full
+// private-repository grant, not a read grant. Mapping it to contents:read alone denied
+// contents:write leases to a credential that demonstrably holds the permission -- and because the
+// denial happens here rather than at GitHub, an operator reads it as a provider refusal instead of
+// as our own gate declining. Diagnosing a governed push that could not write cost most of a day
+// partly because this looked like a GitHub problem.
+//
+// The narrower classic scopes are deliberately not mapped. `public_repo` also grants write, but
+// only on public repositories, and this gate cannot see which repository the lease will be spent
+// against.
+const GITHUB_CONTENT_SCOPES = new Set(["contents:read", "contents:write"]);
+
 const credentialGrantCoversScope = (
   integration: string,
   grantedScopes: ReadonlySet<string>,
@@ -39,7 +51,7 @@ const credentialGrantCoversScope = (
   if (grantedScopes.has(requestedScope)) return true;
   return (
     integration === GITHUB_GRAPHQL_INTEGRATION &&
-    requestedScope === "contents:read" &&
+    GITHUB_CONTENT_SCOPES.has(requestedScope) &&
     grantedScopes.has("repo")
   );
 };
