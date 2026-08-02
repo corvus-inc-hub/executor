@@ -102,9 +102,13 @@ const makeInput = Effect.fn("test.makeGovernedCommitInput")(function* () {
   } satisfies PushCommitArtifactInput;
 });
 
-const githubLayer = (options?: { readonly foreignBase?: boolean }) => {
+const githubLayer = (options?: {
+  readonly foreignBase?: boolean;
+  readonly treeVisibilityFailures?: number;
+}) => {
   let branchCreated = false;
   let pullCreated = false;
+  let treeCreateAttempts = 0;
   const requests: string[] = [];
   const json = (request: HttpClientRequest.HttpClientRequest, body: unknown, status = 200) =>
     HttpClientResponse.fromWeb(
@@ -151,6 +155,10 @@ const githubLayer = (options?: { readonly foreignBase?: boolean }) => {
         return Effect.succeed(json(request, { sha: BLOB_SHA, url: "blob" }, 201));
       }
       if (request.method === "POST" && url.pathname.endsWith("/git/trees")) {
+        treeCreateAttempts += 1;
+        if (treeCreateAttempts <= (options?.treeVisibilityFailures ?? 0)) {
+          return Effect.succeed(json(request, { message: "Not Found" }, 404));
+        }
         return Effect.succeed(json(request, { sha: HEAD_TREE, url: "tree", tree: [] }, 201));
       }
       if (request.method === "POST" && url.pathname.endsWith("/git/commits")) {
@@ -353,6 +361,20 @@ describe("GitHub governed commit capability", () => {
       expect(github.requests.filter((entry) => entry.startsWith("POST "))).toHaveLength(
         postsAfterFirst,
       );
+    }),
+  );
+
+  it.live("waits through a bounded tree visibility delay", () =>
+    Effect.gen(function* () {
+      const input = yield* makeInput();
+      const github = githubLayer({ treeVisibilityFailures: 4 });
+      const receipt = yield* pushCommitArtifact(input, "host-held-token", makeStore()).pipe(
+        Effect.provide(github.layer),
+      );
+      expect(receipt.head.treeSha).toBe(HEAD_TREE);
+      expect(
+        github.requests.filter((entry) => entry === "POST /repos/mnfst/app/git/trees"),
+      ).toHaveLength(5);
     }),
   );
 
