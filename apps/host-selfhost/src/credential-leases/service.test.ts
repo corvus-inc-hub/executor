@@ -239,7 +239,10 @@ describe("credential lease service", () => {
             assumeAwsRole: assumeAwsRoleUnused,
             verifyM2mToken: verified(),
             resolveCredential: () =>
-              Effect.succeed({ connection, values: { token: "should-not-resolve" } }),
+              Effect.succeed({
+                connection: { ...connection, oauthScope: "read:org" },
+                values: { token: "should-not-resolve" },
+              }),
           });
           const result = yield* Effect.result(
             service.lease(request, { ...input, scopes: ["contents:write"] }),
