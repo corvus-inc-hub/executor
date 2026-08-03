@@ -1,4 +1,4 @@
-import { Effect, Option, Schedule, Schema } from "effect";
+import { Effect, Option, Predicate, Schedule, Schema } from "effect";
 import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 
 import { ToolName, type ToolDef } from "@executor-js/sdk/core";
@@ -412,7 +412,7 @@ const bodyText = (body: unknown): string => {
       typeof message === "string" ? message : undefined,
       Array.isArray(errors) && errors.length > 0 ? `errors=${JSON.stringify(errors)}` : undefined,
       typeof documentation === "string" ? `doc=${documentation}` : undefined,
-    ].filter((part): part is string => part !== undefined);
+    ].filter(Predicate.isNotUndefined);
     if (parts.length > 0) return parts.join(" | ").slice(0, 500);
   }
   return "GitHub rejected the request.";
@@ -526,7 +526,7 @@ const requestIdSuffix = (headers: Readonly<Record<string, string>>): string => {
     labelled("github-request-id", header("X-GitHub-Request-Id")),
     labelled("granted-scopes", header("X-OAuth-Scopes")),
     labelled("accepted-scopes", header("X-Accepted-OAuth-Scopes")),
-  ].filter((part): part is string => part !== undefined);
+  ].filter(Predicate.isNotUndefined);
   return parts.length > 0 ? ` | ${parts.join(" | ")}` : "";
 };
 
