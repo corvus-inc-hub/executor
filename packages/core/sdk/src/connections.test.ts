@@ -55,7 +55,11 @@ const demoPlugin = definePlugin(() => ({
       ],
     }),
   invokeTool: ({ toolRow, credential }) =>
-    Effect.succeed({ ran: toolRow.name, value: credential.value }),
+    Effect.succeed({
+      ran: toolRow.name,
+      value: credential.value,
+      ...(credential.grantedScopes ? { grantedScopes: [...credential.grantedScopes] } : {}),
+    }),
   extension: (ctx) => ({
     seed: () =>
       ctx.core.integrations.register({
@@ -715,6 +719,34 @@ describe("execute over a connection", () => {
       });
       const out = yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {});
       expect(out).toEqual({ ran: "deploy", value: "secret-token" });
+    }),
+  );
+
+  it.effect("normalizes comma- and space-delimited OAuth scopes before invoking a tool", () =>
+    Effect.gen(function* () {
+      const config = makeTestConfig({ plugins: [demoPlugin] as const });
+      const executor = yield* createExecutor(config);
+      yield* executor.demo.seed();
+      yield* executor.connections.create({
+        owner: "org",
+        name: ConnectionName.make("main"),
+        integration: INTEG,
+        template: TEMPLATE,
+        value: "secret-token",
+      });
+      yield* Effect.promise(() =>
+        config.db.updateMany("connection", {
+          where: (b) => b.and(b("integration", "=", String(INTEG)), b("name", "=", "main")),
+          set: { oauth_scope: "read:org,repo profile" },
+        }),
+      );
+
+      const out = yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {});
+      expect(out).toEqual({
+        ran: "deploy",
+        value: "secret-token",
+        grantedScopes: ["read:org", "repo", "profile"],
+      });
     }),
   );
 });

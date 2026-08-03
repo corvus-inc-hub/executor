@@ -246,9 +246,9 @@ const RepositoryAuthorityResult = Schema.Literals([
 ]);
 
 export const RepositoryWriteAuthorityReceipt = Schema.Struct({
-  schemaVersion: Schema.Literal("mnfst.executor.repository-write-authority-receipt.v1"),
+  schemaVersion: Schema.Literal("mnfst.executor.repository-write-authority-receipt.v2"),
   checkedAt: Rfc3339Utc,
-  credential: Schema.Struct({
+  credentialReference: Schema.Struct({
     owner: Schema.String,
     integration: Schema.String,
     connection: Schema.String,
@@ -640,7 +640,8 @@ const requestIdSuffix = (headers: Readonly<Record<string, string>>): string => {
 const normalizedScopes = (value: readonly string[] | string | undefined): readonly string[] =>
   [
     ...new Set(
-      (typeof value === "string" ? value.split(/[\s,]+/) : (value ?? []))
+      (typeof value === "string" ? [value] : (value ?? []))
+        .flatMap((scope) => scope.split(/[\s,]+/))
         .map((scope) => scope.trim().toLowerCase())
         .filter(Boolean),
     ),
@@ -687,9 +688,9 @@ const repositoryAuthorityReceipt = (input: {
   pullRequestsWrite: boolean;
 }) =>
   RepositoryWriteAuthorityReceipt.make({
-    schemaVersion: "mnfst.executor.repository-write-authority-receipt.v1",
+    schemaVersion: "mnfst.executor.repository-write-authority-receipt.v2",
     checkedAt: input.checkedAt,
-    credential: {
+    credentialReference: {
       ...input.credential,
       grantedScopes: normalizedScopes(input.credential.grantedScopes),
     },
