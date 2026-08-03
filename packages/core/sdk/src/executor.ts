@@ -590,14 +590,17 @@ const rowToConnection = (row: ConnectionRow): Connection => {
   };
 };
 
-/** Parse a connection row's `oauth_scope` (space-delimited, as echoed by the
- *  token endpoint) into the credential's `grantedScopes`. Undefined when the
- *  row carries none, so scope comparisons downstream fail open. */
+/** Parse a connection row's `oauth_scope` into the credential's `grantedScopes`.
+ *  OAuth token responses conventionally use spaces, while provider metadata can
+ *  echo the same envelope with commas. Undefined when the row carries none, so
+ *  scope comparisons downstream fail closed. */
 const grantedScopesFromRow = (row: {
   readonly oauth_scope?: unknown;
 }): readonly string[] | undefined => {
   if (row.oauth_scope == null) return undefined;
-  const scopes = String(row.oauth_scope).split(/\s+/).filter(Boolean);
+  const scopes = String(row.oauth_scope)
+    .split(/[\s,]+/)
+    .filter(Boolean);
   return scopes.length > 0 ? scopes : undefined;
 };
 

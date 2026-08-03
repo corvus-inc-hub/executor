@@ -645,6 +645,21 @@ describe("GitHub repository write authority", () => {
     }),
   );
 
+  it.effect("normalizes a comma-delimited connection scope envelope in the receipt", () =>
+    Effect.gen(function* () {
+      const github = githubLayer();
+      const receipt = yield* inspectRepositoryWriteAuthority(AUTHORITY_INPUT, "host-held-token", {
+        ...AUTHORITY_CREDENTIAL,
+        grantedScopes: ["read:org,repo"],
+      }).pipe(Effect.provide(github.layer));
+
+      expect(receipt).toMatchObject({
+        credentialReference: { grantedScopes: ["read:org", "repo"] },
+        scopeEnvelope: { executorGrantedScopes: ["read:org", "repo"] },
+      });
+    }),
+  );
+
   it.effect("accepts an explicit higher role but blocks inactive repositories", () =>
     Effect.gen(function* () {
       const administratorGithub = githubLayer({
