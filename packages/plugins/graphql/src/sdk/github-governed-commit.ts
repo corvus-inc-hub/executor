@@ -785,7 +785,7 @@ type TreeWrite = Readonly<{
 //
 // The cost of not retrying is not a slower run. It is a governed push discarded after a person has
 // already spent a signed, one-time approval on it.
-const TREE_CREATE_VISIBILITY_ATTEMPTS = 4;
+const TREE_CREATE_VISIBILITY_WINDOW = "30 seconds";
 
 const createTree = (
   token: string,
@@ -804,8 +804,9 @@ const createTree = (
     Effect.flatMap((response) => requireStatus(response, [201], "tree-create")),
     Effect.flatMap(decodeResponse(GitTreeResponse, "tree")),
     Effect.retry({
-      schedule: Schedule.exponential("500 millis").pipe(Schedule.jittered),
-      times: TREE_CREATE_VISIBILITY_ATTEMPTS - 1,
+      schedule: Schedule.spaced("1 second").pipe(
+        Schedule.both(Schedule.during(TREE_CREATE_VISIBILITY_WINDOW)),
+      ),
       while: (error: GithubGovernedCommitError) =>
         error.stage === "tree-create" && error.status === 404,
     }),
