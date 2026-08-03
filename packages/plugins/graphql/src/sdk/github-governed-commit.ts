@@ -1,4 +1,4 @@
-import { Effect, Option, Predicate, Schedule, Schema } from "effect";
+import { Effect, Option, Predicate, Result, Schedule, Schema } from "effect";
 import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 
 import { ToolName, type ToolDef } from "@executor-js/sdk/core";
@@ -22,6 +22,15 @@ const RepositoryIdentity = Schema.Struct({
   owner: SafeRepositorySegment,
   name: SafeRepositorySegment,
 });
+
+export const RepositoryWriteAuthorityInput = Schema.Struct({
+  schemaVersion: Schema.Literal("mnfst.executor.repository-write-authority.v1"),
+  repository: Schema.Struct({
+    ...RepositoryIdentity.fields,
+    nodeId: Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(200)),
+  }),
+});
+export type RepositoryWriteAuthorityInput = typeof RepositoryWriteAuthorityInput.Type;
 
 const CommitIdentity = Schema.Struct({
   name: Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(200)),
@@ -214,10 +223,79 @@ const GitTreeResponse = Schema.Struct({
 const GitObjectResponse = Schema.Struct({ sha: GitSha, url: Schema.String });
 
 const RepositoryResponse = Schema.Struct({
+  id: Schema.Number,
+  node_id: Schema.String,
   full_name: Schema.String,
+  private: Schema.Boolean,
   archived: Schema.Boolean,
   disabled: Schema.Boolean,
+  default_branch: Schema.NullOr(Schema.String),
+  permissions: Schema.Struct({
+    admin: Schema.Boolean,
+    maintain: Schema.optional(Schema.Boolean),
+    push: Schema.Boolean,
+    pull: Schema.Boolean,
+  }),
 });
+
+const RepositoryAuthorityResult = Schema.Literals([
+  "write_ready",
+  "read_only",
+  "inaccessible",
+  "indeterminate",
+]);
+
+export const RepositoryWriteAuthorityReceipt = Schema.Struct({
+  schemaVersion: Schema.Literal("mnfst.executor.repository-write-authority-receipt.v1"),
+  checkedAt: Rfc3339Utc,
+  credential: Schema.Struct({
+    owner: Schema.String,
+    integration: Schema.String,
+    connection: Schema.String,
+    grantedScopes: Schema.Array(Schema.String),
+  }),
+  expected: Schema.Struct({
+    nodeId: Schema.String,
+    owner: Schema.String,
+    name: Schema.String,
+  }),
+  observed: Schema.NullOr(
+    Schema.Struct({
+      providerId: Schema.Number,
+      nodeId: Schema.String,
+      fullName: Schema.String,
+      owner: Schema.String,
+      name: Schema.String,
+      private: Schema.Boolean,
+      archived: Schema.Boolean,
+      disabled: Schema.Boolean,
+      defaultBranch: Schema.NullOr(Schema.String),
+    }),
+  ),
+  permissions: Schema.NullOr(
+    Schema.Struct({
+      admin: Schema.Boolean,
+      maintain: Schema.NullOr(Schema.Boolean),
+      push: Schema.Boolean,
+      pull: Schema.Boolean,
+    }),
+  ),
+  scopeEnvelope: Schema.Struct({
+    source: Schema.Literals(["github_response", "executor_connection", "none"]),
+    executorGrantedScopes: Schema.Array(Schema.String),
+    providerGrantedScopes: Schema.Array(Schema.String),
+    providerAcceptedScopes: Schema.Array(Schema.String),
+    contentsWrite: Schema.Boolean,
+    pullRequestsWrite: Schema.Boolean,
+  }),
+  provider: Schema.Struct({
+    requestId: Schema.NullOr(Schema.String),
+    status: Schema.NullOr(Schema.Number),
+  }),
+  result: RepositoryAuthorityResult,
+  reasons: Schema.Array(Schema.String),
+});
+export type RepositoryWriteAuthorityReceipt = typeof RepositoryWriteAuthorityReceipt.Type;
 
 const PullRequestResponse = Schema.Struct({
   number: Schema.Number,
@@ -272,6 +350,31 @@ export const GITHUB_GOVERNED_COMMIT_GUARANTEES = Object.freeze({
 
 const inputJsonSchema = Schema.toJsonSchemaDocument(PushCommitArtifactInput).schema;
 const outputJsonSchema = Schema.toJsonSchemaDocument(PushCommitArtifactReceipt).schema;
+const repositoryAuthorityInputJsonSchema = Schema.toJsonSchemaDocument(
+  RepositoryWriteAuthorityInput,
+).schema;
+const repositoryAuthorityOutputJsonSchema = Schema.toJsonSchemaDocument(
+  RepositoryWriteAuthorityReceipt,
+).schema;
+
+export const GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL: ToolDef = {
+  name: ToolName.make("query.repositoryWriteAuthority"),
+  description:
+    "Read GitHub's current write projection for one exact repository through this connection's resolved credential and return a typed, provider-bound authority receipt.",
+  inputSchema: repositoryAuthorityInputJsonSchema,
+  outputSchema: {
+    ...repositoryAuthorityOutputJsonSchema,
+    "x-executor-capability": {
+      schemaVersion: "mnfst.executor.repository-write-authority-capability.v1",
+      guarantees: {
+        credentialsStayInExecutor: true,
+        exactRepositoryIdentity: true,
+        providerRequestIdentity: true,
+        readOnly: true,
+      },
+    },
+  },
+};
 
 export const GITHUB_GOVERNED_COMMIT_TOOL: ToolDef = {
   name: ToolName.make("mutation.pushCommitArtifact"),
@@ -515,20 +618,269 @@ const requireStatus = (response: GithubResponse, expected: readonly number[], st
 //
 // Worth carrying because a governed push failed here while the identical request succeeded by
 // hand, and the two were never using the same credential. The scopes say so immediately.
+const responseHeader = (
+  headers: Readonly<Record<string, string>>,
+  name: string,
+): string | undefined => {
+  const value = headers[name.toLowerCase()] ?? headers[name];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+};
+
 const requestIdSuffix = (headers: Readonly<Record<string, string>>): string => {
-  const header = (name: string): string | undefined => {
-    const value = headers[name.toLowerCase()] ?? headers[name];
-    return typeof value === "string" && value.length > 0 ? value : undefined;
-  };
   const labelled = (label: string, value: string | undefined) =>
     value === undefined ? undefined : `${label}=${value}`;
   const parts = [
-    labelled("github-request-id", header("X-GitHub-Request-Id")),
-    labelled("granted-scopes", header("X-OAuth-Scopes")),
-    labelled("accepted-scopes", header("X-Accepted-OAuth-Scopes")),
+    labelled("github-request-id", responseHeader(headers, "X-GitHub-Request-Id")),
+    labelled("granted-scopes", responseHeader(headers, "X-OAuth-Scopes")),
+    labelled("accepted-scopes", responseHeader(headers, "X-Accepted-OAuth-Scopes")),
   ].filter(Predicate.isNotUndefined);
   return parts.length > 0 ? ` | ${parts.join(" | ")}` : "";
 };
+
+const normalizedScopes = (value: readonly string[] | string | undefined): readonly string[] =>
+  [
+    ...new Set(
+      (typeof value === "string" ? value.split(/[\s,]+/) : (value ?? []))
+        .map((scope) => scope.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  ].sort();
+
+type RepositoryAuthorityCredential = Readonly<{
+  owner: string;
+  integration: string;
+  connection: string;
+  grantedScopes: readonly string[];
+}>;
+
+const observedRepository = (
+  repository: typeof RepositoryResponse.Type,
+): (typeof RepositoryWriteAuthorityReceipt.Type)["observed"] => {
+  const [owner = "", name = ""] = repository.full_name.split("/");
+  return {
+    providerId: repository.id,
+    nodeId: repository.node_id,
+    fullName: repository.full_name,
+    owner,
+    name,
+    private: repository.private,
+    archived: repository.archived,
+    disabled: repository.disabled,
+    defaultBranch: repository.default_branch,
+  };
+};
+
+const repositoryAuthorityReceipt = (input: {
+  checkedAt: string;
+  credential: RepositoryAuthorityCredential;
+  expected: (typeof RepositoryWriteAuthorityInput.Type)["repository"];
+  observed: (typeof RepositoryWriteAuthorityReceipt.Type)["observed"];
+  permissions: (typeof RepositoryWriteAuthorityReceipt.Type)["permissions"];
+  providerAcceptedScopes: readonly string[];
+  providerGrantedScopes: readonly string[];
+  providerRequestId: string | null;
+  providerStatus: number | null;
+  result: typeof RepositoryAuthorityResult.Type;
+  reasons: readonly string[];
+  scopeSource: "github_response" | "executor_connection" | "none";
+  contentsWrite: boolean;
+  pullRequestsWrite: boolean;
+}) =>
+  RepositoryWriteAuthorityReceipt.make({
+    schemaVersion: "mnfst.executor.repository-write-authority-receipt.v1",
+    checkedAt: input.checkedAt,
+    credential: {
+      ...input.credential,
+      grantedScopes: normalizedScopes(input.credential.grantedScopes),
+    },
+    expected: input.expected,
+    observed: input.observed,
+    permissions: input.permissions,
+    scopeEnvelope: {
+      source: input.scopeSource,
+      executorGrantedScopes: normalizedScopes(input.credential.grantedScopes),
+      providerGrantedScopes: input.providerGrantedScopes,
+      providerAcceptedScopes: input.providerAcceptedScopes,
+      contentsWrite: input.contentsWrite,
+      pullRequestsWrite: input.pullRequestsWrite,
+    },
+    provider: {
+      requestId: input.providerRequestId,
+      status: input.providerStatus,
+    },
+    result: input.result,
+    reasons: input.reasons,
+  });
+
+export const inspectRepositoryWriteAuthority = Effect.fn(
+  "graphql.githubGovernedCommit.inspectRepositoryWriteAuthority",
+)(function* (inputUnknown: unknown, token: string, credential: RepositoryAuthorityCredential) {
+  const input = yield* Schema.decodeUnknownEffect(RepositoryWriteAuthorityInput)(inputUnknown).pipe(
+    Effect.mapError(() =>
+      failure({
+        stage: "repository-authority-input",
+        code: "invalid_repository_authority_input",
+        message: "The repository write-authority input does not match the v1 schema.",
+      }),
+    ),
+  );
+  const checkedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const responseResult = yield* Effect.result(
+    githubRequest({
+      token,
+      method: "GET",
+      path: repoPath(input.repository),
+      stage: "repository-authority-read",
+    }),
+  );
+  if (Result.isFailure(responseResult)) {
+    return repositoryAuthorityReceipt({
+      checkedAt,
+      credential,
+      expected: input.repository,
+      observed: null,
+      permissions: null,
+      providerAcceptedScopes: [],
+      providerGrantedScopes: [],
+      providerRequestId: null,
+      providerStatus: responseResult.failure.status,
+      result: "indeterminate",
+      reasons: [responseResult.failure.code],
+      scopeSource: normalizedScopes(credential.grantedScopes).length
+        ? "executor_connection"
+        : "none",
+      contentsWrite: false,
+      pullRequestsWrite: false,
+    });
+  }
+
+  const response = responseResult.success;
+  const providerGrantedScopes = normalizedScopes(
+    responseHeader(response.headers, "X-OAuth-Scopes"),
+  );
+  const providerAcceptedScopes = normalizedScopes(
+    responseHeader(response.headers, "X-Accepted-OAuth-Scopes"),
+  );
+  const executorGrantedScopes = normalizedScopes(credential.grantedScopes);
+  const effectiveScopes =
+    providerGrantedScopes.length > 0 ? providerGrantedScopes : executorGrantedScopes;
+  const scopeSource =
+    providerGrantedScopes.length > 0
+      ? "github_response"
+      : executorGrantedScopes.length > 0
+        ? "executor_connection"
+        : "none";
+  const providerRequestId = responseHeader(response.headers, "X-GitHub-Request-Id") ?? null;
+
+  if (response.status !== 200) {
+    return repositoryAuthorityReceipt({
+      checkedAt,
+      credential,
+      expected: input.repository,
+      observed: null,
+      permissions: null,
+      providerAcceptedScopes,
+      providerGrantedScopes,
+      providerRequestId,
+      providerStatus: response.status,
+      result: [401, 403, 404].includes(response.status) ? "inaccessible" : "indeterminate",
+      reasons: [`github_http_${response.status}`],
+      scopeSource,
+      contentsWrite: false,
+      pullRequestsWrite: false,
+    });
+  }
+
+  const decoded = yield* Effect.result(
+    decodeResponse(RepositoryResponse, "repository")(response.body),
+  );
+  if (Result.isFailure(decoded)) {
+    return repositoryAuthorityReceipt({
+      checkedAt,
+      credential,
+      expected: input.repository,
+      observed: null,
+      permissions: null,
+      providerAcceptedScopes,
+      providerGrantedScopes,
+      providerRequestId,
+      providerStatus: response.status,
+      result: "indeterminate",
+      reasons: ["github_invalid_repository_response"],
+      scopeSource,
+      contentsWrite: false,
+      pullRequestsWrite: false,
+    });
+  }
+
+  const repository = decoded.success;
+  const observed = observedRepository(repository);
+  const fullNameMatches =
+    repository.full_name.toLowerCase() ===
+    `${input.repository.owner}/${input.repository.name}`.toLowerCase();
+  const nodeIdMatches = repository.node_id === input.repository.nodeId;
+  const providerIdValid = Number.isSafeInteger(repository.id) && repository.id > 0;
+  const active = !repository.archived && !repository.disabled;
+  const repositoryWrite =
+    repository.permissions.push ||
+    repository.permissions.admin ||
+    repository.permissions.maintain === true;
+  const classicWriteScope =
+    effectiveScopes.includes("repo") ||
+    (!repository.private && effectiveScopes.includes("public_repo"));
+  const contentsWrite = classicWriteScope || effectiveScopes.includes("contents:write");
+  const pullRequestsWrite =
+    classicWriteScope ||
+    effectiveScopes.includes("pull_requests:write") ||
+    effectiveScopes.includes("pull-requests:write");
+  const reasons: string[] = [];
+  if (!providerIdValid) reasons.push("provider_id_invalid");
+  if (!fullNameMatches) reasons.push("full_name_mismatch");
+  if (!nodeIdMatches) reasons.push("node_id_mismatch");
+  if (repository.archived) reasons.push("repository_archived");
+  if (repository.disabled) reasons.push("repository_disabled");
+  if (!repository.default_branch) reasons.push("default_branch_missing");
+  if (!repositoryWrite) reasons.push("repository_role_read_only");
+  if (scopeSource === "none") reasons.push("credential_scope_indeterminate");
+  else {
+    if (!contentsWrite) reasons.push("contents_scope_read_only");
+    if (!pullRequestsWrite) reasons.push("pull_requests_scope_read_only");
+  }
+
+  const identityDeterminate = providerIdValid && fullNameMatches && nodeIdMatches;
+  const result =
+    identityDeterminate &&
+    active &&
+    repository.default_branch !== null &&
+    repositoryWrite &&
+    contentsWrite &&
+    pullRequestsWrite
+      ? "write_ready"
+      : !identityDeterminate || scopeSource === "none"
+        ? "indeterminate"
+        : "read_only";
+  return repositoryAuthorityReceipt({
+    checkedAt,
+    credential,
+    expected: input.repository,
+    observed,
+    permissions: {
+      admin: repository.permissions.admin,
+      maintain: repository.permissions.maintain ?? null,
+      push: repository.permissions.push,
+      pull: repository.permissions.pull,
+    },
+    providerAcceptedScopes,
+    providerGrantedScopes,
+    providerRequestId,
+    providerStatus: response.status,
+    result,
+    reasons,
+    scopeSource,
+    contentsWrite,
+    pullRequestsWrite,
+  });
+});
 
 const decodeResponse =
   <S extends Schema.Top>(schema: S, stage: string) =>

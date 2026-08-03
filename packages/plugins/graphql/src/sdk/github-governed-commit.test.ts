@@ -17,6 +17,8 @@ import type { GraphqlStore } from "./store";
 import { graphqlPlugin } from "./plugin";
 import {
   GITHUB_GOVERNED_COMMIT_TOOL,
+  GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
+  inspectRepositoryWriteAuthority,
   pushCommitArtifact,
   sha256Canonical,
   type PushCommitArtifactInput,
@@ -35,6 +37,16 @@ const BLOB_SHA = createHash("sha1")
   .update(`blob ${CONTENT.byteLength}\0`)
   .update(CONTENT)
   .digest("hex");
+const AUTHORITY_INPUT = {
+  schemaVersion: "mnfst.executor.repository-write-authority.v1",
+  repository: { owner: "mnfst", name: "app", nodeId: "R_node" },
+} as const;
+const AUTHORITY_CREDENTIAL = {
+  owner: "org",
+  integration: "github",
+  connection: "main",
+  grantedScopes: [] as readonly string[],
+} as const;
 
 const makeStore = () => {
   const governed = new Map<string, unknown>();
@@ -104,6 +116,22 @@ const makeInput = Effect.fn("test.makeGovernedCommitInput")(function* () {
 
 const githubLayer = (options?: {
   readonly foreignBase?: boolean;
+  readonly repository?: Partial<{
+    readonly node_id: string;
+    readonly full_name: string;
+    readonly archived: boolean;
+    readonly disabled: boolean;
+    readonly default_branch: string | null;
+    readonly private: boolean;
+    readonly permissions: {
+      readonly admin: boolean;
+      readonly maintain?: boolean;
+      readonly push: boolean;
+      readonly pull: boolean;
+    };
+  }>;
+  readonly repositoryStatus?: number;
+  readonly oauthScopes?: string;
   readonly treeVisibilityFailures?: number;
 }) => {
   let branchCreated = false;
@@ -115,7 +143,12 @@ const githubLayer = (options?: {
       request,
       new Response(JSON.stringify(body), {
         status,
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          "x-accepted-oauth-scopes": "repo",
+          "x-github-request-id": "TEST:1234",
+          "x-oauth-scopes": options?.oauthScopes ?? "repo",
+        },
       }),
     );
   const layer = Layer.succeed(HttpClient.HttpClient)(
@@ -133,7 +166,21 @@ const githubLayer = (options?: {
       });
       if (request.method === "GET" && url.pathname === "/repos/mnfst/app") {
         return Effect.succeed(
-          json(request, { full_name: "mnfst/app", archived: false, disabled: false }),
+          json(
+            request,
+            {
+              id: 42,
+              node_id: "R_node",
+              full_name: "mnfst/app",
+              private: true,
+              archived: false,
+              disabled: false,
+              default_branch: "main",
+              permissions: { admin: false, maintain: false, push: true, pull: true },
+              ...options?.repository,
+            },
+            options?.repositoryStatus ?? 200,
+          ),
         );
       }
       if (request.method === "GET" && url.pathname.endsWith("/git/ref/heads%2Fmain")) {
@@ -270,6 +317,18 @@ describe("GitHub governed commit capability", () => {
           idempotencyKey: true,
           ambiguousReconciliation: true,
           credentialsStayInExecutor: true,
+        },
+      });
+      const authoritySchema = yield* executor.tools.schema(
+        ToolAddress.make("tools.github.org.main.query.repositoryWriteAuthority"),
+      );
+      expect(Reflect.get(authoritySchema?.outputSchema ?? {}, "x-executor-capability")).toEqual({
+        schemaVersion: "mnfst.executor.repository-write-authority-capability.v1",
+        guarantees: {
+          credentialsStayInExecutor: true,
+          exactRepositoryIdentity: true,
+          providerRequestIdentity: true,
+          readOnly: true,
         },
       });
     }),
@@ -417,6 +476,203 @@ describe("GitHub governed commit capability", () => {
   );
 });
 
+describe("GitHub repository write authority", () => {
+  it.effect("uses the connection credential and performs only the exact repository read", () =>
+    Effect.gen(function* () {
+      const github = githubLayer();
+      const executor = yield* createExecutor(
+        makeTestConfig({
+          plugins: [
+            memoryCredentialsPlugin(),
+            graphqlPlugin({ httpClientLayer: github.layer }),
+          ] as const,
+        }),
+      );
+      yield* executor.graphql.addIntegration({
+        endpoint: "https://api.github.com/graphql",
+        slug: "github",
+        introspectionJson: JSON.stringify({
+          data: {
+            __schema: {
+              queryType: { name: "Query" },
+              mutationType: null,
+              types: [
+                {
+                  kind: "OBJECT",
+                  name: "Query",
+                  description: null,
+                  fields: [],
+                  inputFields: null,
+                  enumValues: null,
+                },
+              ],
+            },
+          },
+        }),
+        authenticationTemplate: [{ kind: "oauth2", slug: "oauth2" }],
+      });
+      yield* executor.connections.create({
+        owner: "org",
+        name: ConnectionName.make("main"),
+        integration: IntegrationSlug.make("github"),
+        template: AuthTemplateSlug.make("oauth2"),
+        value: "host-held-token",
+      });
+      const result = yield* executor.execute(
+        ToolAddress.make("tools.github.org.main.query.repositoryWriteAuthority"),
+        AUTHORITY_INPUT,
+      );
+      expect(result).toMatchObject({
+        ok: true,
+        data: {
+          result: "write_ready",
+          expected: { nodeId: "R_node", owner: "mnfst", name: "app" },
+          observed: { nodeId: "R_node", fullName: "mnfst/app" },
+          permissions: { push: true },
+          provider: { requestId: "TEST:1234", status: 200 },
+          scopeEnvelope: { contentsWrite: true, pullRequestsWrite: true },
+        },
+      });
+      expect(github.requests).toEqual(["GET /repos/mnfst/app"]);
+    }),
+  );
+
+  it.effect("does not treat a readable 200 response as write authority", () =>
+    Effect.gen(function* () {
+      const github = githubLayer({
+        repository: {
+          permissions: { admin: false, maintain: false, push: false, pull: true },
+        },
+      });
+      const receipt = yield* inspectRepositoryWriteAuthority(
+        AUTHORITY_INPUT,
+        "host-held-token",
+        AUTHORITY_CREDENTIAL,
+      ).pipe(Effect.provide(github.layer));
+      expect(receipt).toMatchObject({
+        result: "read_only",
+        reasons: ["repository_role_read_only"],
+        provider: { status: 200 },
+      });
+      expect(github.requests).toEqual(["GET /repos/mnfst/app"]);
+    }),
+  );
+
+  it.effect("fails closed when the configured repository node identity does not match", () =>
+    Effect.gen(function* () {
+      const github = githubLayer({ repository: { node_id: "R_foreign" } });
+      const receipt = yield* inspectRepositoryWriteAuthority(
+        AUTHORITY_INPUT,
+        "host-held-token",
+        AUTHORITY_CREDENTIAL,
+      ).pipe(Effect.provide(github.layer));
+      expect(receipt).toMatchObject({
+        result: "indeterminate",
+        reasons: ["node_id_mismatch"],
+        observed: { nodeId: "R_foreign" },
+      });
+    }),
+  );
+
+  it.effect("classifies a provider-shaped 404 as inaccessible with its request id", () =>
+    Effect.gen(function* () {
+      const github = githubLayer({ repositoryStatus: 404 });
+      const receipt = yield* inspectRepositoryWriteAuthority(
+        AUTHORITY_INPUT,
+        "host-held-token",
+        AUTHORITY_CREDENTIAL,
+      ).pipe(Effect.provide(github.layer));
+      expect(receipt).toMatchObject({
+        result: "inaccessible",
+        reasons: ["github_http_404"],
+        provider: { requestId: "TEST:1234", status: 404 },
+      });
+    }),
+  );
+
+  it.effect("limits public_repo scope to public repositories", () =>
+    Effect.gen(function* () {
+      const privateGithub = githubLayer({ oauthScopes: "public_repo" });
+      const privateReceipt = yield* inspectRepositoryWriteAuthority(
+        AUTHORITY_INPUT,
+        "host-held-token",
+        AUTHORITY_CREDENTIAL,
+      ).pipe(Effect.provide(privateGithub.layer));
+      expect(privateReceipt).toMatchObject({
+        result: "read_only",
+        reasons: ["contents_scope_read_only", "pull_requests_scope_read_only"],
+      });
+
+      const publicGithub = githubLayer({
+        oauthScopes: "public_repo",
+        repository: { private: false },
+      });
+      const publicReceipt = yield* inspectRepositoryWriteAuthority(
+        AUTHORITY_INPUT,
+        "host-held-token",
+        AUTHORITY_CREDENTIAL,
+      ).pipe(Effect.provide(publicGithub.layer));
+      expect(publicReceipt.result).toBe("write_ready");
+    }),
+  );
+
+  it.effect("requires both fine-grained contents and pull-request write scopes", () =>
+    Effect.gen(function* () {
+      const incompleteGithub = githubLayer({ oauthScopes: "contents:write" });
+      const incomplete = yield* inspectRepositoryWriteAuthority(
+        AUTHORITY_INPUT,
+        "host-held-token",
+        AUTHORITY_CREDENTIAL,
+      ).pipe(Effect.provide(incompleteGithub.layer));
+      expect(incomplete).toMatchObject({
+        result: "read_only",
+        reasons: ["pull_requests_scope_read_only"],
+        scopeEnvelope: { contentsWrite: true, pullRequestsWrite: false },
+      });
+
+      const completeGithub = githubLayer({
+        oauthScopes: "contents:write, pull_requests:write",
+      });
+      const complete = yield* inspectRepositoryWriteAuthority(
+        AUTHORITY_INPUT,
+        "host-held-token",
+        AUTHORITY_CREDENTIAL,
+      ).pipe(Effect.provide(completeGithub.layer));
+      expect(complete).toMatchObject({
+        result: "write_ready",
+        scopeEnvelope: { contentsWrite: true, pullRequestsWrite: true },
+      });
+    }),
+  );
+
+  it.effect("accepts an explicit higher role but blocks inactive repositories", () =>
+    Effect.gen(function* () {
+      const administratorGithub = githubLayer({
+        repository: {
+          permissions: { admin: true, maintain: false, push: false, pull: true },
+        },
+      });
+      const administrator = yield* inspectRepositoryWriteAuthority(
+        AUTHORITY_INPUT,
+        "host-held-token",
+        AUTHORITY_CREDENTIAL,
+      ).pipe(Effect.provide(administratorGithub.layer));
+      expect(administrator).toMatchObject({ result: "write_ready", reasons: [] });
+
+      const archivedGithub = githubLayer({ repository: { archived: true } });
+      const archived = yield* inspectRepositoryWriteAuthority(
+        AUTHORITY_INPUT,
+        "host-held-token",
+        AUTHORITY_CREDENTIAL,
+      ).pipe(Effect.provide(archivedGithub.layer));
+      expect(archived).toMatchObject({
+        result: "read_only",
+        reasons: ["repository_archived"],
+      });
+    }),
+  );
+});
+
 describe("governed commit approval posture", () => {
   it("does not ask for an interactive approval it cannot use", () => {
     // Every byte this tool writes is pinned by `artifactSha256` before the call, and the push
@@ -431,5 +687,10 @@ describe("governed commit approval posture", () => {
     expect(GITHUB_GOVERNED_COMMIT_TOOL.annotations?.approvalDescription).toBe(
       "Push an exact governed commit and open its pull request",
     );
+  });
+
+  it("keeps repository authority free of interactive approval", () => {
+    expect(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.annotations?.requiresApproval).toBeFalsy();
+    expect(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.name).toBe("query.repositoryWriteAuthority");
   });
 });

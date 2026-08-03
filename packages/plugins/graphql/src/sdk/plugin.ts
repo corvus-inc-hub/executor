@@ -54,6 +54,8 @@ import { graphqlPresets } from "./presets";
 import { makeDefaultGraphqlStore, type GraphqlStore, type StoredOperation } from "./store";
 import {
   GITHUB_GOVERNED_COMMIT_TOOL,
+  GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
+  inspectRepositoryWriteAuthority,
   isGithubGraphqlEndpoint,
   pushCommitArtifact,
 } from "./github-governed-commit";
@@ -1020,8 +1022,11 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
           tools: isGithubGraphqlEndpoint(graphqlConfig.endpoint)
             ? [
                 ...tools.filter(
-                  (tool) => String(tool.name) !== String(GITHUB_GOVERNED_COMMIT_TOOL.name),
+                  (tool) =>
+                    String(tool.name) !== String(GITHUB_GOVERNED_COMMIT_TOOL.name) &&
+                    String(tool.name) !== String(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.name),
                 ),
+                GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
                 GITHUB_GOVERNED_COMMIT_TOOL,
               ]
             : tools,
@@ -1058,8 +1063,11 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
           ),
         );
 
+        const isGovernedCommit = toolName === String(GITHUB_GOVERNED_COMMIT_TOOL.name);
+        const isRepositoryAuthority =
+          toolName === String(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.name);
         if (
-          toolName === String(GITHUB_GOVERNED_COMMIT_TOOL.name) &&
+          (isGovernedCommit || isRepositoryAuthority) &&
           isGithubGraphqlEndpoint(config.endpoint)
         ) {
           const token = credential.values[TOKEN_VARIABLE];
@@ -1074,6 +1082,31 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
               credentialLabel: "OAuth sign-in",
               template: String(credential.template),
             });
+          }
+          if (isRepositoryAuthority) {
+            return yield* inspectRepositoryWriteAuthority(args, token, {
+              owner: String(credential.owner),
+              integration: String(credential.integration),
+              connection: String(credential.connection),
+              grantedScopes: credential.grantedScopes ?? [],
+            }).pipe(
+              Effect.provide(httpClientLayer),
+              Effect.map(ToolResult.ok),
+              Effect.catchTag("GithubGovernedCommitError", (error) =>
+                Effect.succeed(
+                  ToolResult.fail({
+                    code: error.code,
+                    message: error.message,
+                    ...(error.status === null ? {} : { status: error.status }),
+                    retryable: error.retryable,
+                    details: {
+                      stage: error.stage,
+                      ambiguous: error.ambiguous,
+                    },
+                  }),
+                ),
+              ),
+            );
           }
           return yield* pushCommitArtifact(args, token, ctx.storage).pipe(
             Effect.provide(httpClientLayer),
