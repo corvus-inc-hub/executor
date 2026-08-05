@@ -719,7 +719,12 @@ describe("GitHub pull request checks", () => {
   const checksInput = {
     schemaVersion: "mnfst.executor.pull-request-checks.v1",
     repository: { owner: "mnfst", name: "app" },
-    pullRequest: { number: 17, baseSha: BASE_COMMIT, headSha: HEAD_COMMIT },
+    pullRequest: {
+      number: 17,
+      url: "https://github.com/mnfst/app/pull/17",
+      baseSha: BASE_COMMIT,
+      headSha: HEAD_COMMIT,
+    },
     requiredChecks: ["test"],
   } as const;
 
@@ -730,11 +735,55 @@ describe("GitHub pull request checks", () => {
         Effect.provide(github.layer),
       );
       expect(receipt.result).toBe("success");
+      expect(receipt.expected.url).toBe(checksInput.pullRequest.url);
       expect(receipt.observed?.headSha).toBe(HEAD_COMMIT);
       expect(receipt.checks?.requiredState).toBe("success");
       expect(receipt.checks?.required.map((check) => check.name)).toEqual(["test"]);
       expect(receipt.reasons).toEqual([]);
       expect(receipt.inputSha256).toMatch(/^[a-f0-9]{64}$/);
+    }),
+  );
+
+  it.effect("binds the recorded pull request URL and reads no checks for a mismatch", () =>
+    Effect.gen(function* () {
+      const github = githubLayer();
+      const receipt = yield* inspectPullRequestChecks(
+        {
+          ...checksInput,
+          pullRequest: {
+            ...checksInput.pullRequest,
+            url: "https://github.com/mnfst/app/pull/18",
+          },
+        },
+        "token",
+      ).pipe(Effect.provide(github.layer));
+      expect(receipt.result).toBe("identity_mismatch");
+      expect(receipt.reasons).toContain("pull_request_url_mismatch");
+      expect(receipt.checks).toBeNull();
+      expect(github.requests.some((entry) => entry.includes("check-runs"))).toBe(false);
+      expect(github.requests.some((entry) => entry.includes("/status"))).toBe(false);
+    }),
+  );
+
+  it.effect("accepts GitHub owner and repository casing normalization", () =>
+    Effect.gen(function* () {
+      const github = githubLayer();
+      const canonicalReceipt = yield* inspectPullRequestChecks(checksInput, "token").pipe(
+        Effect.provide(github.layer),
+      );
+      const receipt = yield* inspectPullRequestChecks(
+        {
+          ...checksInput,
+          pullRequest: {
+            ...checksInput.pullRequest,
+            url: "https://github.com/MNFST/App/pull/17",
+          },
+        },
+        "token",
+      ).pipe(Effect.provide(github.layer));
+      expect(receipt.result).toBe("success");
+      expect(receipt.checks?.requiredState).toBe("success");
+      expect(receipt.inputSha256).not.toBe(canonicalReceipt.inputSha256);
     }),
   );
 

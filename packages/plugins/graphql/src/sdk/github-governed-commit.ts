@@ -7,6 +7,38 @@ import type { GraphqlStore } from "./store";
 
 const GITHUB_GRAPHQL_ENDPOINT = "https://api.github.com/graphql";
 const GITHUB_REST_ORIGIN = "https://api.github.com";
+
+function canonicalPullRequestUrl(
+  value: string,
+  expected: {
+    repository: { owner: string; name: string };
+    number: number;
+  },
+): string | null {
+  if (value !== value.trim() || !URL.canParse(value)) return null;
+  const url = new URL(value);
+  if (
+    url.protocol !== "https:" ||
+    url.hostname.toLowerCase() !== "github.com" ||
+    url.port !== "" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    return null;
+  }
+  const match = /^\/([^/]+)\/([^/]+)\/pull\/([1-9][0-9]*)$/.exec(url.pathname);
+  if (
+    match === null ||
+    match[1]?.toLowerCase() !== expected.repository.owner.toLowerCase() ||
+    match[2]?.toLowerCase() !== expected.repository.name.toLowerCase() ||
+    match[3] !== String(expected.number)
+  ) {
+    return null;
+  }
+  return `https://github.com/${match[1].toLowerCase()}/${match[2].toLowerCase()}/pull/${match[3]}`;
+}
 const GITHUB_API_VERSION = "2022-11-28";
 const MAX_FILE_COUNT = 256;
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
@@ -353,6 +385,7 @@ export const PullRequestChecksInput = Schema.Struct({
   repository: RepositoryIdentity,
   pullRequest: Schema.Struct({
     number: Schema.Number.check(Schema.isGreaterThan(0)),
+    url: Schema.String.check(Schema.isMinLength(1)),
     baseSha: GitSha,
     headSha: GitSha,
   }),
@@ -370,6 +403,7 @@ export const PullRequestChecksReceipt = Schema.Struct({
     owner: Schema.String,
     name: Schema.String,
     number: Schema.Number,
+    url: Schema.String,
     baseSha: GitSha,
     headSha: GitSha,
     requiredChecks: Schema.Array(Schema.String),
@@ -1774,6 +1808,7 @@ export const inspectPullRequestChecks = Effect.fn(
     owner: input.repository.owner,
     name: input.repository.name,
     number: input.pullRequest.number,
+    url: input.pullRequest.url,
     baseSha: input.pullRequest.baseSha,
     headSha: input.pullRequest.headSha,
     requiredChecks: input.requiredChecks,
@@ -1833,12 +1868,19 @@ export const inspectPullRequestChecks = Effect.fn(
   if (pull.base.sha !== input.pullRequest.baseSha) reasons.push("base_sha_mismatch");
   if (pull.state.toUpperCase() !== "OPEN") reasons.push("pull_request_not_open");
   if (pull.draft) reasons.push("pull_request_is_draft");
-  if (
-    !pull.html_url.startsWith(
-      `https://github.com/${input.repository.owner}/${input.repository.name}/pull/`,
-    )
-  ) {
-    reasons.push("pull_request_repository_mismatch");
+  const expectedUrl = canonicalPullRequestUrl(input.pullRequest.url, {
+    repository: input.repository,
+    number: input.pullRequest.number,
+  });
+  const observedUrl = canonicalPullRequestUrl(pull.html_url, {
+    repository: input.repository,
+    number: input.pullRequest.number,
+  });
+  // Both URLs must independently resolve to the one repository/number identity above. Their
+  // canonical forms are therefore equal by construction; casing differences in owner/name are
+  // allowed, while a foreign repository, number, query, fragment, or credential is refused.
+  if (expectedUrl === null || observedUrl === null) {
+    reasons.push("pull_request_url_mismatch");
   }
   if (reasons.length > 0) {
     // Deliberately no check read: observing a head we did not deliver is exactly the confusion
