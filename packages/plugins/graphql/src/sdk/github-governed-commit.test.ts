@@ -18,6 +18,7 @@ import { graphqlPlugin } from "./plugin";
 import {
   GITHUB_GOVERNED_COMMIT_TOOL,
   GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
+  inspectPullRequestChecks,
   inspectRepositoryWriteAuthority,
   pushCommitArtifact,
   sha256Canonical,
@@ -133,6 +134,7 @@ const githubLayer = (options?: {
   readonly repositoryStatus?: number;
   readonly oauthScopes?: string;
   readonly treeVisibilityFailures?: number;
+  readonly pullOverride?: Readonly<Record<string, unknown>>;
 }) => {
   let branchCreated = false;
   let pullCreated = false;
@@ -235,6 +237,9 @@ const githubLayer = (options?: {
         head: { sha: HEAD_COMMIT, ref: HEAD_BRANCH },
         base: { sha: BASE_COMMIT, ref: "main" },
       };
+      if (request.method === "GET" && /\/pulls\/\d+$/.test(url.pathname)) {
+        return Effect.succeed(json(request, { ...pull, ...options?.pullOverride }));
+      }
       if (request.method === "GET" && url.pathname.endsWith("/pulls")) {
         return Effect.succeed(json(request, pullCreated ? [pull] : []));
       }
@@ -708,4 +713,119 @@ describe("governed commit approval posture", () => {
     expect(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.annotations?.requiresApproval).toBeFalsy();
     expect(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.name).toBe("query.repositoryWriteAuthority");
   });
+});
+
+describe("GitHub pull request checks", () => {
+  const checksInput = {
+    schemaVersion: "mnfst.executor.pull-request-checks.v1",
+    repository: { owner: "mnfst", name: "app" },
+    pullRequest: {
+      number: 17,
+      url: "https://github.com/mnfst/app/pull/17",
+      baseSha: BASE_COMMIT,
+      headSha: HEAD_COMMIT,
+    },
+    requiredChecks: ["test"],
+  } as const;
+
+  it.effect("observes required checks on the exact delivered head", () =>
+    Effect.gen(function* () {
+      const github = githubLayer();
+      const receipt = yield* inspectPullRequestChecks(checksInput, "token").pipe(
+        Effect.provide(github.layer),
+      );
+      expect(receipt.result).toBe("success");
+      expect(receipt.expected.url).toBe(checksInput.pullRequest.url);
+      expect(receipt.observed?.headSha).toBe(HEAD_COMMIT);
+      expect(receipt.checks?.requiredState).toBe("success");
+      expect(receipt.checks?.required.map((check) => check.name)).toEqual(["test"]);
+      expect(receipt.reasons).toEqual([]);
+      expect(receipt.inputSha256).toMatch(/^[a-f0-9]{64}$/);
+    }),
+  );
+
+  it.effect("binds the recorded pull request URL and reads no checks for a mismatch", () =>
+    Effect.gen(function* () {
+      const github = githubLayer();
+      const receipt = yield* inspectPullRequestChecks(
+        {
+          ...checksInput,
+          pullRequest: {
+            ...checksInput.pullRequest,
+            url: "https://github.com/mnfst/app/pull/18",
+          },
+        },
+        "token",
+      ).pipe(Effect.provide(github.layer));
+      expect(receipt.result).toBe("identity_mismatch");
+      expect(receipt.reasons).toContain("pull_request_url_mismatch");
+      expect(receipt.checks).toBeNull();
+      expect(github.requests.some((entry) => entry.includes("check-runs"))).toBe(false);
+      expect(github.requests.some((entry) => entry.includes("/status"))).toBe(false);
+    }),
+  );
+
+  it.effect("accepts GitHub owner and repository casing normalization", () =>
+    Effect.gen(function* () {
+      const github = githubLayer();
+      const canonicalReceipt = yield* inspectPullRequestChecks(checksInput, "token").pipe(
+        Effect.provide(github.layer),
+      );
+      const receipt = yield* inspectPullRequestChecks(
+        {
+          ...checksInput,
+          pullRequest: {
+            ...checksInput.pullRequest,
+            url: "https://github.com/MNFST/App/pull/17",
+          },
+        },
+        "token",
+      ).pipe(Effect.provide(github.layer));
+      expect(receipt.result).toBe("success");
+      expect(receipt.checks?.requiredState).toBe("success");
+      expect(receipt.inputSha256).not.toBe(canonicalReceipt.inputSha256);
+    }),
+  );
+
+  // The property that stops a green foreign head settling someone else's delivery: when identity
+  // fails, no check is read at all -- provable from the recorded request log, not just the verdict.
+  it.effect("refuses a moved head and reads no checks for it", () =>
+    Effect.gen(function* () {
+      const github = githubLayer({
+        pullOverride: { head: { sha: "7".repeat(40), ref: HEAD_BRANCH } },
+      });
+      const receipt = yield* inspectPullRequestChecks(checksInput, "token").pipe(
+        Effect.provide(github.layer),
+      );
+      expect(receipt.result).toBe("identity_mismatch");
+      expect(receipt.reasons).toContain("head_sha_mismatch");
+      expect(receipt.checks).toBeNull();
+      expect(github.requests.some((entry) => entry.includes("check-runs"))).toBe(false);
+      expect(github.requests.some((entry) => entry.includes("/status"))).toBe(false);
+    }),
+  );
+
+  it.effect("refuses a closed pull request", () =>
+    Effect.gen(function* () {
+      const github = githubLayer({ pullOverride: { state: "closed" } });
+      const receipt = yield* inspectPullRequestChecks(checksInput, "token").pipe(
+        Effect.provide(github.layer),
+      );
+      expect(receipt.result).toBe("identity_mismatch");
+      expect(receipt.reasons).toContain("pull_request_not_open");
+      expect(receipt.checks).toBeNull();
+    }),
+  );
+
+  it.effect("refuses a draft pull request", () =>
+    Effect.gen(function* () {
+      const github = githubLayer({ pullOverride: { draft: true } });
+      const receipt = yield* inspectPullRequestChecks(checksInput, "token").pipe(
+        Effect.provide(github.layer),
+      );
+      expect(receipt.result).toBe("identity_mismatch");
+      expect(receipt.reasons).toContain("pull_request_is_draft");
+      expect(receipt.checks).toBeNull();
+    }),
+  );
 });

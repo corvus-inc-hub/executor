@@ -54,7 +54,9 @@ import { graphqlPresets } from "./presets";
 import { makeDefaultGraphqlStore, type GraphqlStore, type StoredOperation } from "./store";
 import {
   GITHUB_GOVERNED_COMMIT_TOOL,
+  GITHUB_PULL_REQUEST_CHECKS_TOOL,
   GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
+  inspectPullRequestChecks,
   inspectRepositoryWriteAuthority,
   isGithubGraphqlEndpoint,
   pushCommitArtifact,
@@ -1024,9 +1026,11 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
                 ...tools.filter(
                   (tool) =>
                     String(tool.name) !== String(GITHUB_GOVERNED_COMMIT_TOOL.name) &&
-                    String(tool.name) !== String(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.name),
+                    String(tool.name) !== String(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.name) &&
+                    String(tool.name) !== String(GITHUB_PULL_REQUEST_CHECKS_TOOL.name),
                 ),
                 GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
+                GITHUB_PULL_REQUEST_CHECKS_TOOL,
                 GITHUB_GOVERNED_COMMIT_TOOL,
               ]
             : tools,
@@ -1066,8 +1070,9 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
         const isGovernedCommit = toolName === String(GITHUB_GOVERNED_COMMIT_TOOL.name);
         const isRepositoryAuthority =
           toolName === String(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.name);
+        const isPullRequestChecks = toolName === String(GITHUB_PULL_REQUEST_CHECKS_TOOL.name);
         if (
-          (isGovernedCommit || isRepositoryAuthority) &&
+          (isGovernedCommit || isRepositoryAuthority || isPullRequestChecks) &&
           isGithubGraphqlEndpoint(config.endpoint)
         ) {
           const token = credential.values[TOKEN_VARIABLE];
@@ -1082,6 +1087,23 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
               credentialLabel: "OAuth sign-in",
               template: String(credential.template),
             });
+          }
+          if (isPullRequestChecks) {
+            return yield* inspectPullRequestChecks(args, token).pipe(
+              Effect.provide(httpClientLayer),
+              Effect.map(ToolResult.ok),
+              Effect.catchTag("GithubGovernedCommitError", (error) =>
+                Effect.succeed(
+                  ToolResult.fail({
+                    code: error.code,
+                    message: error.message,
+                    ...(error.status === null ? {} : { status: error.status }),
+                    retryable: error.retryable,
+                    details: { stage: error.stage, ambiguous: error.ambiguous },
+                  }),
+                ),
+              ),
+            );
           }
           if (isRepositoryAuthority) {
             return yield* inspectRepositoryWriteAuthority(args, token, {
