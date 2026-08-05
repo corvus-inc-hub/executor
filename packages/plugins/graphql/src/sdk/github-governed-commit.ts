@@ -348,6 +348,58 @@ export const GITHUB_GOVERNED_COMMIT_GUARANTEES = Object.freeze({
   credentialsStayInExecutor: true,
 });
 
+export const PullRequestChecksInput = Schema.Struct({
+  schemaVersion: Schema.Literal("mnfst.executor.pull-request-checks.v1"),
+  repository: RepositoryIdentity,
+  pullRequest: Schema.Struct({
+    number: Schema.Number.check(Schema.isGreaterThan(0)),
+    baseSha: GitSha,
+    headSha: GitSha,
+  }),
+  requiredChecks: Schema.Array(Schema.String.check(Schema.isMinLength(1))).check(
+    Schema.isMinLength(1),
+  ),
+});
+export type PullRequestChecksInput = typeof PullRequestChecksInput.Type;
+
+export const PullRequestChecksReceipt = Schema.Struct({
+  schemaVersion: Schema.Literal("mnfst.executor.pull-request-checks-receipt.v1"),
+  observedAt: Rfc3339Utc,
+  inputSha256: Sha256,
+  expected: Schema.Struct({
+    owner: Schema.String,
+    name: Schema.String,
+    number: Schema.Number,
+    baseSha: GitSha,
+    headSha: GitSha,
+    requiredChecks: Schema.Array(Schema.String),
+  }),
+  observed: Schema.NullOr(
+    Schema.Struct({
+      number: Schema.Number,
+      url: Schema.String,
+      state: Schema.String,
+      isDraft: Schema.Boolean,
+      baseSha: Schema.String,
+      headSha: Schema.String,
+    }),
+  ),
+  checks: Schema.NullOr(
+    Schema.Struct({
+      combinedState: Schema.String,
+      requiredState: Schema.Literals(["success", "pending", "failure"]),
+      required: Schema.Array(RequiredCheckReceipt),
+    }),
+  ),
+  provider: Schema.Struct({
+    requestId: Schema.NullOr(Schema.String),
+    status: Schema.NullOr(Schema.Number),
+  }),
+  result: Schema.Literals(["success", "pending", "failure", "identity_mismatch", "indeterminate"]),
+  reasons: Schema.Array(Schema.String),
+});
+export type PullRequestChecksReceipt = typeof PullRequestChecksReceipt.Type;
+
 const inputJsonSchema = Schema.toJsonSchemaDocument(PushCommitArtifactInput).schema;
 const outputJsonSchema = Schema.toJsonSchemaDocument(PushCommitArtifactReceipt).schema;
 const repositoryAuthorityInputJsonSchema = Schema.toJsonSchemaDocument(
@@ -369,6 +421,25 @@ export const GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL: ToolDef = {
       guarantees: {
         credentialsStayInExecutor: true,
         exactRepositoryIdentity: true,
+        providerRequestIdentity: true,
+        readOnly: true,
+      },
+    },
+  },
+};
+
+export const GITHUB_PULL_REQUEST_CHECKS_TOOL: ToolDef = {
+  name: ToolName.make("query.pullRequestChecks"),
+  description:
+    "Re-observe one exact governed pull request through this connection's resolved credential: prove the caller's recorded delivery identity against GitHub, then read the named required checks on that same head and return a typed, provider-bound receipt.",
+  inputSchema: Schema.toJsonSchemaDocument(PullRequestChecksInput).schema,
+  outputSchema: {
+    ...Schema.toJsonSchemaDocument(PullRequestChecksReceipt).schema,
+    "x-executor-capability": {
+      schemaVersion: "mnfst.executor.pull-request-checks-capability.v1",
+      guarantees: {
+        credentialsStayInExecutor: true,
+        exactPullRequestIdentity: true,
         providerRequestIdentity: true,
         readOnly: true,
       },
@@ -1323,16 +1394,30 @@ const ensurePullRequest = Effect.fn("graphql.githubGovernedCommit.ensurePullRequ
   });
 });
 
+// Narrowed from the full push input so a read-only caller can observe the same checks without
+// holding a commit artifact or a write grant. The push path passes exactly what it used to.
+type ChecksObservationTarget = Readonly<{
+  repository: typeof RepositoryIdentity.Type;
+  headSha: string;
+  requiredChecks: readonly string[];
+}>;
+
+const checksTargetForPush = (input: PushCommitArtifactInput): ChecksObservationTarget => ({
+  repository: input.repository,
+  headSha: input.artifact.head.commitSha,
+  requiredChecks: input.policy.requiredChecks,
+});
+
 const observeChecks = Effect.fn("graphql.githubGovernedCommit.observeChecks")(function* (
   token: string,
-  input: PushCommitArtifactInput,
+  target: ChecksObservationTarget,
 ) {
   const [runsBody, statusesBody] = yield* Effect.all(
     [
       githubRequest({
         token,
         method: "GET",
-        path: `${repoPath(input.repository)}/commits/${input.artifact.head.commitSha}/check-runs?filter=latest&per_page=100`,
+        path: `${repoPath(target.repository)}/commits/${target.headSha}/check-runs?filter=latest&per_page=100`,
         stage: "check-runs-read",
       }).pipe(
         Effect.flatMap((response) => requireStatus(response, [200], "check-runs-read")),
@@ -1341,7 +1426,7 @@ const observeChecks = Effect.fn("graphql.githubGovernedCommit.observeChecks")(fu
       githubRequest({
         token,
         method: "GET",
-        path: `${repoPath(input.repository)}/commits/${input.artifact.head.commitSha}/status?per_page=100`,
+        path: `${repoPath(target.repository)}/commits/${target.headSha}/status?per_page=100`,
         stage: "commit-status-read",
       }).pipe(
         Effect.flatMap((response) => requireStatus(response, [200], "commit-status-read")),
@@ -1350,7 +1435,7 @@ const observeChecks = Effect.fn("graphql.githubGovernedCommit.observeChecks")(fu
     ],
     { concurrency: 2 },
   );
-  if (statusesBody.sha !== input.artifact.head.commitSha) {
+  if (statusesBody.sha !== target.headSha) {
     return yield* failure({
       stage: "checks-read",
       code: "check_sha_mismatch",
@@ -1366,7 +1451,7 @@ const observeChecks = Effect.fn("graphql.githubGovernedCommit.observeChecks")(fu
     detailsUrl: run.details_url,
     headSha: run.head_sha,
   }));
-  if (runs.some((run) => run.headSha !== input.artifact.head.commitSha)) {
+  if (runs.some((run) => run.headSha !== target.headSha)) {
     return yield* failure({
       stage: "checks-read",
       code: "check_sha_mismatch",
@@ -1381,7 +1466,7 @@ const observeChecks = Effect.fn("graphql.githubGovernedCommit.observeChecks")(fu
     targetUrl: status.target_url,
     sha: statusesBody.sha,
   }));
-  const required = input.policy.requiredChecks.map((name): RequiredCheckReceipt => {
+  const required = target.requiredChecks.map((name): RequiredCheckReceipt => {
     const run = runs.find((candidate) => candidate.name === name);
     if (run) {
       const state =
@@ -1431,7 +1516,7 @@ const reconcileCompletedReceipt = Effect.fn("graphql.githubGovernedCommit.reconc
       [
         getReference(token, input.repository, input.artifact.head.branch),
         listMatchingPullRequests(token, input),
-        observeChecks(token, input),
+        observeChecks(token, checksTargetForPush(input)),
       ],
       { concurrency: 3 },
     );
@@ -1617,7 +1702,7 @@ export const pushCommitArtifact = Effect.fn("graphql.githubGovernedCommit.pushCo
         message: "The pull request does not match the exact governed base and head commits.",
       });
     }
-    const checks = yield* observeChecks(token, input);
+    const checks = yield* observeChecks(token, checksTargetForPush(input));
     const receipt = PushCommitArtifactReceipt.make({
       schemaVersion: "mnfst.executor.push-commit-artifact-receipt.v1",
       idempotencyKey: input.idempotencyKey,
@@ -1658,3 +1743,144 @@ export const pushCommitArtifact = Effect.fn("graphql.githubGovernedCommit.pushCo
     return receipt;
   },
 );
+
+// Capability A: re-observe a governed pull request's required checks WITHOUT a write grant.
+//
+// Manifest records a delivery the moment the pull request exists, because the PR's existence is a
+// fact and its CI colour is evidence that has not arrived yet. Something must collect that evidence
+// later, and the only sanctioned reader of GitHub is the Executor. Before this existed, the sole
+// way to re-read check state was to re-invoke `mutation.pushCommitArtifact` — consuming a governed
+// WRITE grant to perform a read, which inverts prepare -> decide -> grant -> consume -> settle.
+//
+// Identity is proved before any check is read, and the receipt binds what the caller already
+// recorded — repository, number, base, head, OPEN, non-draft. A pull request that has moved to a
+// different head, closed, or become a draft is reported as `identity_mismatch` with NO check
+// observation at all, so a green foreign head can never settle someone else's artifact.
+export const inspectPullRequestChecks = Effect.fn(
+  "graphql.githubGovernedCommit.inspectPullRequestChecks",
+)(function* (inputUnknown: unknown, token: string) {
+  const input = yield* Schema.decodeUnknownEffect(PullRequestChecksInput)(inputUnknown).pipe(
+    Effect.mapError(() =>
+      failure({
+        stage: "pull-request-checks-input",
+        code: "invalid_pull_request_checks_input",
+        message: "The pull-request checks input does not match the v1 schema.",
+      }),
+    ),
+  );
+  const inputSha256 = yield* sha256Canonical(input);
+  const observedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const expected = {
+    owner: input.repository.owner,
+    name: input.repository.name,
+    number: input.pullRequest.number,
+    baseSha: input.pullRequest.baseSha,
+    headSha: input.pullRequest.headSha,
+    requiredChecks: input.requiredChecks,
+  };
+  const base = {
+    schemaVersion: "mnfst.executor.pull-request-checks-receipt.v1" as const,
+    observedAt,
+    inputSha256,
+    expected,
+  };
+
+  const responseResult = yield* Effect.result(
+    githubRequest({
+      token,
+      method: "GET",
+      path: `${repoPath(input.repository)}/pulls/${input.pullRequest.number}`,
+      stage: "pull-request-read",
+    }),
+  );
+  if (Result.isFailure(responseResult)) {
+    return PullRequestChecksReceipt.make({
+      ...base,
+      observed: null,
+      checks: null,
+      provider: { requestId: null, status: responseResult.failure.status ?? null },
+      result: "indeterminate",
+      reasons: [responseResult.failure.code],
+    });
+  }
+  const response = responseResult.success;
+  const providerRequestId = responseHeader(response.headers, "X-GitHub-Request-Id") ?? null;
+  const decoded = yield* Effect.result(
+    Schema.decodeUnknownEffect(PullRequestResponse)(response.body),
+  );
+  if (Result.isFailure(decoded)) {
+    return PullRequestChecksReceipt.make({
+      ...base,
+      observed: null,
+      checks: null,
+      provider: { requestId: providerRequestId, status: response.status },
+      result: "indeterminate",
+      reasons: ["pull_request_decode_failed"],
+    });
+  }
+  const pull = decoded.success;
+  const observed = {
+    number: pull.number,
+    url: pull.html_url,
+    state: pull.state,
+    isDraft: pull.draft,
+    baseSha: pull.base.sha,
+    headSha: pull.head.sha,
+  };
+  const reasons: string[] = [];
+  if (pull.number !== input.pullRequest.number) reasons.push("pull_request_number_mismatch");
+  if (pull.head.sha !== input.pullRequest.headSha) reasons.push("head_sha_mismatch");
+  if (pull.base.sha !== input.pullRequest.baseSha) reasons.push("base_sha_mismatch");
+  if (pull.state.toUpperCase() !== "OPEN") reasons.push("pull_request_not_open");
+  if (pull.draft) reasons.push("pull_request_is_draft");
+  if (
+    !pull.html_url.startsWith(
+      `https://github.com/${input.repository.owner}/${input.repository.name}/pull/`,
+    )
+  ) {
+    reasons.push("pull_request_repository_mismatch");
+  }
+  if (reasons.length > 0) {
+    // Deliberately no check read: observing a head we did not deliver is exactly the confusion
+    // this receipt exists to prevent.
+    return PullRequestChecksReceipt.make({
+      ...base,
+      observed,
+      checks: null,
+      provider: { requestId: providerRequestId, status: response.status },
+      result: "identity_mismatch",
+      reasons,
+    });
+  }
+
+  const checksResult = yield* Effect.result(
+    observeChecks(token, {
+      repository: input.repository,
+      headSha: input.pullRequest.headSha,
+      requiredChecks: input.requiredChecks,
+    }),
+  );
+  if (Result.isFailure(checksResult)) {
+    return PullRequestChecksReceipt.make({
+      ...base,
+      observed,
+      checks: null,
+      provider: { requestId: providerRequestId, status: response.status },
+      result: "indeterminate",
+      reasons: [checksResult.failure.code],
+    });
+  }
+  const checks = checksResult.success;
+  return PullRequestChecksReceipt.make({
+    ...base,
+    observed,
+    checks: {
+      combinedState: checks.combinedState,
+      requiredState: checks.requiredState,
+      required: checks.required,
+    },
+    provider: { requestId: providerRequestId, status: response.status },
+    result: checks.requiredState,
+    reasons: [],
+  });
+});
