@@ -13,14 +13,17 @@ describe("mcpAuthMethodInputFromEditorValue", () => {
     expect(mcpAuthMethodInputFromEditorValue({ kind: "none" })).toEqual({ kind: "none" });
   });
 
-  it("maps 'oauth' → { kind: 'oauth2' } (endpoints/scopes are resolved at connect time)", () => {
+  it("maps oauth with an explicit scope policy to oauth2", () => {
     const value: AuthTemplateEditorValue = {
       kind: "oauth",
       authorizationUrl: "https://a.example.com/auth",
       tokenUrl: "https://a.example.com/token",
       scopes: ["mcp.read"],
     };
-    expect(mcpAuthMethodInputFromEditorValue(value)).toEqual({ kind: "oauth2" });
+    expect(mcpAuthMethodInputFromEditorValue(value)).toEqual({
+      kind: "oauth2",
+      scopes: ["mcp.read"],
+    });
   });
 
   it("maps a header placement to an apikey method (prefix preserved)", () => {
@@ -121,6 +124,21 @@ describe("editorValueFromMcpAuthMethod", () => {
       scopes: [],
     });
   });
+
+  it("preserves explicit oauth2 scopes in the editor", () => {
+    expect(
+      editorValueFromMcpAuthMethod({
+        slug: "oauth2",
+        kind: "oauth2",
+        scopes: ["files:read", "chat:write"],
+      }),
+    ).toEqual({
+      kind: "oauth",
+      authorizationUrl: "",
+      tokenUrl: "",
+      scopes: ["files:read", "chat:write"],
+    });
+  });
 });
 
 describe("authMethodsFromConfig", () => {
@@ -172,6 +190,19 @@ describe("authMethodsFromConfig", () => {
       { carrier: "header", name: "Authorization", prefix: "Bearer ", variable: "api_token" },
       { carrier: "query", name: "team_id", prefix: "", variable: "team_id" },
     ]);
+  });
+
+  it("carries explicit oauth scopes through to the hub", () => {
+    const methods = authMethodsFromConfig(
+      [{ slug: "oauth2", kind: "oauth2", scopes: ["files:read", "chat:write"] }],
+      "https://mcp.example.com/mcp",
+    );
+
+    expect(methods[0]?.oauth).toEqual({
+      discoveryUrl: "https://mcp.example.com/mcp",
+      scopes: ["files:read", "chat:write"],
+      supportsDynamicRegistration: true,
+    });
   });
 });
 

@@ -48,14 +48,22 @@ export const mcpWireAuthInput = (
   method: McpAuthMethod | McpCanonicalAuthMethodInput,
 ): McpAuthMethodInput => wireAuthInputFromShared(method) as McpAuthMethodInput;
 
-const oauthAuthMethod = (slug: string, endpoint: string): AuthMethod => ({
+const oauthAuthMethod = (
+  slug: string,
+  endpoint: string,
+  scopes: readonly string[] | undefined,
+): AuthMethod => ({
   id: slug,
   label: "OAuth",
   kind: "oauth",
   source: slug.startsWith("custom_") ? "custom" : "spec",
   template: AuthTemplateSlug.make(slug),
   placements: [],
-  oauth: { discoveryUrl: endpoint, supportsDynamicRegistration: true },
+  oauth: {
+    discoveryUrl: endpoint,
+    ...(scopes === undefined ? {} : { scopes: [...scopes] }),
+    supportsDynamicRegistration: true,
+  },
 });
 
 /** Convert a generic editor value into one MCP auth-method input (no slug —
@@ -65,7 +73,10 @@ const oauthAuthMethod = (slug: string, endpoint: string): AuthMethod => ({
 export function mcpAuthMethodInputFromEditorValue(
   value: AuthTemplateEditorValue,
 ): McpCanonicalAuthMethodInput {
-  if (value.kind === "oauth") return { kind: "oauth2" };
+  if (value.kind === "oauth") {
+    const scopes = value.scopes.map((scope) => scope.trim()).filter(Boolean);
+    return { kind: "oauth2", ...(scopes.length === 0 ? {} : { scopes }) };
+  }
   return (sharedMethodInputFromEditorValue(value) ?? {
     kind: "none",
   }) as McpCanonicalAuthMethodInput;
@@ -74,7 +85,12 @@ export function mcpAuthMethodInputFromEditorValue(
 /** Convert one stored MCP method into the generic editor value. */
 export function editorValueFromMcpAuthMethod(method: McpAuthMethod): AuthTemplateEditorValue {
   if (method.kind === "oauth2") {
-    return { kind: "oauth", authorizationUrl: "", tokenUrl: "", scopes: [] };
+    return {
+      kind: "oauth",
+      authorizationUrl: "",
+      tokenUrl: "",
+      scopes: [...(method.scopes ?? [])],
+    };
   }
   if (method.kind === "stdio_env") return stdioEnvEditorValue(method);
   return editorValueFromSharedMethod(method);
@@ -89,7 +105,7 @@ export function authMethodsFromConfig(
   endpoint: string,
 ): AuthMethod[] {
   return methods.map((method: McpAuthMethod): AuthMethod => {
-    if (method.kind === "oauth2") return oauthAuthMethod(method.slug, endpoint);
+    if (method.kind === "oauth2") return oauthAuthMethod(method.slug, endpoint, method.scopes);
     if (method.kind === "stdio_env") return stdioEnvAuthMethod(method);
     return authMethodFromSharedTemplate(method);
   });
