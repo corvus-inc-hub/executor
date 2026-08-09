@@ -47,6 +47,28 @@ describe("describeMcpAuthMethods", () => {
     ]);
   });
 
+  it("projects an explicit least-privilege OAuth scope policy", () => {
+    const methods = describeMcpAuthMethods(
+      recordWith({
+        transport: "remote",
+        endpoint: "https://mcp.example.com/mcp",
+        authenticationTemplate: [
+          {
+            slug: "oauth2",
+            kind: "oauth2",
+            scopes: ["files:read", "chat:write"],
+          },
+        ],
+      }),
+    );
+
+    expect(methods[0]?.oauth).toEqual({
+      discoveryUrl: "https://mcp.example.com/mcp",
+      scopes: ["files:read", "chat:write"],
+      supportsDynamicRegistration: true,
+    });
+  });
+
   it("projects an apikey header method carrying the placement", () => {
     const methods = describeMcpAuthMethods(
       recordWith({

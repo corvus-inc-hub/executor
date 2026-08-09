@@ -51,6 +51,9 @@ export type McpTransport = typeof McpTransport.Type;
 export const McpOAuthMethod = Schema.Struct({
   slug: Schema.String,
   kind: Schema.Literal("oauth2"),
+  /** Explicit least-privilege scopes for this integration. Omit to retain
+   *  backwards-compatible discovery of the resource's advertised scopes. */
+  scopes: Schema.optional(Schema.Array(Schema.String)),
 });
 export type McpOAuthMethod = typeof McpOAuthMethod.Type;
 
@@ -114,7 +117,11 @@ export const mcpAuthMethodFromShorthand = (auth: McpAuthShorthand): McpAuthMetho
  *  `normalizeMcpAuthMethods` backfills it. */
 export const McpAuthMethodInput = Schema.Union([
   Schema.Struct({ slug: Schema.optional(Schema.String), kind: Schema.Literal("none") }),
-  Schema.Struct({ slug: Schema.optional(Schema.String), kind: Schema.Literal("oauth2") }),
+  Schema.Struct({
+    slug: Schema.optional(Schema.String),
+    kind: Schema.Literal("oauth2"),
+    scopes: Schema.optional(Schema.Array(Schema.String)),
+  }),
   // Credential methods are authored request-shaped — the ONE apikey input
   // dialect: `{ type: "apiKey", headers: { Authorization: ["Bearer ",
   // variable("token")] }, queryParams: { … } }`. Stored configs and the
