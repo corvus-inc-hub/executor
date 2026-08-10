@@ -27,6 +27,9 @@ import {
 
 const BASE_COMMIT = "1111111111111111111111111111111111111111";
 const BASE_TREE = "2222222222222222222222222222222222222222";
+const ADVANCED_BASE_COMMIT = "9".repeat(40);
+const ADVANCED_BASE_TREE = "8".repeat(40);
+const FOREIGN_BLOB = "7".repeat(40);
 const HEAD_TREE = "3333333333333333333333333333333333333333";
 const HEAD_COMMIT = "4444444444444444444444444444444444444444";
 const IDEMPOTENCY_KEY = "a".repeat(64);
@@ -116,7 +119,9 @@ const makeInput = Effect.fn("test.makeGovernedCommitInput")(function* () {
 });
 
 const githubLayer = (options?: {
-  readonly foreignBase?: boolean;
+  readonly advancedBase?: boolean;
+  readonly conflictingBase?: boolean;
+  readonly divergedBase?: boolean;
   readonly repository?: Partial<{
     readonly node_id: string;
     readonly full_name: string;
@@ -186,8 +191,12 @@ const githubLayer = (options?: {
         );
       }
       if (request.method === "GET" && url.pathname.endsWith("/git/ref/heads%2Fmain")) {
+        const advanced =
+          options?.advancedBase === true ||
+          options?.conflictingBase === true ||
+          options?.divergedBase === true;
         return Effect.succeed(
-          json(request, ref("main", options?.foreignBase === true ? "9".repeat(40) : BASE_COMMIT)),
+          json(request, ref("main", advanced ? ADVANCED_BASE_COMMIT : BASE_COMMIT)),
         );
       }
       if (request.method === "GET" && url.pathname.endsWith(`/git/commits/${BASE_COMMIT}`)) {
@@ -198,6 +207,44 @@ const githubLayer = (options?: {
       if (request.method === "GET" && url.pathname.endsWith(`/git/trees/${BASE_TREE}`)) {
         return Effect.succeed(
           json(request, { sha: BASE_TREE, url: "tree", truncated: false, tree: [] }),
+        );
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname.endsWith(`/git/commits/${ADVANCED_BASE_COMMIT}`)
+      ) {
+        return Effect.succeed(
+          json(request, {
+            sha: ADVANCED_BASE_COMMIT,
+            url: "advanced-commit",
+            tree: { sha: ADVANCED_BASE_TREE },
+          }),
+        );
+      }
+      if (request.method === "GET" && url.pathname.endsWith(`/git/trees/${ADVANCED_BASE_TREE}`)) {
+        return Effect.succeed(
+          json(request, {
+            sha: ADVANCED_BASE_TREE,
+            url: "advanced-tree",
+            truncated: false,
+            tree:
+              options?.conflictingBase === true
+                ? [{ path: "greeting.txt", mode: "100644", type: "blob", sha: FOREIGN_BLOB }]
+                : [],
+          }),
+        );
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname.endsWith(`/compare/${BASE_COMMIT}...${ADVANCED_BASE_COMMIT}`)
+      ) {
+        return Effect.succeed(
+          json(request, {
+            status: options?.divergedBase === true ? "diverged" : "ahead",
+            merge_base_commit: {
+              sha: options?.divergedBase === true ? "6".repeat(40) : BASE_COMMIT,
+            },
+          }),
         );
       }
       if (request.method === "POST" && url.pathname.endsWith("/git/blobs")) {
@@ -235,7 +282,15 @@ const githubLayer = (options?: {
         state: "open",
         draft: false,
         head: { sha: HEAD_COMMIT, ref: HEAD_BRANCH },
-        base: { sha: BASE_COMMIT, ref: "main" },
+        base: {
+          sha:
+            options?.advancedBase === true ||
+            options?.conflictingBase === true ||
+            options?.divergedBase === true
+              ? ADVANCED_BASE_COMMIT
+              : BASE_COMMIT,
+          ref: "main",
+        },
       };
       if (request.method === "GET" && /\/pulls\/\d+$/.test(url.pathname)) {
         return Effect.succeed(json(request, { ...pull, ...options?.pullOverride }));
@@ -442,10 +497,41 @@ describe("GitHub governed commit capability", () => {
     }),
   );
 
-  it.effect("fails before effects when the live base branch is foreign", () =>
+  it.effect("opens a PR from an immutable base after non-overlapping target advances", () =>
     Effect.gen(function* () {
       const input = yield* makeInput();
-      const github = githubLayer({ foreignBase: true });
+      const github = githubLayer({ advancedBase: true });
+      const result = yield* pushCommitArtifact(input, "host-held-token", makeStore()).pipe(
+        Effect.provide(github.layer),
+      );
+      expect(result.pullRequest).toMatchObject({
+        baseSha: ADVANCED_BASE_COMMIT,
+        headSha: HEAD_COMMIT,
+      });
+      expect(github.requests.some((entry) => entry.startsWith("POST "))).toBe(true);
+    }),
+  );
+
+  it.effect("fails before effects when the live target changed an owned path", () =>
+    Effect.gen(function* () {
+      const input = yield* makeInput();
+      const github = githubLayer({ conflictingBase: true });
+      const result = yield* Effect.result(
+        pushCommitArtifact(input, "host-held-token", makeStore()).pipe(
+          Effect.provide(github.layer),
+        ),
+      );
+      expect(Result.isFailure(result)).toBe(true);
+      if (!Result.isFailure(result)) return;
+      expect(result.failure).toMatchObject({ code: "base_blob_mismatch" });
+      expect(github.requests.some((entry) => entry.startsWith("POST "))).toBe(false);
+    }),
+  );
+
+  it.effect("fails before effects when the live target diverged from the immutable base", () =>
+    Effect.gen(function* () {
+      const input = yield* makeInput();
+      const github = githubLayer({ divergedBase: true });
       const result = yield* Effect.result(
         pushCommitArtifact(input, "host-held-token", makeStore()).pipe(
           Effect.provide(github.layer),
