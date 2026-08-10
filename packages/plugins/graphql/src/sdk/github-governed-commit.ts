@@ -252,6 +252,11 @@ const GitTreeResponse = Schema.Struct({
   tree: Schema.Array(GitTreeEntry),
 });
 
+const GitCompareResponse = Schema.Struct({
+  status: Schema.String,
+  merge_base_commit: Schema.Struct({ sha: GitSha }),
+});
+
 const GitObjectResponse = Schema.Struct({ sha: GitSha, url: Schema.String });
 
 const RepositoryResponse = Schema.Struct({
@@ -1206,6 +1211,39 @@ const getTree = (token: string, repository: typeof RepositoryIdentity.Type, sha:
     Effect.flatMap(decodeResponse(GitTreeResponse, "tree")),
   );
 
+const compareCommits = (
+  token: string,
+  repository: typeof RepositoryIdentity.Type,
+  baseSha: string,
+  headSha: string,
+) =>
+  githubRequest({
+    token,
+    method: "GET",
+    path: `${repoPath(repository)}/compare/${baseSha}...${headSha}`,
+    stage: "base-comparison",
+  }).pipe(
+    Effect.flatMap((response) => requireStatus(response, [200], "base-comparison")),
+    Effect.flatMap(decodeResponse(GitCompareResponse, "base comparison")),
+  );
+
+const treeMatchesArtifactBase = (
+  files: PushCommitArtifactInput["artifact"]["files"],
+  tree: typeof GitTreeResponse.Type,
+) => {
+  const blobs = new Map(
+    tree.tree
+      .filter((entry) => entry.type === "blob")
+      .map((entry) => [entry.path, { sha: entry.sha, mode: entry.mode }]),
+  );
+  return files.every((file) => {
+    const current = blobs.get(file.path);
+    return file.operation === "add"
+      ? current === undefined
+      : current?.sha === file.baseBlobSha && current?.mode === file.baseMode;
+  });
+};
+
 const createBlob = (
   token: string,
   repository: typeof RepositoryIdentity.Type,
@@ -1641,7 +1679,7 @@ export const pushCommitArtifact = Effect.fn("graphql.githubGovernedCommit.pushCo
       { concurrency: 3 },
     );
     if (
-      baseReference?.object.sha !== input.artifact.base.commitSha ||
+      baseReference === null ||
       baseCommit.sha !== input.artifact.base.commitSha ||
       baseCommit.tree.sha !== input.artifact.base.treeSha ||
       baseTree.sha !== input.artifact.base.treeSha ||
@@ -1650,27 +1688,56 @@ export const pushCommitArtifact = Effect.fn("graphql.githubGovernedCommit.pushCo
       return yield* failure({
         stage: "base-verification",
         code: "base_revision_mismatch",
-        message: "The live GitHub base revision or tree does not match the immutable artifact.",
+        message: "The GitHub base revision or tree does not match the immutable artifact.",
       });
     }
-    const baseBlobs = new Map(
-      baseTree.tree
-        .filter((entry) => entry.type === "blob")
-        .map((entry) => [entry.path, { sha: entry.sha, mode: entry.mode }]),
-    );
-    for (const file of input.artifact.files) {
-      const current = baseBlobs.get(file.path);
+    if (!treeMatchesArtifactBase(input.artifact.files, baseTree)) {
+      return yield* failure({
+        stage: "base-verification",
+        code: "base_blob_mismatch",
+        message: "The immutable base blobs do not match the governed artifact.",
+      });
+    }
+    let targetTree = baseTree;
+    if (baseReference.object.sha !== input.artifact.base.commitSha) {
+      const [comparison, targetCommit] = yield* Effect.all(
+        [
+          compareCommits(
+            token,
+            input.repository,
+            input.artifact.base.commitSha,
+            baseReference.object.sha,
+          ),
+          getCommit(token, input.repository, baseReference.object.sha),
+        ],
+        { concurrency: 2 },
+      );
       if (
-        (file.operation === "add" && current !== undefined) ||
-        (file.operation !== "add" &&
-          (current?.sha !== file.baseBlobSha || current?.mode !== file.baseMode))
+        comparison.status !== "ahead" ||
+        comparison.merge_base_commit.sha !== input.artifact.base.commitSha ||
+        targetCommit.sha !== baseReference.object.sha
       ) {
         return yield* failure({
           stage: "base-verification",
-          code: "base_blob_mismatch",
-          message: `The live base blob for ${file.path} does not match the artifact.`,
+          code: "base_revision_mismatch",
+          message: "The live target branch is not a descendant of the immutable base revision.",
         });
       }
+      targetTree = yield* getTree(token, input.repository, targetCommit.tree.sha);
+      if (targetTree.sha !== targetCommit.tree.sha || targetTree.truncated === true) {
+        return yield* failure({
+          stage: "base-verification",
+          code: "base_revision_mismatch",
+          message: "The live target branch tree could not be verified completely.",
+        });
+      }
+    }
+    if (!treeMatchesArtifactBase(input.artifact.files, targetTree)) {
+      return yield* failure({
+        stage: "base-verification",
+        code: "base_blob_mismatch",
+        message: "The live target branch changed a path owned by the governed artifact.",
+      });
     }
 
     const treeEntries: TreeWrite[] = [];
@@ -1725,7 +1792,8 @@ export const pushCommitArtifact = Effect.fn("graphql.githubGovernedCommit.pushCo
     const pull = yield* ensurePullRequest(token, input);
     if (
       pull.pullRequest.head.sha !== input.artifact.head.commitSha ||
-      pull.pullRequest.base.sha !== input.artifact.base.commitSha ||
+      pull.pullRequest.base.sha !== baseReference.object.sha ||
+      pull.pullRequest.base.ref !== input.artifact.base.branch ||
       pull.pullRequest.title !== input.pullRequest.title ||
       (pull.pullRequest.body ?? "") !== input.pullRequest.body ||
       pull.pullRequest.draft
