@@ -19,6 +19,7 @@ import {
   GITHUB_GOVERNED_COMMIT_TOOL,
   GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
   inspectPullRequestChecks,
+  inspectPullRequestRevision,
   inspectRepositoryWriteAuthority,
   pushCommitArtifact,
   sha256Canonical,
@@ -32,6 +33,8 @@ const ADVANCED_BASE_TREE = "8".repeat(40);
 const FOREIGN_BLOB = "7".repeat(40);
 const HEAD_TREE = "3333333333333333333333333333333333333333";
 const HEAD_COMMIT = "4444444444444444444444444444444444444444";
+const REVIEW_HEAD_TREE = "5555555555555555555555555555555555555555";
+const REVIEW_HEAD_COMMIT = "6666666666666666666666666666666666666666";
 const IDEMPOTENCY_KEY = "a".repeat(64);
 const HEAD_BRANCH = `mnfst/${IDEMPOTENCY_KEY.slice(0, 16)}`;
 const CONTENT = Buffer.from("hello\n", "utf8");
@@ -137,6 +140,8 @@ const githubLayer = (options?: {
     };
   }>;
   readonly repositoryStatus?: number;
+  readonly revisionDiverged?: boolean;
+  readonly revisionHead?: boolean;
   readonly oauthScopes?: string;
   readonly treeVisibilityFailures?: number;
   readonly pullOverride?: Readonly<Record<string, unknown>>;
@@ -145,6 +150,7 @@ const githubLayer = (options?: {
   let pullCreated = false;
   let treeCreateAttempts = 0;
   const requests: string[] = [];
+  const activeHead = options?.revisionHead === true ? REVIEW_HEAD_COMMIT : HEAD_COMMIT;
   const json = (request: HttpClientRequest.HttpClientRequest, body: unknown, status = 200) =>
     HttpClientResponse.fromWeb(
       request,
@@ -204,6 +210,11 @@ const githubLayer = (options?: {
           json(request, { sha: BASE_COMMIT, url: "commit", tree: { sha: BASE_TREE } }),
         );
       }
+      if (request.method === "GET" && url.pathname.endsWith(`/git/commits/${HEAD_COMMIT}`)) {
+        return Effect.succeed(
+          json(request, { sha: HEAD_COMMIT, url: "head-commit", tree: { sha: HEAD_TREE } }),
+        );
+      }
       if (request.method === "GET" && url.pathname.endsWith(`/git/trees/${BASE_TREE}`)) {
         return Effect.succeed(
           json(request, { sha: BASE_TREE, url: "tree", truncated: false, tree: [] }),
@@ -247,6 +258,55 @@ const githubLayer = (options?: {
           }),
         );
       }
+      if (
+        request.method === "GET" &&
+        url.pathname.endsWith(`/compare/${HEAD_COMMIT}...${REVIEW_HEAD_COMMIT}`)
+      ) {
+        return Effect.succeed(
+          json(request, {
+            status: options?.revisionDiverged === true ? "diverged" : "ahead",
+            merge_base_commit: {
+              sha: options?.revisionDiverged === true ? "7".repeat(40) : HEAD_COMMIT,
+            },
+          }),
+        );
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname.endsWith(`/compare/${BASE_COMMIT}...${REVIEW_HEAD_COMMIT}`)
+      ) {
+        return Effect.succeed(
+          json(request, {
+            status: "ahead",
+            merge_base_commit: { sha: BASE_COMMIT },
+          }),
+        );
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname.endsWith(`/compare/${HEAD_COMMIT}...${HEAD_COMMIT}`)
+      ) {
+        return Effect.succeed(
+          json(request, { status: "identical", merge_base_commit: { sha: HEAD_COMMIT } }),
+        );
+      }
+      if (
+        request.method === "GET" &&
+        url.pathname.endsWith(`/compare/${BASE_COMMIT}...${HEAD_COMMIT}`)
+      ) {
+        return Effect.succeed(
+          json(request, { status: "ahead", merge_base_commit: { sha: BASE_COMMIT } }),
+        );
+      }
+      if (request.method === "GET" && url.pathname.endsWith(`/git/commits/${REVIEW_HEAD_COMMIT}`)) {
+        return Effect.succeed(
+          json(request, {
+            sha: REVIEW_HEAD_COMMIT,
+            url: "review-head-commit",
+            tree: { sha: REVIEW_HEAD_TREE },
+          }),
+        );
+      }
       if (request.method === "POST" && url.pathname.endsWith("/git/blobs")) {
         return Effect.succeed(json(request, { sha: BLOB_SHA, url: "blob" }, 201));
       }
@@ -281,7 +341,7 @@ const githubLayer = (options?: {
         body: "Exact governed change",
         state: "open",
         draft: false,
-        head: { sha: HEAD_COMMIT, ref: HEAD_BRANCH },
+        head: { sha: activeHead, ref: HEAD_BRANCH },
         base: {
           sha:
             options?.advancedBase === true ||
@@ -313,15 +373,15 @@ const githubLayer = (options?: {
                 conclusion: "success",
                 url: "https://api.github.com/check-runs/23",
                 details_url: "https://github.com/mnfst/app/actions/runs/23",
-                head_sha: HEAD_COMMIT,
+                head_sha: activeHead,
               },
             ],
           }),
         );
       }
-      if (request.method === "GET" && url.pathname.endsWith(`/commits/${HEAD_COMMIT}/status`)) {
+      if (request.method === "GET" && url.pathname.endsWith(`/commits/${activeHead}/status`)) {
         return Effect.succeed(
-          json(request, { state: "success", sha: HEAD_COMMIT, url: "status", statuses: [] }),
+          json(request, { state: "success", sha: activeHead, url: "status", statuses: [] }),
         );
       }
       return Effect.succeed(json(request, { message: "Unexpected test request" }, 500));
@@ -391,6 +451,20 @@ describe("GitHub governed commit capability", () => {
           readOnly: true,
         },
       });
+      const revisionSchema = yield* executor.tools.schema(
+        ToolAddress.make("tools.github.org.main.query.pullRequestRevision"),
+      );
+      expect(Reflect.get(revisionSchema?.outputSchema ?? {}, "x-executor-capability")).toEqual({
+        schemaVersion: "mnfst.executor.pull-request-revision-capability.v1",
+        guarantees: {
+          credentialsStayInExecutor: true,
+          exactPullRequestIdentity: true,
+          recordedHeadAncestry: true,
+          implementationBaseAncestry: true,
+          providerRequestIdentity: true,
+          readOnly: true,
+        },
+      });
     }),
   );
 
@@ -446,6 +520,29 @@ describe("GitHub governed commit capability", () => {
         data: {
           head: { commitSha: HEAD_COMMIT },
           pullRequest: { number: 17 },
+          checks: { requiredState: "success" },
+        },
+      });
+      const revision = yield* executor.execute(
+        ToolAddress.make("tools.github.org.main.query.pullRequestRevision"),
+        {
+          schemaVersion: "mnfst.executor.pull-request-revision.v1",
+          repository: { owner: "mnfst", name: "app" },
+          pullRequest: {
+            number: 17,
+            url: "https://github.com/mnfst/app/pull/17",
+            baseSha: BASE_COMMIT,
+            recordedHeadSha: HEAD_COMMIT,
+            implementationBaseSha: BASE_COMMIT,
+          },
+          requiredChecks: ["test"],
+        },
+      );
+      expect(revision).toMatchObject({
+        ok: true,
+        data: {
+          result: "current",
+          observed: { headSha: HEAD_COMMIT, headTreeSha: HEAD_TREE },
           checks: { requiredState: "success" },
         },
       });
@@ -912,6 +1009,92 @@ describe("GitHub pull request checks", () => {
       expect(receipt.result).toBe("identity_mismatch");
       expect(receipt.reasons).toContain("pull_request_is_draft");
       expect(receipt.checks).toBeNull();
+    }),
+  );
+});
+
+describe("GitHub pull request revision", () => {
+  const revisionInput = {
+    schemaVersion: "mnfst.executor.pull-request-revision.v1",
+    repository: { owner: "mnfst", name: "app" },
+    pullRequest: {
+      number: 17,
+      url: "https://github.com/mnfst/app/pull/17",
+      baseSha: BASE_COMMIT,
+      recordedHeadSha: HEAD_COMMIT,
+      implementationBaseSha: BASE_COMMIT,
+    },
+    requiredChecks: ["test"],
+  } as const;
+
+  it.effect("proves a reviewed head that descends from the recorded delivery", () =>
+    Effect.gen(function* () {
+      const github = githubLayer({ revisionHead: true });
+      const receipt = yield* inspectPullRequestRevision(revisionInput, "token").pipe(
+        Effect.provide(github.layer),
+      );
+      expect(receipt).toMatchObject({
+        result: "advanced",
+        reasons: [],
+        observed: {
+          baseSha: BASE_COMMIT,
+          headSha: REVIEW_HEAD_COMMIT,
+          headTreeSha: REVIEW_HEAD_TREE,
+        },
+        lineage: {
+          recordedHeadStatus: "ahead",
+          recordedHeadMergeBaseSha: HEAD_COMMIT,
+          implementationBaseStatus: "ahead",
+          implementationBaseMergeBaseSha: BASE_COMMIT,
+        },
+        checks: { requiredState: "success" },
+      });
+      expect(github.requests.filter((entry) => entry.endsWith("/pulls/17"))).toHaveLength(2);
+      expect(github.requests).toContain(
+        `GET /repos/mnfst/app/compare/${HEAD_COMMIT}...${REVIEW_HEAD_COMMIT}`,
+      );
+    }),
+  );
+
+  it.effect("reports the recorded head as current without manufacturing an amendment", () =>
+    Effect.gen(function* () {
+      const github = githubLayer();
+      const receipt = yield* inspectPullRequestRevision(revisionInput, "token").pipe(
+        Effect.provide(github.layer),
+      );
+      expect(receipt.result).toBe("current");
+      expect(receipt.observed?.headSha).toBe(HEAD_COMMIT);
+      expect(receipt.checks?.requiredState).toBe("success");
+    }),
+  );
+
+  it.effect("rejects a head that does not descend from the recorded delivery", () =>
+    Effect.gen(function* () {
+      const github = githubLayer({ revisionDiverged: true, revisionHead: true });
+      const receipt = yield* inspectPullRequestRevision(revisionInput, "token").pipe(
+        Effect.provide(github.layer),
+      );
+      expect(receipt.result).toBe("history_mismatch");
+      expect(receipt.reasons).toContain("recorded_head_not_ancestor");
+      expect(receipt.checks).toBeNull();
+      expect(github.requests.some((entry) => entry.includes("check-runs"))).toBe(false);
+    }),
+  );
+
+  it.effect("rejects a changed pull request base before reading history or checks", () =>
+    Effect.gen(function* () {
+      const github = githubLayer({
+        pullOverride: { base: { sha: ADVANCED_BASE_COMMIT, ref: "main" } },
+        revisionHead: true,
+      });
+      const receipt = yield* inspectPullRequestRevision(revisionInput, "token").pipe(
+        Effect.provide(github.layer),
+      );
+      expect(receipt.result).toBe("identity_mismatch");
+      expect(receipt.reasons).toContain("base_sha_mismatch");
+      expect(receipt.lineage).toBeNull();
+      expect(receipt.checks).toBeNull();
+      expect(github.requests.some((entry) => entry.includes("/compare/"))).toBe(false);
     }),
   );
 });
