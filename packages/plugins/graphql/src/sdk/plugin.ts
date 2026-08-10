@@ -55,8 +55,10 @@ import { makeDefaultGraphqlStore, type GraphqlStore, type StoredOperation } from
 import {
   GITHUB_GOVERNED_COMMIT_TOOL,
   GITHUB_PULL_REQUEST_CHECKS_TOOL,
+  GITHUB_PULL_REQUEST_REVISION_TOOL,
   GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
   inspectPullRequestChecks,
+  inspectPullRequestRevision,
   inspectRepositoryWriteAuthority,
   isGithubGraphqlEndpoint,
   pushCommitArtifact,
@@ -1027,10 +1029,12 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
                   (tool) =>
                     String(tool.name) !== String(GITHUB_GOVERNED_COMMIT_TOOL.name) &&
                     String(tool.name) !== String(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.name) &&
-                    String(tool.name) !== String(GITHUB_PULL_REQUEST_CHECKS_TOOL.name),
+                    String(tool.name) !== String(GITHUB_PULL_REQUEST_CHECKS_TOOL.name) &&
+                    String(tool.name) !== String(GITHUB_PULL_REQUEST_REVISION_TOOL.name),
                 ),
                 GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
                 GITHUB_PULL_REQUEST_CHECKS_TOOL,
+                GITHUB_PULL_REQUEST_REVISION_TOOL,
                 GITHUB_GOVERNED_COMMIT_TOOL,
               ]
             : tools,
@@ -1071,8 +1075,12 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
         const isRepositoryAuthority =
           toolName === String(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.name);
         const isPullRequestChecks = toolName === String(GITHUB_PULL_REQUEST_CHECKS_TOOL.name);
+        const isPullRequestRevision = toolName === String(GITHUB_PULL_REQUEST_REVISION_TOOL.name);
         if (
-          (isGovernedCommit || isRepositoryAuthority || isPullRequestChecks) &&
+          (isGovernedCommit ||
+            isRepositoryAuthority ||
+            isPullRequestChecks ||
+            isPullRequestRevision) &&
           isGithubGraphqlEndpoint(config.endpoint)
         ) {
           const token = credential.values[TOKEN_VARIABLE];
@@ -1090,6 +1098,23 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
           }
           if (isPullRequestChecks) {
             return yield* inspectPullRequestChecks(args, token).pipe(
+              Effect.provide(httpClientLayer),
+              Effect.map(ToolResult.ok),
+              Effect.catchTag("GithubGovernedCommitError", (error) =>
+                Effect.succeed(
+                  ToolResult.fail({
+                    code: error.code,
+                    message: error.message,
+                    ...(error.status === null ? {} : { status: error.status }),
+                    retryable: error.retryable,
+                    details: { stage: error.stage, ambiguous: error.ambiguous },
+                  }),
+                ),
+              ),
+            );
+          }
+          if (isPullRequestRevision) {
+            return yield* inspectPullRequestRevision(args, token).pipe(
               Effect.provide(httpClientLayer),
               Effect.map(ToolResult.ok),
               Effect.catchTag("GithubGovernedCommitError", (error) =>
@@ -1149,7 +1174,6 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
             ),
           );
         }
-
         // Operation bindings are produced lazily for integrations registered
         // without an add-time schema (no network at catalog registration). On a
         // cache miss, introspect with this connection's credential, persist the

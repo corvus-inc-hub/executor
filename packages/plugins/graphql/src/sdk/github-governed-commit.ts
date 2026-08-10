@@ -439,6 +439,77 @@ export const PullRequestChecksReceipt = Schema.Struct({
 });
 export type PullRequestChecksReceipt = typeof PullRequestChecksReceipt.Type;
 
+export const PullRequestRevisionInput = Schema.Struct({
+  schemaVersion: Schema.Literal("mnfst.executor.pull-request-revision.v1"),
+  repository: RepositoryIdentity,
+  pullRequest: Schema.Struct({
+    number: Schema.Number.check(Schema.isGreaterThan(0)),
+    url: Schema.String.check(Schema.isMinLength(1)),
+    baseSha: GitSha,
+    recordedHeadSha: GitSha,
+    implementationBaseSha: GitSha,
+  }),
+  requiredChecks: Schema.Array(Schema.String.check(Schema.isMinLength(1))).check(
+    Schema.isMinLength(1),
+  ),
+});
+export type PullRequestRevisionInput = typeof PullRequestRevisionInput.Type;
+
+export const PullRequestRevisionReceipt = Schema.Struct({
+  schemaVersion: Schema.Literal("mnfst.executor.pull-request-revision-receipt.v1"),
+  observedAt: Rfc3339Utc,
+  inputSha256: Sha256,
+  expected: Schema.Struct({
+    owner: Schema.String,
+    name: Schema.String,
+    number: Schema.Number,
+    url: Schema.String,
+    baseSha: GitSha,
+    recordedHeadSha: GitSha,
+    implementationBaseSha: GitSha,
+    requiredChecks: Schema.Array(Schema.String),
+  }),
+  observed: Schema.NullOr(
+    Schema.Struct({
+      number: Schema.Number,
+      url: Schema.String,
+      state: Schema.String,
+      isDraft: Schema.Boolean,
+      baseSha: Schema.String,
+      headSha: Schema.String,
+      headTreeSha: Schema.NullOr(Schema.String),
+    }),
+  ),
+  lineage: Schema.NullOr(
+    Schema.Struct({
+      recordedHeadStatus: Schema.String,
+      recordedHeadMergeBaseSha: Schema.String,
+      implementationBaseStatus: Schema.String,
+      implementationBaseMergeBaseSha: Schema.String,
+    }),
+  ),
+  checks: Schema.NullOr(
+    Schema.Struct({
+      combinedState: Schema.String,
+      requiredState: Schema.Literals(["success", "pending", "failure"]),
+      required: Schema.Array(RequiredCheckReceipt),
+    }),
+  ),
+  provider: Schema.Struct({
+    requestId: Schema.NullOr(Schema.String),
+    status: Schema.NullOr(Schema.Number),
+  }),
+  result: Schema.Literals([
+    "current",
+    "advanced",
+    "identity_mismatch",
+    "history_mismatch",
+    "indeterminate",
+  ]),
+  reasons: Schema.Array(Schema.String),
+});
+export type PullRequestRevisionReceipt = typeof PullRequestRevisionReceipt.Type;
+
 const inputJsonSchema = Schema.toJsonSchemaDocument(PushCommitArtifactInput).schema;
 const outputJsonSchema = Schema.toJsonSchemaDocument(PushCommitArtifactReceipt).schema;
 const repositoryAuthorityInputJsonSchema = Schema.toJsonSchemaDocument(
@@ -479,6 +550,27 @@ export const GITHUB_PULL_REQUEST_CHECKS_TOOL: ToolDef = {
       guarantees: {
         credentialsStayInExecutor: true,
         exactPullRequestIdentity: true,
+        providerRequestIdentity: true,
+        readOnly: true,
+      },
+    },
+  },
+};
+
+export const GITHUB_PULL_REQUEST_REVISION_TOOL: ToolDef = {
+  name: ToolName.make("query.pullRequestRevision"),
+  description:
+    "Read one governed pull request after review, prove that its current head stays on the recorded history, and return the exact current head, tree, and required-check state without writing to GitHub.",
+  inputSchema: Schema.toJsonSchemaDocument(PullRequestRevisionInput).schema,
+  outputSchema: {
+    ...Schema.toJsonSchemaDocument(PullRequestRevisionReceipt).schema,
+    "x-executor-capability": {
+      schemaVersion: "mnfst.executor.pull-request-revision-capability.v1",
+      guarantees: {
+        credentialsStayInExecutor: true,
+        exactPullRequestIdentity: true,
+        recordedHeadAncestry: true,
+        implementationBaseAncestry: true,
         providerRequestIdentity: true,
         readOnly: true,
       },
@@ -1991,6 +2083,339 @@ export const inspectPullRequestChecks = Effect.fn(
     },
     provider: { requestId: providerRequestId, status: response.status },
     result: checks.requiredState,
+    reasons: [],
+  });
+});
+
+type GithubObserved<T> = Readonly<{
+  value: T;
+  requestId: string | null;
+  status: number;
+}>;
+
+const observePullRequest = Effect.fn("graphql.githubGovernedCommit.observePullRequest")(function* (
+  token: string,
+  repository: typeof RepositoryIdentity.Type,
+  number: number,
+) {
+  const response = yield* githubRequest({
+    token,
+    method: "GET",
+    path: `${repoPath(repository)}/pulls/${number}`,
+    stage: "pull-request-revision-read",
+  });
+  yield* requireStatus(response, [200], "pull-request-revision-read");
+  const value = yield* decodeResponse(PullRequestResponse, "pull-request revision")(response.body);
+  return {
+    value,
+    requestId: responseHeader(response.headers, "X-GitHub-Request-Id") ?? null,
+    status: response.status,
+  } satisfies GithubObserved<typeof PullRequestResponse.Type>;
+});
+
+const observeCommitComparison = Effect.fn("graphql.githubGovernedCommit.observeCommitComparison")(
+  function* (
+    token: string,
+    repository: typeof RepositoryIdentity.Type,
+    baseSha: string,
+    headSha: string,
+    stage: string,
+  ) {
+    const response = yield* githubRequest({
+      token,
+      method: "GET",
+      path: `${repoPath(repository)}/compare/${baseSha}...${headSha}`,
+      stage,
+    });
+    yield* requireStatus(response, [200], stage);
+    const value = yield* decodeResponse(GitCompareResponse, stage)(response.body);
+    return {
+      value,
+      requestId: responseHeader(response.headers, "X-GitHub-Request-Id") ?? null,
+      status: response.status,
+    } satisfies GithubObserved<typeof GitCompareResponse.Type>;
+  },
+);
+
+const observeCommit = Effect.fn("graphql.githubGovernedCommit.observeCommit")(function* (
+  token: string,
+  repository: typeof RepositoryIdentity.Type,
+  sha: string,
+) {
+  const response = yield* githubRequest({
+    token,
+    method: "GET",
+    path: `${repoPath(repository)}/git/commits/${sha}`,
+    stage: "pull-request-head-read",
+  });
+  yield* requireStatus(response, [200], "pull-request-head-read");
+  const value = yield* decodeResponse(GitCommitResponse, "pull-request head")(response.body);
+  return {
+    value,
+    requestId: responseHeader(response.headers, "X-GitHub-Request-Id") ?? null,
+    status: response.status,
+  } satisfies GithubObserved<typeof GitCommitResponse.Type>;
+});
+
+// Capability B: prove a same-pull-request review amendment WITHOUT adopting it or writing.
+//
+// A green check receipt is intentionally pinned to the head Manifest recorded. A reviewer can
+// then add a commit to the same branch. That must not turn the old receipt green, but the product
+// also needs a safe way forward that does not discard the review or open a second pull request.
+// This reader proves the bridge: same open pull request, exact base, recorded head still in the
+// current head's history, implementation base still in that history, exact current tree, and
+// checks read on the current head. Manifest can use this receipt to ask for a separate adoption
+// decision while the original artifact remains immutable.
+export const inspectPullRequestRevision = Effect.fn(
+  "graphql.githubGovernedCommit.inspectPullRequestRevision",
+)(function* (inputUnknown: unknown, token: string) {
+  const input = yield* Schema.decodeUnknownEffect(PullRequestRevisionInput)(inputUnknown).pipe(
+    Effect.mapError(() =>
+      failure({
+        stage: "pull-request-revision-input",
+        code: "invalid_pull_request_revision_input",
+        message: "The pull-request revision input does not match the v1 schema.",
+      }),
+    ),
+  );
+  const inputSha256 = yield* sha256Canonical(input);
+  const observedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const expected = {
+    owner: input.repository.owner,
+    name: input.repository.name,
+    number: input.pullRequest.number,
+    url: input.pullRequest.url,
+    baseSha: input.pullRequest.baseSha,
+    recordedHeadSha: input.pullRequest.recordedHeadSha,
+    implementationBaseSha: input.pullRequest.implementationBaseSha,
+    requiredChecks: input.requiredChecks,
+  };
+  const base = {
+    schemaVersion: "mnfst.executor.pull-request-revision-receipt.v1" as const,
+    observedAt,
+    inputSha256,
+    expected,
+  };
+  const initialResult = yield* Effect.result(
+    observePullRequest(token, input.repository, input.pullRequest.number),
+  );
+  if (Result.isFailure(initialResult)) {
+    return PullRequestRevisionReceipt.make({
+      ...base,
+      observed: null,
+      lineage: null,
+      checks: null,
+      provider: { requestId: null, status: initialResult.failure.status ?? null },
+      result: "indeterminate",
+      reasons: [initialResult.failure.code],
+    });
+  }
+  const initial = initialResult.success;
+  const pull = initial.value;
+  const observedBase = {
+    number: pull.number,
+    url: pull.html_url,
+    state: pull.state,
+    isDraft: pull.draft,
+    baseSha: pull.base.sha,
+    headSha: pull.head.sha,
+  };
+  const identityReasons: string[] = [];
+  if (pull.number !== input.pullRequest.number) {
+    identityReasons.push("pull_request_number_mismatch");
+  }
+  if (pull.base.sha !== input.pullRequest.baseSha) identityReasons.push("base_sha_mismatch");
+  if (pull.state.toUpperCase() !== "OPEN") identityReasons.push("pull_request_not_open");
+  if (pull.draft) identityReasons.push("pull_request_is_draft");
+  const expectedUrl = canonicalPullRequestUrl(input.pullRequest.url, {
+    repository: input.repository,
+    number: input.pullRequest.number,
+  });
+  const observedUrl = canonicalPullRequestUrl(pull.html_url, {
+    repository: input.repository,
+    number: input.pullRequest.number,
+  });
+  if (expectedUrl === null || observedUrl === null) {
+    identityReasons.push("pull_request_url_mismatch");
+  }
+  if (identityReasons.length > 0) {
+    return PullRequestRevisionReceipt.make({
+      ...base,
+      observed: { ...observedBase, headTreeSha: null },
+      lineage: null,
+      checks: null,
+      provider: { requestId: initial.requestId, status: initial.status },
+      result: "identity_mismatch",
+      reasons: identityReasons,
+    });
+  }
+
+  const exactComparison = (sha: string) =>
+    Effect.succeed({
+      value: { status: "identical", merge_base_commit: { sha } },
+      requestId: initial.requestId,
+      status: initial.status,
+    } satisfies GithubObserved<typeof GitCompareResponse.Type>);
+  const recordedComparison =
+    input.pullRequest.recordedHeadSha === pull.head.sha
+      ? exactComparison(pull.head.sha)
+      : observeCommitComparison(
+          token,
+          input.repository,
+          input.pullRequest.recordedHeadSha,
+          pull.head.sha,
+          "recorded-head-comparison",
+        );
+  const implementationComparison =
+    input.pullRequest.implementationBaseSha === pull.head.sha
+      ? exactComparison(pull.head.sha)
+      : observeCommitComparison(
+          token,
+          input.repository,
+          input.pullRequest.implementationBaseSha,
+          pull.head.sha,
+          "implementation-base-comparison",
+        );
+  const [recordedLineageResult, implementationLineageResult, headResult] = yield* Effect.all(
+    [
+      Effect.result(recordedComparison),
+      Effect.result(implementationComparison),
+      Effect.result(observeCommit(token, input.repository, pull.head.sha)),
+    ],
+    { concurrency: 3 },
+  );
+  if (Result.isFailure(recordedLineageResult)) {
+    return PullRequestRevisionReceipt.make({
+      ...base,
+      observed: { ...observedBase, headTreeSha: null },
+      lineage: null,
+      checks: null,
+      provider: { requestId: initial.requestId, status: initial.status },
+      result: "indeterminate",
+      reasons: [recordedLineageResult.failure.code],
+    });
+  }
+  if (Result.isFailure(implementationLineageResult)) {
+    return PullRequestRevisionReceipt.make({
+      ...base,
+      observed: { ...observedBase, headTreeSha: null },
+      lineage: null,
+      checks: null,
+      provider: { requestId: initial.requestId, status: initial.status },
+      result: "indeterminate",
+      reasons: [implementationLineageResult.failure.code],
+    });
+  }
+  if (Result.isFailure(headResult)) {
+    return PullRequestRevisionReceipt.make({
+      ...base,
+      observed: { ...observedBase, headTreeSha: null },
+      lineage: null,
+      checks: null,
+      provider: { requestId: initial.requestId, status: initial.status },
+      result: "indeterminate",
+      reasons: [headResult.failure.code],
+    });
+  }
+  const recordedLineage = recordedLineageResult.success.value;
+  const implementationLineage = implementationLineageResult.success.value;
+  const head = headResult.success.value;
+  const lineage = {
+    recordedHeadStatus: recordedLineage.status,
+    recordedHeadMergeBaseSha: recordedLineage.merge_base_commit.sha,
+    implementationBaseStatus: implementationLineage.status,
+    implementationBaseMergeBaseSha: implementationLineage.merge_base_commit.sha,
+  };
+  const historyReasons: string[] = [];
+  if (
+    !["ahead", "identical"].includes(recordedLineage.status) ||
+    recordedLineage.merge_base_commit.sha !== input.pullRequest.recordedHeadSha
+  ) {
+    historyReasons.push("recorded_head_not_ancestor");
+  }
+  if (
+    !["ahead", "identical"].includes(implementationLineage.status) ||
+    implementationLineage.merge_base_commit.sha !== input.pullRequest.implementationBaseSha
+  ) {
+    historyReasons.push("implementation_base_not_ancestor");
+  }
+  if (head.sha !== pull.head.sha) historyReasons.push("head_commit_mismatch");
+  if (historyReasons.length > 0) {
+    return PullRequestRevisionReceipt.make({
+      ...base,
+      observed: { ...observedBase, headTreeSha: head.tree.sha },
+      lineage,
+      checks: null,
+      provider: { requestId: initial.requestId, status: initial.status },
+      result: "history_mismatch",
+      reasons: historyReasons,
+    });
+  }
+
+  const checksResult = yield* Effect.result(
+    observeChecks(token, {
+      repository: input.repository,
+      headSha: pull.head.sha,
+      requiredChecks: input.requiredChecks,
+    }),
+  );
+  const finalResult = yield* Effect.result(
+    observePullRequest(token, input.repository, input.pullRequest.number),
+  );
+  if (Result.isFailure(checksResult)) {
+    return PullRequestRevisionReceipt.make({
+      ...base,
+      observed: { ...observedBase, headTreeSha: head.tree.sha },
+      lineage,
+      checks: null,
+      provider: { requestId: initial.requestId, status: initial.status },
+      result: "indeterminate",
+      reasons: [checksResult.failure.code],
+    });
+  }
+  if (Result.isFailure(finalResult)) {
+    return PullRequestRevisionReceipt.make({
+      ...base,
+      observed: { ...observedBase, headTreeSha: head.tree.sha },
+      lineage,
+      checks: null,
+      provider: { requestId: initial.requestId, status: initial.status },
+      result: "indeterminate",
+      reasons: [finalResult.failure.code],
+    });
+  }
+  const final = finalResult.success;
+  const finalPull = final.value;
+  if (
+    finalPull.number !== pull.number ||
+    finalPull.html_url !== pull.html_url ||
+    finalPull.base.sha !== pull.base.sha ||
+    finalPull.head.sha !== pull.head.sha ||
+    finalPull.state.toUpperCase() !== "OPEN" ||
+    finalPull.draft
+  ) {
+    return PullRequestRevisionReceipt.make({
+      ...base,
+      observed: { ...observedBase, headTreeSha: head.tree.sha },
+      lineage,
+      checks: null,
+      provider: { requestId: final.requestId, status: final.status },
+      result: "indeterminate",
+      reasons: ["pull_request_changed_during_observation"],
+    });
+  }
+  const checks = checksResult.success;
+  return PullRequestRevisionReceipt.make({
+    ...base,
+    observed: { ...observedBase, headTreeSha: head.tree.sha },
+    lineage,
+    checks: {
+      combinedState: checks.combinedState,
+      requiredState: checks.requiredState,
+      required: checks.required,
+    },
+    provider: { requestId: final.requestId, status: final.status },
+    result: pull.head.sha === input.pullRequest.recordedHeadSha ? "current" : "advanced",
     reasons: [],
   });
 });
