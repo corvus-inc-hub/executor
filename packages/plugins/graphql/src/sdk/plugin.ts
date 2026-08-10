@@ -55,10 +55,12 @@ import { makeDefaultGraphqlStore, type GraphqlStore, type StoredOperation } from
 import {
   GITHUB_GOVERNED_COMMIT_TOOL,
   GITHUB_PULL_REQUEST_CHECKS_TOOL,
+  GITHUB_PULL_REQUEST_REVISION_ARTIFACT_TOOL,
   GITHUB_PULL_REQUEST_REVISION_TOOL,
   GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
   inspectPullRequestChecks,
   inspectPullRequestRevision,
+  inspectPullRequestRevisionArtifact,
   inspectRepositoryWriteAuthority,
   isGithubGraphqlEndpoint,
   pushCommitArtifact,
@@ -1030,11 +1032,13 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
                     String(tool.name) !== String(GITHUB_GOVERNED_COMMIT_TOOL.name) &&
                     String(tool.name) !== String(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.name) &&
                     String(tool.name) !== String(GITHUB_PULL_REQUEST_CHECKS_TOOL.name) &&
+                    String(tool.name) !== String(GITHUB_PULL_REQUEST_REVISION_ARTIFACT_TOOL.name) &&
                     String(tool.name) !== String(GITHUB_PULL_REQUEST_REVISION_TOOL.name),
                 ),
                 GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
                 GITHUB_PULL_REQUEST_CHECKS_TOOL,
                 GITHUB_PULL_REQUEST_REVISION_TOOL,
+                GITHUB_PULL_REQUEST_REVISION_ARTIFACT_TOOL,
                 GITHUB_GOVERNED_COMMIT_TOOL,
               ]
             : tools,
@@ -1076,11 +1080,14 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
           toolName === String(GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL.name);
         const isPullRequestChecks = toolName === String(GITHUB_PULL_REQUEST_CHECKS_TOOL.name);
         const isPullRequestRevision = toolName === String(GITHUB_PULL_REQUEST_REVISION_TOOL.name);
+        const isPullRequestRevisionArtifact =
+          toolName === String(GITHUB_PULL_REQUEST_REVISION_ARTIFACT_TOOL.name);
         if (
           (isGovernedCommit ||
             isRepositoryAuthority ||
             isPullRequestChecks ||
-            isPullRequestRevision) &&
+            isPullRequestRevision ||
+            isPullRequestRevisionArtifact) &&
           isGithubGraphqlEndpoint(config.endpoint)
         ) {
           const token = credential.values[TOKEN_VARIABLE];
@@ -1115,6 +1122,23 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
           }
           if (isPullRequestRevision) {
             return yield* inspectPullRequestRevision(args, token).pipe(
+              Effect.provide(httpClientLayer),
+              Effect.map(ToolResult.ok),
+              Effect.catchTag("GithubGovernedCommitError", (error) =>
+                Effect.succeed(
+                  ToolResult.fail({
+                    code: error.code,
+                    message: error.message,
+                    ...(error.status === null ? {} : { status: error.status }),
+                    retryable: error.retryable,
+                    details: { stage: error.stage, ambiguous: error.ambiguous },
+                  }),
+                ),
+              ),
+            );
+          }
+          if (isPullRequestRevisionArtifact) {
+            return yield* inspectPullRequestRevisionArtifact(args, token).pipe(
               Effect.provide(httpClientLayer),
               Effect.map(ToolResult.ok),
               Effect.catchTag("GithubGovernedCommitError", (error) =>

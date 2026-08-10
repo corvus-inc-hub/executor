@@ -257,6 +257,19 @@ const GitCompareResponse = Schema.Struct({
   merge_base_commit: Schema.Struct({ sha: GitSha }),
 });
 
+const PullRequestFileResponse = Schema.Struct({
+  sha: GitSha,
+  filename: Schema.String,
+  status: Schema.String,
+  additions: Schema.Number,
+  deletions: Schema.Number,
+  changes: Schema.Number,
+  patch: Schema.optional(Schema.String),
+  previous_filename: Schema.optional(Schema.String),
+});
+
+const PullRequestFilesResponse = Schema.Array(PullRequestFileResponse);
+
 const GitObjectResponse = Schema.Struct({ sha: GitSha, url: Schema.String });
 
 const RepositoryResponse = Schema.Struct({
@@ -510,6 +523,51 @@ export const PullRequestRevisionReceipt = Schema.Struct({
 });
 export type PullRequestRevisionReceipt = typeof PullRequestRevisionReceipt.Type;
 
+export const PullRequestRevisionArtifactInput = Schema.Struct({
+  schemaVersion: Schema.Literal("mnfst.executor.pull-request-revision-artifact.v1"),
+  revision: PullRequestRevisionInput,
+  expectedHeadSha: GitSha,
+  expectedHeadTreeSha: GitSha,
+});
+export type PullRequestRevisionArtifactInput = typeof PullRequestRevisionArtifactInput.Type;
+
+const RevisionTextChange = Schema.Struct({
+  path: Schema.String,
+  kind: Schema.Literals(["added", "modified", "deleted", "renamed"]),
+  previousPath: Schema.optional(Schema.String),
+  patch: Schema.String,
+});
+
+const RevisionBinaryChange = Schema.Struct({
+  path: Schema.String,
+  kind: Schema.Literals(["added", "modified", "deleted", "renamed"]),
+  previousPath: Schema.optional(Schema.String),
+  binary: Schema.Literal(true),
+});
+
+export const PullRequestRevisionArtifactReceipt = Schema.Struct({
+  schemaVersion: Schema.Literal("mnfst.executor.pull-request-revision-artifact-receipt.v1"),
+  observedAt: Rfc3339Utc,
+  inputSha256: Sha256,
+  expectedHeadSha: GitSha,
+  expectedHeadTreeSha: GitSha,
+  artifactSha256: Schema.NullOr(Sha256),
+  artifact: Schema.NullOr(
+    Schema.Struct({
+      schemaVersion: Schema.Literal("mnfst.changes.v2"),
+      changes: Schema.Array(Schema.Union([RevisionTextChange, RevisionBinaryChange])),
+    }),
+  ),
+  revision: PullRequestRevisionReceipt,
+  provider: Schema.Struct({
+    requestIds: Schema.Array(Schema.String),
+    status: Schema.NullOr(Schema.Number),
+  }),
+  result: Schema.Literals(["ready", "not_ready", "indeterminate"]),
+  reasons: Schema.Array(Schema.String),
+});
+export type PullRequestRevisionArtifactReceipt = typeof PullRequestRevisionArtifactReceipt.Type;
+
 const inputJsonSchema = Schema.toJsonSchemaDocument(PushCommitArtifactInput).schema;
 const outputJsonSchema = Schema.toJsonSchemaDocument(PushCommitArtifactReceipt).schema;
 const repositoryAuthorityInputJsonSchema = Schema.toJsonSchemaDocument(
@@ -571,6 +629,27 @@ export const GITHUB_PULL_REQUEST_REVISION_TOOL: ToolDef = {
         exactPullRequestIdentity: true,
         recordedHeadAncestry: true,
         implementationBaseAncestry: true,
+        providerRequestIdentity: true,
+        readOnly: true,
+      },
+    },
+  },
+};
+
+export const GITHUB_PULL_REQUEST_REVISION_ARTIFACT_TOOL: ToolDef = {
+  name: ToolName.make("query.pullRequestRevisionArtifact"),
+  description:
+    "Read the exact file-level diff for one already-verified pull request revision and return an immutable mnfst.changes.v2 artifact without writing to GitHub.",
+  inputSchema: Schema.toJsonSchemaDocument(PullRequestRevisionArtifactInput).schema,
+  outputSchema: {
+    ...Schema.toJsonSchemaDocument(PullRequestRevisionArtifactReceipt).schema,
+    "x-executor-capability": {
+      schemaVersion: "mnfst.executor.pull-request-revision-artifact-capability.v1",
+      guarantees: {
+        credentialsStayInExecutor: true,
+        exactPullRequestIdentity: true,
+        exactHeadAndTree: true,
+        exhaustiveFileList: true,
         providerRequestIdentity: true,
         readOnly: true,
       },
@@ -2416,6 +2495,329 @@ export const inspectPullRequestRevision = Effect.fn(
     },
     provider: { requestId: final.requestId, status: final.status },
     result: pull.head.sha === input.pullRequest.recordedHeadSha ? "current" : "advanced",
+    reasons: [],
+  });
+});
+
+type RevisionArtifactChange =
+  | {
+      readonly path: string;
+      readonly kind: "added" | "modified" | "deleted" | "renamed";
+      readonly previousPath?: string;
+      readonly patch: string;
+    }
+  | {
+      readonly path: string;
+      readonly kind: "added" | "modified" | "deleted" | "renamed";
+      readonly previousPath?: string;
+      readonly binary: true;
+    };
+
+const safeRevisionPath = (value: string): boolean =>
+  value.length > 0 &&
+  value === value.trim() &&
+  !value.startsWith("/") &&
+  !value.includes("\\") &&
+  !value.includes("\0") &&
+  value.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+
+const gitPathToken = (prefix: "a/" | "b/" | "", path: string): string => {
+  const value = `${prefix}${path}`;
+  return /^[\x21-\x7e]+$/.test(value) && !value.includes('"') ? value : JSON.stringify(value);
+};
+
+const normalizedPatchBody = (value: string): string | null => {
+  if (value.length === 0 || value.includes("\r") || !value.startsWith("@@")) return null;
+  return value.endsWith("\n") ? value : `${value}\n`;
+};
+
+const revisionFileKind = (status: string): "added" | "modified" | "deleted" | "renamed" | null => {
+  if (status === "added") return "added";
+  if (status === "modified" || status === "changed") return "modified";
+  if (status === "removed") return "deleted";
+  if (status === "renamed") return "renamed";
+  return null;
+};
+
+const buildRevisionPatch = (input: {
+  readonly body?: string;
+  readonly kind: "added" | "modified" | "deleted" | "renamed";
+  readonly path: string;
+  readonly previousPath?: string;
+}): string | null => {
+  const oldPath = input.previousPath ?? input.path;
+  const header = `diff --git ${gitPathToken("a/", oldPath)} ${gitPathToken("b/", input.path)}\n`;
+  if (input.kind === "renamed" && input.body === undefined) {
+    return `${header}rename from ${gitPathToken("", oldPath)}\nrename to ${gitPathToken("", input.path)}\n`;
+  }
+  const body = input.body === undefined ? null : normalizedPatchBody(input.body);
+  if (body === null) return null;
+  const rename =
+    input.kind === "renamed"
+      ? `rename from ${gitPathToken("", oldPath)}\nrename to ${gitPathToken("", input.path)}\n`
+      : "";
+  const before = input.kind === "added" ? "/dev/null" : gitPathToken("a/", oldPath);
+  const after = input.kind === "deleted" ? "/dev/null" : gitPathToken("b/", input.path);
+  return `${header}${rename}--- ${before}\n+++ ${after}\n${body}`;
+};
+
+const observePullRequestFilePage = Effect.fn(
+  "graphql.githubGovernedCommit.observePullRequestFilePage",
+)(function* (
+  token: string,
+  repository: typeof RepositoryIdentity.Type,
+  number: number,
+  page: number,
+) {
+  const response = yield* githubRequest({
+    token,
+    method: "GET",
+    path: `${repoPath(repository)}/pulls/${number}/files?per_page=100&page=${page}`,
+    stage: "pull-request-revision-files",
+  });
+  yield* requireStatus(response, [200], "pull-request-revision-files");
+  const value = yield* decodeResponse(
+    PullRequestFilesResponse,
+    "pull-request revision files",
+  )(response.body);
+  return {
+    value,
+    requestId: responseHeader(response.headers, "X-GitHub-Request-Id") ?? null,
+    status: response.status,
+  } satisfies GithubObserved<typeof PullRequestFilesResponse.Type>;
+});
+
+// Capability C: adopt the already-proved review revision as immutable, file-level evidence.
+//
+// This is a separate read from revision observation on purpose. Observation answers whether a
+// reviewer stayed on the governed history. Adoption needs the exhaustive, exact file list that a
+// human can review in Manifest. The old artifact remains immutable; this returns a new one only
+// after the head, tree, checks, paths, and all paginated file evidence agree.
+export const inspectPullRequestRevisionArtifact = Effect.fn(
+  "graphql.githubGovernedCommit.inspectPullRequestRevisionArtifact",
+)(function* (inputUnknown: unknown, token: string) {
+  const input = yield* Schema.decodeUnknownEffect(PullRequestRevisionArtifactInput)(
+    inputUnknown,
+  ).pipe(
+    Effect.mapError(() =>
+      failure({
+        stage: "pull-request-revision-artifact-input",
+        code: "invalid_pull_request_revision_artifact_input",
+        message: "The pull-request revision artifact input does not match the v1 schema.",
+      }),
+    ),
+  );
+  const inputSha256 = yield* sha256Canonical(input);
+  const observedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const revision = yield* inspectPullRequestRevision(input.revision, token);
+  const base = {
+    schemaVersion: "mnfst.executor.pull-request-revision-artifact-receipt.v1" as const,
+    observedAt,
+    inputSha256,
+    expectedHeadSha: input.expectedHeadSha,
+    expectedHeadTreeSha: input.expectedHeadTreeSha,
+    revision,
+  };
+  const revisionRequestIds =
+    revision.provider.requestId === null ? [] : [revision.provider.requestId];
+  if (
+    (revision.result !== "advanced" && revision.result !== "current") ||
+    revision.checks?.requiredState !== "success" ||
+    revision.observed?.headSha !== input.expectedHeadSha ||
+    revision.observed.headTreeSha !== input.expectedHeadTreeSha
+  ) {
+    return PullRequestRevisionArtifactReceipt.make({
+      ...base,
+      artifactSha256: null,
+      artifact: null,
+      provider: { requestIds: revisionRequestIds, status: revision.provider.status },
+      result: "not_ready",
+      reasons: ["revision_not_ready"],
+    });
+  }
+
+  const pages = yield* Effect.all(
+    [1, 2, 3, 4].map((page) =>
+      Effect.result(
+        observePullRequestFilePage(
+          token,
+          input.revision.repository,
+          input.revision.pullRequest.number,
+          page,
+        ),
+      ),
+    ),
+    { concurrency: 1 },
+  );
+  const failedPage = pages.find(Result.isFailure);
+  if (failedPage && Result.isFailure(failedPage)) {
+    return PullRequestRevisionArtifactReceipt.make({
+      ...base,
+      artifactSha256: null,
+      artifact: null,
+      provider: { requestIds: revisionRequestIds, status: revision.provider.status },
+      result: "indeterminate",
+      reasons: [failedPage.failure.code],
+    });
+  }
+  const successfulPages = pages.filter(Result.isSuccess).map((page) => page.success);
+  const requestIds = [
+    ...revisionRequestIds,
+    ...successfulPages.flatMap((page) => (page.requestId === null ? [] : [page.requestId])),
+  ];
+  const fourthPage = successfulPages[3]?.value ?? [];
+  const files = successfulPages.slice(0, 3).flatMap((page) => page.value);
+  if (fourthPage.length > 0) {
+    return PullRequestRevisionArtifactReceipt.make({
+      ...base,
+      artifactSha256: null,
+      artifact: null,
+      provider: { requestIds, status: successfulPages[3]?.status ?? null },
+      result: "not_ready",
+      reasons: ["file_limit_exceeded"],
+    });
+  }
+  if (files.length === 0) {
+    return PullRequestRevisionArtifactReceipt.make({
+      ...base,
+      artifactSha256: null,
+      artifact: null,
+      provider: { requestIds, status: successfulPages[0]?.status ?? null },
+      result: "not_ready",
+      reasons: ["no_changed_files"],
+    });
+  }
+
+  const seenPaths = new Set<string>();
+  const changes: RevisionArtifactChange[] = [];
+  const invalidReasons: string[] = [];
+  for (const file of files) {
+    const kind = revisionFileKind(file.status);
+    const previousPath = file.previous_filename;
+    if (
+      kind === null ||
+      !safeRevisionPath(file.filename) ||
+      (kind === "renamed" &&
+        (previousPath === undefined ||
+          !safeRevisionPath(previousPath) ||
+          previousPath === file.filename)) ||
+      (kind !== "renamed" && previousPath !== undefined) ||
+      seenPaths.has(file.filename) ||
+      !Number.isSafeInteger(file.additions) ||
+      file.additions < 0 ||
+      !Number.isSafeInteger(file.deletions) ||
+      file.deletions < 0 ||
+      !Number.isSafeInteger(file.changes) ||
+      file.changes < 0
+    ) {
+      invalidReasons.push("invalid_file_evidence");
+      break;
+    }
+    seenPaths.add(file.filename);
+    const patch = buildRevisionPatch({
+      ...(file.patch === undefined ? {} : { body: file.patch }),
+      kind,
+      path: file.filename,
+      ...(previousPath === undefined ? {} : { previousPath }),
+    });
+    if (patch !== null) {
+      changes.push({
+        path: file.filename,
+        kind,
+        ...(previousPath === undefined ? {} : { previousPath }),
+        patch,
+      });
+      continue;
+    }
+    if (file.additions === 0 && file.deletions === 0 && file.changes === 0) {
+      changes.push({
+        path: file.filename,
+        kind,
+        ...(previousPath === undefined ? {} : { previousPath }),
+        binary: true,
+      });
+      continue;
+    }
+    invalidReasons.push("patch_missing");
+    break;
+  }
+  if (invalidReasons.length > 0 || changes.length !== files.length) {
+    return PullRequestRevisionArtifactReceipt.make({
+      ...base,
+      artifactSha256: null,
+      artifact: null,
+      provider: { requestIds, status: successfulPages.at(-1)?.status ?? null },
+      result: "not_ready",
+      reasons: invalidReasons,
+    });
+  }
+
+  const [finalPullResult, finalHeadResult] = yield* Effect.all(
+    [
+      Effect.result(
+        observePullRequest(token, input.revision.repository, input.revision.pullRequest.number),
+      ),
+      Effect.result(observeCommit(token, input.revision.repository, input.expectedHeadSha)),
+    ],
+    { concurrency: 2 },
+  );
+  if (Result.isFailure(finalPullResult) || Result.isFailure(finalHeadResult)) {
+    const code = Result.isFailure(finalPullResult)
+      ? finalPullResult.failure.code
+      : Result.isFailure(finalHeadResult)
+        ? finalHeadResult.failure.code
+        : "github_unavailable";
+    return PullRequestRevisionArtifactReceipt.make({
+      ...base,
+      artifactSha256: null,
+      artifact: null,
+      provider: { requestIds, status: successfulPages.at(-1)?.status ?? null },
+      result: "indeterminate",
+      reasons: [code],
+    });
+  }
+  const finalPull = finalPullResult.success;
+  const finalHead = finalHeadResult.success;
+  const finalExpectedUrl = canonicalPullRequestUrl(input.revision.pullRequest.url, {
+    repository: input.revision.repository,
+    number: input.revision.pullRequest.number,
+  });
+  const finalObservedUrl = canonicalPullRequestUrl(finalPull.value.html_url, {
+    repository: input.revision.repository,
+    number: input.revision.pullRequest.number,
+  });
+  requestIds.push(
+    ...(finalPull.requestId === null ? [] : [finalPull.requestId]),
+    ...(finalHead.requestId === null ? [] : [finalHead.requestId]),
+  );
+  if (
+    finalExpectedUrl === null ||
+    finalObservedUrl === null ||
+    finalPull.value.number !== input.revision.pullRequest.number ||
+    finalPull.value.base.sha !== input.revision.pullRequest.baseSha ||
+    finalPull.value.head.sha !== input.expectedHeadSha ||
+    finalPull.value.state.toUpperCase() !== "OPEN" ||
+    finalPull.value.draft ||
+    finalHead.value.sha !== input.expectedHeadSha ||
+    finalHead.value.tree.sha !== input.expectedHeadTreeSha
+  ) {
+    return PullRequestRevisionArtifactReceipt.make({
+      ...base,
+      artifactSha256: null,
+      artifact: null,
+      provider: { requestIds, status: finalPull.status },
+      result: "not_ready",
+      reasons: ["pull_request_changed_during_artifact_read"],
+    });
+  }
+  const artifact = { schemaVersion: "mnfst.changes.v2" as const, changes };
+  const artifactSha256 = yield* sha256Canonical(artifact);
+  return PullRequestRevisionArtifactReceipt.make({
+    ...base,
+    artifactSha256,
+    artifact,
+    provider: { requestIds: [...new Set(requestIds)], status: finalPull.status },
+    result: "ready",
     reasons: [],
   });
 });

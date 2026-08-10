@@ -17,9 +17,11 @@ import type { GraphqlStore } from "./store";
 import { graphqlPlugin } from "./plugin";
 import {
   GITHUB_GOVERNED_COMMIT_TOOL,
+  GITHUB_PULL_REQUEST_REVISION_ARTIFACT_TOOL,
   GITHUB_REPOSITORY_WRITE_AUTHORITY_TOOL,
   inspectPullRequestChecks,
   inspectPullRequestRevision,
+  inspectPullRequestRevisionArtifact,
   inspectRepositoryWriteAuthority,
   pushCommitArtifact,
   sha256Canonical,
@@ -355,6 +357,27 @@ const githubLayer = (options?: {
       if (request.method === "GET" && /\/pulls\/\d+$/.test(url.pathname)) {
         return Effect.succeed(json(request, { ...pull, ...options?.pullOverride }));
       }
+      if (request.method === "GET" && url.pathname.endsWith("/pulls/17/files")) {
+        const page = Number(url.searchParams.get("page") ?? "1");
+        return Effect.succeed(
+          json(
+            request,
+            page === 1
+              ? [
+                  {
+                    sha: "7".repeat(40),
+                    filename: "greeting.txt",
+                    status: "modified",
+                    additions: 1,
+                    deletions: 1,
+                    changes: 2,
+                    patch: "@@ -1 +1 @@\n-hello\n+hello reviewer\n",
+                  },
+                ]
+              : [],
+          ),
+        );
+      }
       if (request.method === "GET" && url.pathname.endsWith("/pulls")) {
         return Effect.succeed(json(request, pullCreated ? [pull] : []));
       }
@@ -465,6 +488,25 @@ describe("GitHub governed commit capability", () => {
           readOnly: true,
         },
       });
+      const revisionArtifactSchema = yield* executor.tools.schema(
+        ToolAddress.make("tools.github.org.main.query.pullRequestRevisionArtifact"),
+      );
+      expect(
+        Reflect.get(revisionArtifactSchema?.outputSchema ?? {}, "x-executor-capability"),
+      ).toEqual({
+        schemaVersion: "mnfst.executor.pull-request-revision-artifact-capability.v1",
+        guarantees: {
+          credentialsStayInExecutor: true,
+          exactPullRequestIdentity: true,
+          exactHeadAndTree: true,
+          exhaustiveFileList: true,
+          providerRequestIdentity: true,
+          readOnly: true,
+        },
+      });
+      expect(String(GITHUB_PULL_REQUEST_REVISION_ARTIFACT_TOOL.name)).toBe(
+        "query.pullRequestRevisionArtifact",
+      );
     }),
   );
 
@@ -1053,6 +1095,38 @@ describe("GitHub pull request revision", () => {
       expect(github.requests).toContain(
         `GET /repos/mnfst/app/compare/${HEAD_COMMIT}...${REVIEW_HEAD_COMMIT}`,
       );
+    }),
+  );
+
+  it.effect("returns an immutable file-level artifact for the exact reviewed head", () =>
+    Effect.gen(function* () {
+      const github = githubLayer({ revisionHead: true });
+      const receipt = yield* inspectPullRequestRevisionArtifact(
+        {
+          schemaVersion: "mnfst.executor.pull-request-revision-artifact.v1",
+          revision: revisionInput,
+          expectedHeadSha: REVIEW_HEAD_COMMIT,
+          expectedHeadTreeSha: REVIEW_HEAD_TREE,
+        },
+        "token",
+      ).pipe(Effect.provide(github.layer));
+      expect(receipt).toMatchObject({
+        result: "ready",
+        reasons: [],
+        artifact: {
+          schemaVersion: "mnfst.changes.v2",
+          changes: [
+            {
+              path: "greeting.txt",
+              kind: "modified",
+              patch:
+                "diff --git a/greeting.txt b/greeting.txt\n--- a/greeting.txt\n+++ b/greeting.txt\n@@ -1 +1 @@\n-hello\n+hello reviewer\n",
+            },
+          ],
+        },
+      });
+      expect(receipt.artifactSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(github.requests.filter((entry) => entry.includes("/pulls/17/files?"))).toHaveLength(4);
     }),
   );
 
