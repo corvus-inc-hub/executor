@@ -68,7 +68,7 @@ const servePluginTestApi = () =>
 const specText = () => {
   const spec = makeOpenApiHttpApiTestIntegrationConfig(TestApi, {}).spec;
   if (spec.kind === "blob") return spec.value;
-  return spec.url;
+  return spec.kind === "url" ? spec.url : spec.urls[0];
 };
 
 // A custom apiKey method that places the connection value into `x-api-key`,

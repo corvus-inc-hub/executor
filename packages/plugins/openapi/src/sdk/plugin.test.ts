@@ -108,7 +108,7 @@ const TestApi = HttpApi.make("testApi").add(ItemsGroup);
 const testApiSpecText = () => {
   const spec = makeOpenApiHttpApiTestIntegrationConfig(TestApi, {}).spec;
   if (spec.kind === "blob") return spec.value;
-  return spec.url;
+  return spec.kind === "url" ? spec.url : spec.urls[0];
 };
 
 const MICROSOFT_GRAPH_V1_OPERATION_COUNT = 16_548;
@@ -494,6 +494,39 @@ describe("OpenAPI Plugin", () => {
       const integration = yield* executor.openapi.getIntegration("runtime");
       expect(integration?.slug).toBe(IntegrationSlug.make("runtime"));
       expect((yield* executor.integrations.list()).map((i) => String(i.slug))).toContain("runtime");
+    }),
+  );
+
+  it.effect("rejects an empty multi-URL spec input at the runtime boundary", () =>
+    Effect.gen(function* () {
+      const executor = yield* createExecutor(makeTestConfig({ plugins: testPlugins() }));
+      const error = yield* executor
+        .execute(ToolAddress.make("executor.openapi.addSpec"), {
+          spec: { kind: "urls", urls: [] },
+          slug: "empty_bundle",
+        })
+        .pipe(Effect.flip);
+
+      expect(Predicate.isTagged(error, "ToolInvocationError")).toBe(true);
+      expect(yield* executor.openapi.getIntegration("empty_bundle")).toBeNull();
+    }),
+  );
+
+  it.effect("rejects multiple URLs without a spec format adapter", () =>
+    Effect.gen(function* () {
+      const executor = yield* createExecutor(makeTestConfig({ plugins: testPlugins() }));
+      const error = yield* executor.openapi
+        .addSpec({
+          spec: {
+            kind: "urls",
+            urls: ["https://one.example/spec.json", "https://two.example/spec.json"],
+          },
+          slug: "plain_bundle",
+        })
+        .pipe(Effect.flip);
+
+      expect(Predicate.isTagged(error, "OpenApiParseError")).toBe(true);
+      expect(yield* executor.openapi.getIntegration("plain_bundle")).toBeNull();
     }),
   );
 

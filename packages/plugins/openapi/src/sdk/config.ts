@@ -49,6 +49,8 @@ export const OpenApiIntegrationConfigSchema = Schema.Struct({
   sourceSpecHash: Schema.optional(Schema.String),
   /** Origin URL the spec was fetched from, when known. Enables refresh. */
   specUrl: Schema.optional(Schema.String),
+  /** Ordered source URLs for an adapter-backed bundle. Enables exact refresh. */
+  specUrls: Schema.optional(Schema.NonEmptyArray(Schema.String)),
   /** Optional base URL override. */
   baseUrl: Schema.optional(Schema.String),
   /** Static headers applied to every request (no secret material). */

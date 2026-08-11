@@ -1,7 +1,12 @@
 import { expect, it } from "@effect/vitest";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Predicate, Schema } from "effect";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
-import { createExecutor, IntegrationSlug } from "@executor-js/sdk";
+import {
+  AuthTemplateSlug,
+  ConnectionName,
+  createExecutor,
+  IntegrationSlug,
+} from "@executor-js/sdk";
 import { makeTestConfig, memoryCredentialsPlugin } from "@executor-js/sdk/testing";
 import { openApiPlugin, parse } from "@executor-js/plugin-openapi";
 import type { AuthenticationInput } from "@executor-js/plugin-openapi";
@@ -10,6 +15,89 @@ import { deriveGoogleDiscoveryIdentity, googleDiscoveryAdapter } from "./spec-fo
 import { googleCatalog } from "./presets";
 
 const TASKS_URL = "https://www.googleapis.com/discovery/v1/apis/tasks/v1/rest";
+const GOOGLE_WORKSPACE_URLS: readonly [string, string, string, string, string] = [
+  "https://www.googleapis.com/discovery/v1/apis/gmail/v1/rest",
+  "https://www.googleapis.com/discovery/v1/apis/drive/v3/rest",
+  "https://www.googleapis.com/discovery/v1/apis/docs/v1/rest",
+  "https://www.googleapis.com/discovery/v1/apis/sheets/v4/rest",
+  "https://www.googleapis.com/discovery/v1/apis/slides/v1/rest",
+];
+const GOOGLE_WORKSPACE_SCOPES: Readonly<Record<string, string>> = {
+  gmail: "https://mail.google.com/",
+  drive: "https://www.googleapis.com/auth/drive",
+  docs: "https://www.googleapis.com/auth/documents",
+  sheets: "https://www.googleapis.com/auth/spreadsheets",
+  slides: "https://www.googleapis.com/auth/presentations",
+};
+const encodeJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+
+const googleWorkspaceDiscoveryDocument = (service: string, version: string, scope: string) => ({
+  name: service,
+  version,
+  title: `Google ${service}`,
+  description: `Use Google ${service} in one Workspace grant.`,
+  rootUrl: "https://www.googleapis.com/",
+  servicePath: "",
+  auth: {
+    oauth2: {
+      scopes: {
+        [scope]: { description: `Use Google ${service}.` },
+      },
+    },
+  },
+  methods: {
+    resourcesList: {
+      id: `${service}.resources.list`,
+      httpMethod: "GET",
+      path: `${service}/${version}/resources`,
+      scopes: [scope],
+      response: { $ref: "Result" },
+    },
+  },
+  schemas: {
+    Result: {
+      type: "object",
+      properties: { id: { type: "string" } },
+    },
+  },
+});
+
+const googleWorkspaceDocuments = new Map(
+  GOOGLE_WORKSPACE_URLS.map((url) => {
+    const segments = new URL(url).pathname.split("/");
+    const service = segments.at(-3) ?? "unknown";
+    const version = segments.at(-2) ?? "v1";
+    return [
+      url,
+      googleWorkspaceDiscoveryDocument(
+        service,
+        version,
+        GOOGLE_WORKSPACE_SCOPES[service] ?? "openid",
+      ),
+    ];
+  }),
+);
+
+const googleWorkspaceHttpClientLayer = (state: {
+  readonly requests: string[];
+  readonly unavailable: Set<string>;
+}) =>
+  Layer.succeed(HttpClient.HttpClient)(
+    HttpClient.make((request: HttpClientRequest.HttpClientRequest) => {
+      state.requests.push(request.url);
+      const document = googleWorkspaceDocuments.get(request.url);
+      const available = document !== undefined && !state.unavailable.has(request.url);
+      return Effect.succeed(
+        HttpClientResponse.fromWeb(
+          request,
+          new Response(available ? encodeJson(document) : "not found", {
+            status: available ? 200 : 404,
+            headers: { "content-type": available ? "application/json" : "text/plain" },
+          }),
+        ),
+      );
+    }),
+  );
 
 const tasksDiscoveryDoc = {
   name: "tasks",
@@ -61,7 +149,7 @@ const discoveryHttpClientLayer = Layer.succeed(HttpClient.HttpClient)(
     Effect.succeed(
       HttpClientResponse.fromWeb(
         request,
-        new Response(JSON.stringify(tasksDiscoveryDoc), {
+        new Response(encodeJson(tasksDiscoveryDoc), {
           status: request.url === TASKS_URL ? 200 : 404,
           headers: { "content-type": "application/json" },
         }),
@@ -164,4 +252,85 @@ it.effect(
         ]),
       );
     }),
+);
+
+it.effect("persists and atomically refreshes one five-service Google Workspace bundle", () =>
+  Effect.gen(function* () {
+    const state: { readonly requests: string[]; readonly unavailable: Set<string> } = {
+      requests: [],
+      unavailable: new Set<string>(),
+    };
+    const executor = yield* createExecutor(
+      makeTestConfig({
+        plugins: [
+          openApiPlugin({
+            httpClientLayer: googleWorkspaceHttpClientLayer(state),
+            specFormats: [googleDiscoveryAdapter],
+          }),
+          memoryCredentialsPlugin(),
+        ],
+      }),
+    );
+
+    const added = yield* executor.openapi.addSpec({
+      spec: { kind: "urls", urls: GOOGLE_WORKSPACE_URLS },
+      slug: "google",
+      name: "Google Workspace",
+      specFormat: "google-discovery",
+      family: "google",
+    });
+    expect(added.toolCount).toBe(5);
+
+    const config = yield* executor.openapi.getConfig("google");
+    expect(config?.specUrl).toBeUndefined();
+    expect(config?.specUrls).toEqual(GOOGLE_WORKSPACE_URLS);
+    expect(config?.family).toBe("google");
+    expect(config?.specFormat).toBe("google-discovery");
+    const oauthTemplate = config?.authenticationTemplate?.find(
+      (template) => template.kind === "oauth2",
+    );
+    expect(oauthTemplate?.scopes).toEqual(
+      expect.arrayContaining(Object.values(GOOGLE_WORKSPACE_SCOPES)),
+    );
+    expect(
+      oauthTemplate?.scopes.some(
+        (scope) => scope.includes("/auth/admin.") || scope.includes("cloud-platform"),
+      ),
+    ).toBe(false);
+
+    yield* executor.connections.create({
+      owner: "org",
+      name: ConnectionName.make("workspace"),
+      integration: IntegrationSlug.make("google"),
+      template: AuthTemplateSlug.make("googleOAuth2"),
+      value: "test-access-token",
+    });
+    const toolNames = (yield* executor.tools.list())
+      .filter((tool) => String(tool.address).startsWith("tools.google.org.workspace."))
+      .map((tool) => String(tool.name));
+    expect(toolNames).toEqual(
+      expect.arrayContaining([
+        "gmail.resources.list",
+        "drive.resources.list",
+        "docs.resources.list",
+        "sheets.resources.list",
+        "slides.resources.list",
+      ]),
+    );
+
+    state.requests.length = 0;
+    const refreshed = yield* executor.openapi.updateSpec("google");
+    expect(refreshed.toolCount).toBe(5);
+    expect(refreshed.addedTools).toEqual([]);
+    expect(refreshed.removedTools).toEqual([]);
+    expect(new Set(state.requests)).toEqual(new Set(GOOGLE_WORKSPACE_URLS));
+
+    const beforeFailedRefresh = yield* executor.openapi.getConfig("google");
+    state.unavailable.add(GOOGLE_WORKSPACE_URLS[4]);
+    const failure = yield* executor.openapi.updateSpec("google").pipe(Effect.flip);
+    expect(Predicate.isTagged(failure, "OpenApiParseError")).toBe(true);
+    const afterFailedRefresh = yield* executor.openapi.getConfig("google");
+    expect(afterFailedRefresh?.specHash).toBe(beforeFailedRefresh?.specHash);
+    expect(afterFailedRefresh?.specUrls).toEqual(GOOGLE_WORKSPACE_URLS);
+  }),
 );
