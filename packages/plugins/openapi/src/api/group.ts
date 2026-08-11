@@ -56,6 +56,7 @@ const SlugParams = {
 
 const OpenApiSpecInputPayload = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("url"), url: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal("urls"), urls: Schema.NonEmptyArray(Schema.String) }),
   Schema.Struct({ kind: Schema.Literal("blob"), value: Schema.String }),
 ]);
 
@@ -146,6 +147,7 @@ const IntegrationView = Schema.Struct({
 // store, and no client reads it (the configure UI only touches the template).
 const OpenApiConfigView = Schema.Struct({
   specUrl: Schema.optional(Schema.String),
+  specUrls: Schema.optional(Schema.NonEmptyArray(Schema.String)),
   baseUrl: Schema.optional(Schema.String),
   headers: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   queryParams: Schema.optional(Schema.Record(Schema.String, Schema.String)),

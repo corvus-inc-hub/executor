@@ -49,6 +49,11 @@ export const googleDiscoveryAdapter: SpecFormatAdapter = {
   id: "google-discovery",
   fetch: (input) =>
     Effect.gen(function* () {
+      if (input.urls.length === 0) {
+        return yield* new OpenApiParseError({
+          message: "Google Discovery requires at least one source URL",
+        });
+      }
       const documents = yield* Effect.forEach(
         input.urls,
         (url) =>
@@ -61,6 +66,12 @@ export const googleDiscoveryAdapter: SpecFormatAdapter = {
           ),
         { concurrency: 4 },
       );
+      const [firstDocument, ...remainingDocuments] = documents;
+      if (!firstDocument) {
+        return yield* new OpenApiParseError({
+          message: "Google Discovery did not resolve a source document",
+        });
+      }
       const conversion = yield* convertGoogleDiscoveryBundleToOpenApi({ documents });
       const document =
         documents.length === 1
@@ -75,7 +86,11 @@ export const googleDiscoveryAdapter: SpecFormatAdapter = {
             );
       return {
         specText: conversion.specText,
-        specUrl: documents[0]?.discoveryUrl,
+        ...(remainingDocuments.length === 0 ? { specUrl: firstDocument.discoveryUrl } : {}),
+        specUrls: [
+          firstDocument.discoveryUrl,
+          ...remainingDocuments.map((item) => item.discoveryUrl),
+        ],
         baseUrl: conversion.baseUrl,
         authenticationTemplate: conversion.authenticationTemplate,
         document,

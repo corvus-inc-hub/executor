@@ -99,6 +99,7 @@ export const OpenApiHandlers = HttpApiBuilder.group(ExecutorApiWithOpenApi, "ope
           return config
             ? {
                 specUrl: config.specUrl,
+                specUrls: config.specUrls,
                 baseUrl: config.baseUrl,
                 headers: config.headers ? { ...config.headers } : undefined,
                 queryParams: config.queryParams ? { ...config.queryParams } : undefined,

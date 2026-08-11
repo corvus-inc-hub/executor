@@ -280,6 +280,7 @@ type StaticPreviewSpecOutput = typeof StaticPreviewSpecOutputSchema.Type;
 
 const OpenApiSpecInputSchema = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("url"), url: Schema.String }),
+  Schema.Struct({ kind: Schema.Literal("urls"), urls: Schema.NonEmptyArray(Schema.String) }),
   Schema.Struct({ kind: Schema.Literal("blob"), value: Schema.String }),
 ]);
 
@@ -405,8 +406,17 @@ const staticPreviewOutput = (preview: SpecPreview): StaticPreviewSpecOutput => (
   })),
 });
 
-const specInputToSpecUrl = (spec: OpenApiSpecInput): string | undefined =>
-  spec.kind === "url" ? spec.url : undefined;
+const firstSpecInputUrl = (spec: OpenApiSpecInput): string | undefined =>
+  spec.kind === "url" ? spec.url : spec.kind === "urls" ? spec.urls[0] : undefined;
+
+const sourceMetadataForResolvedSpec = (
+  spec: OpenApiSpecInput,
+  resolved: ConvertedSpec,
+): Pick<OpenApiIntegrationConfig, "specUrl" | "specUrls"> => {
+  if (spec.kind === "blob") return {};
+  if (spec.kind === "url") return { specUrl: resolved.specUrl ?? spec.url };
+  return { specUrls: resolved.specUrls ?? spec.urls };
+};
 
 const OAUTH_DISCOVERED_SCHEME_NAME = "DiscoveredOAuth2";
 const OPENAPI_HTTP_METHODS = new Set([
@@ -601,7 +611,7 @@ export const describeOpenApiIntegrationDisplay = (
 ): { readonly url?: string; readonly family?: string } => {
   const config = decodeOpenApiIntegrationConfig(record.config);
   return {
-    url: config?.baseUrl ?? config?.specUrl,
+    url: config?.baseUrl ?? config?.specUrl ?? config?.specUrls?.[0],
     ...(config?.family ? { family: config.family } : {}),
   };
 };
@@ -659,13 +669,13 @@ export const openApiPlugin = definePlugin<
         config.specFormat,
       );
       if (adapter) {
-        if (config.spec.kind !== "url") {
+        if (config.spec.kind === "blob") {
           return yield* new OpenApiParseError({
-            message: "Spec format adapters require a URL spec input",
+            message: "Spec format adapters require one or more URL spec inputs",
           });
         }
         const resolved = yield* adapter.fetch({
-          urls: [config.spec.url],
+          urls: config.spec.kind === "url" ? [config.spec.url] : config.spec.urls,
           credentials: {
             ...(config.headers ? { headers: config.headers } : {}),
             ...(config.queryParams ? { queryParams: config.queryParams } : {}),
@@ -682,6 +692,11 @@ export const openApiPlugin = definePlugin<
           { specText, specUrl: config.spec.url },
           config.specOverrides,
         );
+      }
+      if (config.spec.kind === "urls") {
+        return yield* new OpenApiParseError({
+          message: "Multiple spec URLs require a spec format adapter",
+        });
       }
       return yield* applyOverridesToResolvedSpec(
         { specText: config.spec.value },
@@ -765,6 +780,7 @@ export const openApiPlugin = definePlugin<
           // Resolve URL → text and parse BEFORE opening a transaction. Holding
           // `BEGIN` across a network fetch is the Hyperdrive deadlock path.
           const resolved = yield* resolveSpecForInput(config, httpClientLayer);
+          const sourceMetadata = sourceMetadataForResolvedSpec(config.spec, resolved);
           const compiled = resolved.keepPathItem
             ? undefined
             : yield* compileOpenApiSpec(resolved.specText);
@@ -805,7 +821,7 @@ export const openApiPlugin = definePlugin<
                     enrichPreviewWithDiscoveredOAuth({
                       specText: resolved.specText,
                       preview: rawPreview,
-                      specUrl: resolved.specUrl ?? specInputToSpecUrl(config.spec),
+                      specUrl: sourceMetadata.specUrl ?? sourceMetadata.specUrls?.[0],
                       baseUrl: explicitBaseUrl,
                     }),
                   ),
@@ -840,9 +856,7 @@ export const openApiPlugin = definePlugin<
           const integrationConfig: OpenApiIntegrationConfig = {
             ...(resolved.config ?? {}),
             specHash,
-            ...((resolved.specUrl ?? specInputToSpecUrl(config.spec)) !== undefined
-              ? { specUrl: resolved.specUrl ?? specInputToSpecUrl(config.spec) }
-              : {}),
+            ...sourceMetadata,
             // baseUrl is an optional override only. The host is otherwise
             // resolved per call from the operation's `servers` (extracted from
             // the spec), so we never bake a derived base URL into the config.
@@ -896,7 +910,7 @@ export const openApiPlugin = definePlugin<
                   resolvedSlug,
                 config: integrationConfig satisfies OpenApiIntegrationConfig as IntegrationConfig,
                 canRemove: true,
-                canRefresh: integrationConfig.specUrl != null,
+                canRefresh: integrationConfig.specUrl != null || integrationConfig.specUrls != null,
               });
               if (config.healthCheck) {
                 yield* ctx.core.integrations.setHealthCheck(slug, config.healthCheck);
@@ -945,20 +959,23 @@ export const openApiPlugin = definePlugin<
           // where the spec originally came from. A pasted-blob integration has
           // no origin, so updating it requires a new input.
           const nextOverrides = input?.specOverrides ?? current.specOverrides ?? [];
+          const hasStoredSource = current.specUrls != null || current.specUrl != null;
           const storedSourceHash = current.sourceSpecHash ?? current.specHash;
           const storedSourceText =
-            input?.spec === undefined && !current.specUrl && input?.specOverrides !== undefined
+            input?.spec === undefined && !hasStoredSource && input?.specOverrides !== undefined
               ? storedSourceHash
                 ? yield* ctx.storage.getSpec(storedSourceHash)
                 : null
               : null;
           const specInput: OpenApiSpecInput | null =
             input?.spec ??
-            (current.specUrl
-              ? { kind: "url", url: current.specUrl }
-              : storedSourceText
-                ? { kind: "blob", value: storedSourceText }
-                : null);
+            (current.specUrls
+              ? { kind: "urls", urls: current.specUrls }
+              : current.specUrl
+                ? { kind: "url", url: current.specUrl }
+                : storedSourceText
+                  ? { kind: "blob", value: storedSourceText }
+                  : null);
           if (specInput === null) {
             return yield* new OpenApiParseError({
               message:
@@ -979,6 +996,7 @@ export const openApiPlugin = definePlugin<
             },
             httpClientLayer,
           );
+          const sourceMetadata = sourceMetadataForResolvedSpec(specInput, resolved);
           const compiled = resolved.keepPathItem
             ? undefined
             : yield* compileOpenApiSpec(resolved.specText);
@@ -1004,14 +1022,14 @@ export const openApiPlugin = definePlugin<
           const {
             sourceSpecHash: _currentSourceSpecHash,
             specOverrides: _currentSpecOverrides,
+            specUrl: _currentSpecUrl,
+            specUrls: _currentSpecUrls,
             ...currentWithoutOverrides
           } = current;
           const nextConfig: OpenApiIntegrationConfig = {
             ...currentWithoutOverrides,
             specHash,
-            ...((resolved.specUrl ?? specInputToSpecUrl(specInput)) !== undefined
-              ? { specUrl: resolved.specUrl ?? specInputToSpecUrl(specInput) }
-              : {}),
+            ...sourceMetadata,
             ...(nextOverrides.length > 0 ? { specOverrides: nextOverrides, sourceSpecHash } : {}),
           };
 
@@ -1095,7 +1113,7 @@ export const openApiPlugin = definePlugin<
             return yield* enrichPreviewWithDiscoveredOAuth({
               specText: resolved.specText,
               preview,
-              specUrl: resolved.specUrl ?? (spec.kind === "url" ? spec.url : undefined),
+              specUrl: resolved.specUrl ?? firstSpecInputUrl(spec),
             });
           }),
 
