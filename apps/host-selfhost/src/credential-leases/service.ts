@@ -498,14 +498,15 @@ export const makeCredentialLeaseService = (deps: CredentialLeaseDeps) => ({
       ) {
         return yield* leaseFailure(403, "forbidden", "M2M platform identity is not authorized");
       }
-      if (
-        input.organizationId !== verified.organizationId ||
-        input.organizationId !== deps.config.serviceOrganizationId
-      ) {
+      const targetOrganizationAllowed =
+        input.organizationId === deps.config.serviceOrganizationId ||
+        deps.config.allowedOrganizationIds.size === 0 ||
+        deps.config.allowedOrganizationIds.has(input.organizationId);
+      if (!targetOrganizationAllowed) {
         return yield* leaseFailure(
           403,
           "forbidden",
-          "Credential lease organization does not match the verified platform identity",
+          "Credential lease organization is not available to the platform service",
         );
       }
       if (

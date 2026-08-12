@@ -87,7 +87,7 @@ const connection: Connection = {
 };
 
 const input: CredentialLeaseRequest = {
-  organizationId: "org_platform",
+  organizationId: "org_allowed",
   workspaceId: "workspace_manifest",
   runId: "run_123",
   credential: { integration: "github_graphql", name: "github-prod" },
@@ -111,7 +111,7 @@ const awsConnection: Connection = {
 };
 
 const awsInput: CredentialLeaseRequest = {
-  organizationId: "org_platform",
+  organizationId: "org_allowed",
   workspaceId: "workspace_manifest",
   runId: "run_bedrock_123",
   credential: { integration: "amazonaws.com", name: "bedrock-production" },
@@ -290,7 +290,7 @@ describe("credential lease service", () => {
     ),
   );
 
-  it.effect("rejects a foreign request organization before credential resolution", () =>
+  it.effect("rejects a request organization outside the platform allowlist", () =>
     Effect.acquireUseRelease(
       Effect.promise(async () => {
         const db = createClient({ url: ":memory:" });
@@ -318,6 +318,42 @@ describe("credential lease service", () => {
           if (!Result.isFailure(result)) return;
           expect(result.failure).toMatchObject({ code: "forbidden", status: 403 });
           expect(resolved).toBe(false);
+        }),
+      (db) => Effect.sync(() => db.close()),
+    ),
+  );
+
+  it.effect("permits a customer organization when the platform allowlist is open", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(async () => {
+        const db = createClient({ url: ":memory:" });
+        await Effect.runPromise(ensureWorkOSIdentityTables(db));
+        return db;
+      }),
+      (db) =>
+        Effect.gen(function* () {
+          let resolvedOrganizationId = "";
+          const service = makeCredentialLeaseService({
+            config: { ...config, allowedOrganizationIds: new Set() },
+            workos,
+            db,
+            assumeAwsRole: assumeAwsRoleUnused,
+            verifyM2mToken: verified(),
+            resolveCredential: (_serviceAccountId, organizationId) => {
+              resolvedOrganizationId = organizationId;
+              return Effect.succeed({
+                connection,
+                values: { token: "secret-token", certificate: "secret-certificate" },
+              });
+            },
+          });
+
+          const response = yield* service.lease(request, {
+            ...input,
+            organizationId: "org_new_customer",
+          });
+          expect(resolvedOrganizationId).toBe("org_new_customer");
+          expect(response.lease.organizationId).toBe("org_new_customer");
         }),
       (db) => Effect.sync(() => db.close()),
     ),
