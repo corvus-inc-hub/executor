@@ -127,6 +127,7 @@ export const PushCommitArtifactInput = Schema.Struct({
   policy: RepositoryDeliveryPolicy,
   artifact: CommitArtifact,
   pullRequest: Schema.Struct({
+    baseBranch: Schema.optional(BranchName),
     title: Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(256)),
     body: Schema.String.check(Schema.isMaxLength(65_536)),
     draft: Schema.Literal(false),
@@ -1180,6 +1181,9 @@ const decodeResponse =
 const repoPath = (repository: typeof RepositoryIdentity.Type): string =>
   `/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}`;
 
+const pullRequestBaseBranch = (input: PushCommitArtifactInput): string =>
+  input.pullRequest.baseBranch ?? input.artifact.base.branch;
+
 const refPath = (repository: typeof RepositoryIdentity.Type, branch: string): string =>
   `${repoPath(repository)}/git/ref/${encodeURIComponent(`heads/${branch}`)}`;
 
@@ -1206,6 +1210,7 @@ const validatePath = (path: string): boolean => {
 const checkInputInvariants = Effect.fn("graphql.githubGovernedCommit.validate")(function* (
   input: PushCommitArtifactInput,
 ) {
+  const targetBranch = pullRequestBaseBranch(input);
   const expectedPolicyHash = yield* sha256Canonical(input.policy);
   if (expectedPolicyHash !== input.policySha256) {
     return yield* failure({
@@ -1232,9 +1237,15 @@ const checkInputInvariants = Effect.fn("graphql.githubGovernedCommit.validate")(
       message: "The requested repository does not match the immutable delivery policy.",
     });
   }
+  const isInitialDelivery =
+    input.artifact.base.branch === targetBranch &&
+    input.artifact.head.branch !== input.artifact.base.branch;
+  const isReviewedHeadContinuation =
+    input.artifact.base.branch === input.artifact.head.branch &&
+    input.artifact.base.branch !== targetBranch;
   if (
-    input.artifact.base.branch !== input.policy.baseBranch ||
-    input.artifact.head.branch === input.artifact.base.branch ||
+    targetBranch !== input.policy.baseBranch ||
+    (!isInitialDelivery && !isReviewedHeadContinuation) ||
     !input.artifact.head.branch.startsWith(input.policy.headBranchPrefix)
   ) {
     return yield* failure({
@@ -1570,10 +1581,11 @@ const ensureHeadReference = Effect.fn("graphql.githubGovernedCommit.ensureRef")(
 });
 
 const listMatchingPullRequests = (token: string, input: PushCommitArtifactInput) => {
+  const targetBranch = pullRequestBaseBranch(input);
   const query = new URLSearchParams({
     state: "all",
     head: `${input.repository.owner}:${input.artifact.head.branch}`,
-    base: input.artifact.base.branch,
+    base: targetBranch,
     per_page: "100",
   });
   return githubRequest({
@@ -1590,7 +1602,7 @@ const listMatchingPullRequests = (token: string, input: PushCommitArtifactInput)
           (pull) =>
             pull.head.ref === input.artifact.head.branch &&
             pull.head.sha === input.artifact.head.commitSha &&
-            pull.base.ref === input.artifact.base.branch,
+            pull.base.ref === targetBranch,
         ) ?? null,
     ),
   );
@@ -1600,6 +1612,7 @@ const ensurePullRequest = Effect.fn("graphql.githubGovernedCommit.ensurePullRequ
   token: string,
   input: PushCommitArtifactInput,
 ) {
+  const targetBranch = pullRequestBaseBranch(input);
   const existing = yield* listMatchingPullRequests(token, input);
   if (existing !== null) return { pullRequest: existing, reconciled: true };
   const created = yield* Effect.option(
@@ -1613,7 +1626,7 @@ const ensurePullRequest = Effect.fn("graphql.githubGovernedCommit.ensurePullRequ
         title: input.pullRequest.title,
         body: input.pullRequest.body,
         head: input.artifact.head.branch,
-        base: input.artifact.base.branch,
+        base: targetBranch,
         draft: false,
         maintainer_can_modify: false,
       },
@@ -1841,7 +1854,7 @@ export const pushCommitArtifact = Effect.fn("graphql.githubGovernedCommit.pushCo
         message: "GitHub repository identity or mutability does not match the governed request.",
       });
     }
-    const [baseReference, baseCommit, baseTree] = yield* Effect.all(
+    const [artifactBaseReference, baseCommit, baseTree] = yield* Effect.all(
       [
         getReference(token, input.repository, input.artifact.base.branch),
         getCommit(token, input.repository, input.artifact.base.commitSha),
@@ -1849,8 +1862,13 @@ export const pushCommitArtifact = Effect.fn("graphql.githubGovernedCommit.pushCo
       ],
       { concurrency: 3 },
     );
+    const pullRequestBaseReference =
+      pullRequestBaseBranch(input) === input.artifact.base.branch
+        ? artifactBaseReference
+        : yield* getReference(token, input.repository, pullRequestBaseBranch(input));
     if (
-      baseReference === null ||
+      artifactBaseReference === null ||
+      pullRequestBaseReference === null ||
       baseCommit.sha !== input.artifact.base.commitSha ||
       baseCommit.tree.sha !== input.artifact.base.treeSha ||
       baseTree.sha !== input.artifact.base.treeSha ||
@@ -1870,23 +1888,23 @@ export const pushCommitArtifact = Effect.fn("graphql.githubGovernedCommit.pushCo
       });
     }
     let targetTree = baseTree;
-    if (baseReference.object.sha !== input.artifact.base.commitSha) {
+    if (artifactBaseReference.object.sha !== input.artifact.base.commitSha) {
       const [comparison, targetCommit] = yield* Effect.all(
         [
           compareCommits(
             token,
             input.repository,
             input.artifact.base.commitSha,
-            baseReference.object.sha,
+            artifactBaseReference.object.sha,
           ),
-          getCommit(token, input.repository, baseReference.object.sha),
+          getCommit(token, input.repository, artifactBaseReference.object.sha),
         ],
         { concurrency: 2 },
       );
       if (
         comparison.status !== "ahead" ||
         comparison.merge_base_commit.sha !== input.artifact.base.commitSha ||
-        targetCommit.sha !== baseReference.object.sha
+        targetCommit.sha !== artifactBaseReference.object.sha
       ) {
         return yield* failure({
           stage: "base-verification",
@@ -1963,8 +1981,8 @@ export const pushCommitArtifact = Effect.fn("graphql.githubGovernedCommit.pushCo
     const pull = yield* ensurePullRequest(token, input);
     if (
       pull.pullRequest.head.sha !== input.artifact.head.commitSha ||
-      pull.pullRequest.base.sha !== baseReference.object.sha ||
-      pull.pullRequest.base.ref !== input.artifact.base.branch ||
+      pull.pullRequest.base.sha !== pullRequestBaseReference.object.sha ||
+      pull.pullRequest.base.ref !== pullRequestBaseBranch(input) ||
       pull.pullRequest.title !== input.pullRequest.title ||
       (pull.pullRequest.body ?? "") !== input.pullRequest.body ||
       pull.pullRequest.draft

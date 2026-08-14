@@ -146,13 +146,19 @@ const githubLayer = (options?: {
   readonly revisionHead?: boolean;
   readonly oauthScopes?: string;
   readonly treeVisibilityFailures?: number;
+  readonly existingReviewedHead?: boolean;
   readonly pullOverride?: Readonly<Record<string, unknown>>;
 }) => {
   let branchCreated = false;
   let pullCreated = false;
   let treeCreateAttempts = 0;
   const requests: string[] = [];
-  const activeHead = options?.revisionHead === true ? REVIEW_HEAD_COMMIT : HEAD_COMMIT;
+  const activeHead = () =>
+    branchCreated
+      ? HEAD_COMMIT
+      : options?.revisionHead === true || options?.existingReviewedHead === true
+        ? REVIEW_HEAD_COMMIT
+        : HEAD_COMMIT;
   const json = (request: HttpClientRequest.HttpClientRequest, body: unknown, status = 200) =>
     HttpClientResponse.fromWeb(
       request,
@@ -220,6 +226,11 @@ const githubLayer = (options?: {
       if (request.method === "GET" && url.pathname.endsWith(`/git/trees/${BASE_TREE}`)) {
         return Effect.succeed(
           json(request, { sha: BASE_TREE, url: "tree", truncated: false, tree: [] }),
+        );
+      }
+      if (request.method === "GET" && url.pathname.endsWith(`/git/trees/${REVIEW_HEAD_TREE}`)) {
+        return Effect.succeed(
+          json(request, { sha: REVIEW_HEAD_TREE, url: "review-tree", truncated: false, tree: [] }),
         );
       }
       if (
@@ -328,12 +339,18 @@ const githubLayer = (options?: {
         return Effect.succeed(
           branchCreated
             ? json(request, ref(HEAD_BRANCH, HEAD_COMMIT))
-            : json(request, { message: "Not Found" }, 404),
+            : options?.existingReviewedHead === true
+              ? json(request, ref(HEAD_BRANCH, REVIEW_HEAD_COMMIT))
+              : json(request, { message: "Not Found" }, 404),
         );
       }
       if (request.method === "POST" && url.pathname.endsWith("/git/refs")) {
         branchCreated = true;
         return Effect.succeed(json(request, ref(HEAD_BRANCH, HEAD_COMMIT), 201));
+      }
+      if (request.method === "PATCH" && url.pathname.includes("/git/ref/heads%2Fmnfst%2F")) {
+        branchCreated = true;
+        return Effect.succeed(json(request, ref(HEAD_BRANCH, HEAD_COMMIT)));
       }
       const pull = {
         number: 17,
@@ -343,7 +360,7 @@ const githubLayer = (options?: {
         body: "Exact governed change",
         state: "open",
         draft: false,
-        head: { sha: activeHead, ref: HEAD_BRANCH },
+        head: { sha: activeHead(), ref: HEAD_BRANCH },
         base: {
           sha:
             options?.advancedBase === true ||
@@ -379,7 +396,9 @@ const githubLayer = (options?: {
         );
       }
       if (request.method === "GET" && url.pathname.endsWith("/pulls")) {
-        return Effect.succeed(json(request, pullCreated ? [pull] : []));
+        return Effect.succeed(
+          json(request, pullCreated || options?.existingReviewedHead === true ? [pull] : []),
+        );
       }
       if (request.method === "POST" && url.pathname.endsWith("/pulls")) {
         pullCreated = true;
@@ -396,15 +415,15 @@ const githubLayer = (options?: {
                 conclusion: "success",
                 url: "https://api.github.com/check-runs/23",
                 details_url: "https://github.com/mnfst/app/actions/runs/23",
-                head_sha: activeHead,
+                head_sha: activeHead(),
               },
             ],
           }),
         );
       }
-      if (request.method === "GET" && url.pathname.endsWith(`/commits/${activeHead}/status`)) {
+      if (request.method === "GET" && url.pathname.endsWith(`/commits/${activeHead()}/status`)) {
         return Effect.succeed(
-          json(request, { state: "success", sha: activeHead, url: "status", statuses: [] }),
+          json(request, { state: "success", sha: activeHead(), url: "status", statuses: [] }),
         );
       }
       return Effect.succeed(json(request, { message: "Unexpected test request" }, 500));
@@ -648,6 +667,66 @@ describe("GitHub governed commit capability", () => {
         headSha: HEAD_COMMIT,
       });
       expect(github.requests.some((entry) => entry.startsWith("POST "))).toBe(true);
+    }),
+  );
+
+  it.effect("continues an existing reviewed PR while preserving its target branch", () =>
+    Effect.gen(function* () {
+      const original = yield* makeInput();
+      const artifact = {
+        ...original.artifact,
+        base: {
+          branch: HEAD_BRANCH,
+          commitSha: REVIEW_HEAD_COMMIT,
+          treeSha: REVIEW_HEAD_TREE,
+        },
+      } satisfies PushCommitArtifactInput["artifact"];
+      const input = {
+        ...original,
+        artifact,
+        artifactSha256: yield* sha256Canonical(artifact),
+        pullRequest: { ...original.pullRequest, baseBranch: "main" },
+      } satisfies PushCommitArtifactInput;
+      const github = githubLayer({ existingReviewedHead: true });
+
+      const result = yield* pushCommitArtifact(input, "host-held-token", makeStore()).pipe(
+        Effect.provide(github.layer),
+      );
+
+      expect(result).toMatchObject({
+        base: { branch: HEAD_BRANCH, commitSha: REVIEW_HEAD_COMMIT },
+        head: { branch: HEAD_BRANCH, commitSha: HEAD_COMMIT },
+        pullRequest: { number: 17, baseSha: BASE_COMMIT, headSha: HEAD_COMMIT },
+      });
+      expect(github.requests).toContain(
+        "PATCH /repos/mnfst/app/git/ref/heads%2Fmnfst%2Faaaaaaaaaaaaaaaa",
+      );
+      expect(github.requests.some((entry) => entry === "POST /repos/mnfst/app/pulls")).toBe(false);
+      expect(
+        github.requests.some((entry) => entry.includes("/pulls?") && entry.includes("base=main")),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect("rejects a pull request target outside the immutable policy", () =>
+    Effect.gen(function* () {
+      const original = yield* makeInput();
+      const input = {
+        ...original,
+        pullRequest: { ...original.pullRequest, baseBranch: "release" },
+      } satisfies PushCommitArtifactInput;
+      const github = githubLayer();
+
+      const result = yield* Effect.result(
+        pushCommitArtifact(input, "host-held-token", makeStore()).pipe(
+          Effect.provide(github.layer),
+        ),
+      );
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (!Result.isFailure(result)) return;
+      expect(result.failure).toMatchObject({ code: "branch_policy_mismatch" });
+      expect(github.requests).toHaveLength(0);
     }),
   );
 
