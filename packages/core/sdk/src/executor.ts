@@ -114,6 +114,7 @@ import type {
   IntegrationPresetCatalogEntry,
   IntegrationRecord,
   OwnerBinding,
+  OperationPluginCtx,
   PluginCtx,
   PluginExtensions,
   ResolveToolsResult,
@@ -3918,108 +3919,28 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       );
 
     // Operation handlers receive credentials and a reviewed target from core;
-    // they do not receive the executor's ambient mutation/credential surface.
-    // Keep the existing PluginCtx type for generic handlers, but hand
-    // operation handlers a capability facade that exposes only owner, HTTP,
-    // and plugin-owned read storage. Missing capabilities fail as an opaque
-    // defect and are normalized by the operation boundary.
-    const operationPluginContext = (ctx: PluginCtx<unknown>): PluginCtx<unknown> => {
-      const isWriteCapability = (property: PropertyKey): boolean =>
-        typeof property === "string" &&
-        /^(create|delete|insert|put|set|update|remove|write|save|clear|reset|replace|publish|register|upsert|patch|run|execute|transaction)/i.test(
-          property,
-        );
-      const readOnlyStorage =
-        typeof ctx.storage === "object" && ctx.storage !== null
-          ? new Proxy(ctx.storage, {
-              get(target, property, receiver) {
-                const value = Reflect.get(target, property, receiver);
-                if (typeof value !== "function") return value;
-                if (isWriteCapability(property)) {
-                  return undefined;
-                }
-                return value.bind(target);
-              },
-              has(target, property) {
-                return !isWriteCapability(property) && Reflect.has(target, property);
-              },
-              ownKeys(target) {
-                return Reflect.ownKeys(target).filter((property) => !isWriteCapability(property));
-              },
-              getOwnPropertyDescriptor(target, property) {
-                return isWriteCapability(property)
-                  ? undefined
-                  : Reflect.getOwnPropertyDescriptor(target, property);
-              },
-            })
-          : ctx.storage;
-      const readOnlyIntegrations = new Proxy(ctx.core.integrations, {
-        get(target, property, receiver) {
-          if (property !== "get" && property !== "list") return undefined;
-          const value = Reflect.get(target, property, receiver);
-          return typeof value === "function" ? value.bind(target) : value;
-        },
-        has(target, property) {
-          return property === "get" || property === "list";
-        },
-        ownKeys() {
-          return ["get", "list"];
-        },
-        getOwnPropertyDescriptor(target, property) {
-          if (property !== "get" && property !== "list") return undefined;
-          return Reflect.getOwnPropertyDescriptor(target, property);
-        },
-      });
-      const readOnlyCore = new Proxy(ctx.core, {
-        get(target, property, _receiver) {
-          if (property === "integrations") {
-            return readOnlyIntegrations;
-          }
-          return undefined;
-        },
-        has(_target, property) {
-          return property === "integrations";
-        },
-        ownKeys() {
-          return ["integrations"];
-        },
-        getOwnPropertyDescriptor(target, property) {
-          return property === "integrations"
-            ? Reflect.getOwnPropertyDescriptor(target, property)
-            : undefined;
-        },
-      });
-      return new Proxy(ctx, {
-        get(target, property, receiver) {
-          if (property === "owner" || property === "httpClientLayer") {
-            return Reflect.get(target, property, receiver);
-          }
-          if (property === "storage") return readOnlyStorage;
-          if (property === "core") return readOnlyCore;
-          // connections/providers/pluginStorage/policies/execute/transaction
-          // are intentionally absent from this capability context.
-          return undefined;
-        },
-        has(_target, property) {
-          return (
-            property === "owner" ||
-            property === "httpClientLayer" ||
-            property === "storage" ||
-            property === "core"
-          );
-        },
-        ownKeys() {
-          return ["owner", "httpClientLayer", "storage", "core"];
-        },
-        getOwnPropertyDescriptor(target, property) {
-          return property === "owner" ||
-            property === "httpClientLayer" ||
-            property === "storage" ||
-            property === "core"
-            ? Reflect.getOwnPropertyDescriptor(target, property)
-            : undefined;
-        },
-      });
+    // they do not receive the executor's ambient PluginCtx. Copy and freeze
+    // the owner so a handler cannot redirect the authorization partition by
+    // mutating the generic executor binding.
+    const operationPluginContext = (ctx: PluginCtx<unknown>): OperationPluginCtx => {
+      const owner = Object.freeze(
+        Object.setPrototypeOf(
+          {
+            tenant: Tenant.make(String(ctx.owner.tenant)),
+            subject: ctx.owner.subject === null ? null : Subject.make(String(ctx.owner.subject)),
+          },
+          null,
+        ),
+      );
+      return Object.freeze(
+        Object.setPrototypeOf(
+          {
+            owner,
+            httpClientLayer: ctx.httpClientLayer,
+          },
+          null,
+        ),
+      );
     };
 
     const executeInternal = (
@@ -4078,6 +3999,36 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 }),
             ),
           );
+        const invokeOperationHandler = (
+          handler: (...args: never[]) => unknown,
+          input: unknown,
+        ): Effect.Effect<unknown, ToolInvocationError> => {
+          const failure = () =>
+            new ToolInvocationError({
+              address,
+              message: "Operation invocation failed.",
+              cause: {},
+            });
+          const isOperationEffect = (
+            value: unknown,
+          ): value is Effect.Effect<unknown, unknown, never> => Effect.isEffect(value);
+          return Effect.suspend((): Effect.Effect<unknown, ToolInvocationError> => {
+            let result: unknown;
+            // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: plugin sync throws become opaque typed operation failures
+            try {
+              // Operation handlers are plugin code. Invoke them through an
+              // untyped boundary so the runtime's narrow OperationPluginCtx
+              // cannot be widened back to the ambient PluginCtx by the public
+              // generic hook signature. Reflect.apply also prevents a plugin
+              // from receiving an executor-owned `this` value.
+              result = Reflect.apply(handler, undefined, [input]);
+            } catch {
+              return Effect.fail(failure());
+            }
+            if (!isOperationEffect(result)) return Effect.fail(failure());
+            return result.pipe(Effect.mapError(() => failure()));
+          });
+        };
 
         // Static path — O(1) map lookup for plugin-contributed static tools
         // (core-tools, plugin executor namespaces). Addressed by their fqid,
@@ -4110,13 +4061,19 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 policy,
                 handler,
               );
-          const value = yield* wrapInvocationError(
-            staticEntry.tool.handler({
-              ctx: internal?.operation ? operationPluginContext(staticEntry.ctx) : staticEntry.ctx,
-              args,
-              elicit: buildElicit(address, args, handler),
-            }),
-          );
+          const value = yield* internal?.operation
+            ? invokeOperationHandler(staticEntry.tool.handler, {
+                ctx: operationPluginContext(staticEntry.ctx),
+                args,
+                elicit: buildElicit(address, args, handler),
+              })
+            : wrapInvocationError(
+                staticEntry.tool.handler({
+                  ctx: staticEntry.ctx,
+                  args,
+                  elicit: buildElicit(address, args, handler),
+                }),
+              );
           return {
             value,
             policy,
@@ -4257,16 +4214,25 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           ...(grantedScopes ? { grantedScopes } : {}),
         };
 
-        const value = yield* wrapInvocationError(
-          runtime.plugin.invokeTool({
-            ctx: internal?.operation ? operationPluginContext(runtime.ctx) : runtime.ctx,
-            toolRow: row,
-            credential,
-            args,
-            elicit: buildElicit(address, args, handler),
-            invokeOptions: options,
-          }),
-        );
+        const value = yield* internal?.operation
+          ? invokeOperationHandler(runtime.plugin.invokeTool, {
+              ctx: operationPluginContext(runtime.ctx),
+              toolRow: row,
+              credential,
+              args,
+              elicit: buildElicit(address, args, handler),
+              invokeOptions: options,
+            })
+          : wrapInvocationError(
+              runtime.plugin.invokeTool({
+                ctx: runtime.ctx,
+                toolRow: row,
+                credential,
+                args,
+                elicit: buildElicit(address, args, handler),
+                invokeOptions: options,
+              }),
+            );
         return {
           value,
           policy,
@@ -4741,6 +4707,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           decoded.approval.providerTransport !== decoded.providerTransport ||
           decoded.approval.carrier !== decoded.carrier ||
           decoded.approval.sessionId !== `approval:${decoded.executionId}` ||
+          decoded.approval.decidedAt === undefined ||
           !samePolicy(decoded.approval.policy, decoded.policy)
         ) {
           return yield* failResult("result.approval");
@@ -4780,62 +4747,51 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         }
 
         // The approval adapter is an authorization boundary, not a free-form
-        // annotation. Reject results whose status, policy, and decision could
-        // not have been produced by the reviewed lifecycle.
-        if (
-          decoded.status === "completed" &&
-          (decoded.policy.decision === "deny" ||
-            (decoded.policy.decision === "require_approval" &&
-              decoded.approval.decision !== "approved") ||
-            (decoded.policy.decision === "allow" && decoded.approval.decision !== "not_required"))
-        ) {
-          return yield* failResult("result.approval");
-        }
-        if (
-          decoded.policy.decision === "require_approval" &&
-          decoded.approval.decision === "not_required"
-        ) {
-          return yield* failResult("result.approval");
-        }
-        if (decoded.status === "blocked" && decoded.approval.decision === "approved") {
-          return yield* failResult("result.approval");
-        }
-        if (decoded.status === "cancelled" && decoded.approval.decision !== "cancelled") {
-          return yield* failResult("result.approval");
-        }
-        if (
-          decoded.status === "failed" &&
-          (decoded.approval.decision === "declined" || decoded.approval.decision === "cancelled")
-        ) {
-          return yield* failResult("result.approval");
-        }
-        if (decoded.failure !== undefined) {
-          const code = decoded.failure.code;
-          if (
-            decoded.status === "cancelled" &&
-            code !== "operation_cancelled" &&
-            code !== "approval_cancelled"
-          ) {
-            return yield* failResult("result.failure");
-          }
-          if (
-            decoded.status === "blocked" &&
-            code !== "policy_blocked" &&
-            code !== "approval_handler_required" &&
-            code !== "approval_declined"
-          ) {
-            return yield* failResult("result.failure");
-          }
-          if (
-            decoded.status === "failed" &&
-            (code === "operation_cancelled" ||
-              code === "approval_cancelled" ||
-              code === "policy_blocked" ||
-              code === "approval_handler_required" ||
-              code === "approval_declined")
-          ) {
-            return yield* failResult("result.failure");
-          }
+        // annotation. Enumerate every terminal combination that this
+        // executor can produce. In particular, a corrupt adapter cannot turn
+        // an allow/not-required run into an approved or declined result, and
+        // control-plane failures cannot be replayed as ordinary tool errors.
+        const decision = decoded.approval.decision;
+        const policyDecision = decoded.policy.decision;
+        const failureCode = decoded.failure?.code;
+        const operationalFailure =
+          failureCode === "operation_failed" ||
+          failureCode === "provider_error" ||
+          failureCode === "upstream_bad_request" ||
+          failureCode === "upstream_unauthorized" ||
+          failureCode === "upstream_forbidden" ||
+          failureCode === "upstream_not_found" ||
+          failureCode === "upstream_conflict" ||
+          failureCode === "upstream_rate_limited" ||
+          failureCode === "upstream_server_error" ||
+          failureCode === "tool_not_found" ||
+          failureCode === "tool_blocked" ||
+          failureCode === "credential_missing" ||
+          failureCode === "credential_invalid" ||
+          failureCode === "output_schema_invalid" ||
+          failureCode === "provider_receipt_mismatch" ||
+          failureCode === "provider_receipt_unavailable";
+        const validTerminalState =
+          decoded.status === "completed"
+            ? (policyDecision === "allow" && decision === "not_required") ||
+              (policyDecision === "require_approval" && decision === "approved")
+            : decoded.status === "failed"
+              ? ((policyDecision === "allow" && decision === "not_required") ||
+                  (policyDecision === "require_approval" && decision === "approved")) &&
+                operationalFailure
+              : decoded.status === "blocked"
+                ? (policyDecision === "deny" &&
+                    decision === "not_required" &&
+                    failureCode === "policy_blocked") ||
+                  (policyDecision === "require_approval" &&
+                    decision === "declined" &&
+                    (failureCode === "approval_handler_required" ||
+                      failureCode === "approval_declined"))
+                : decoded.status === "cancelled" &&
+                  decision === "cancelled" &&
+                  (failureCode === "operation_cancelled" || failureCode === "approval_cancelled");
+        if (!validTerminalState) {
+          return yield* failResult("result.state");
         }
 
         const reconciliation = decoded.providerReconciliation;
@@ -5310,35 +5266,23 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 : undefined;
             const declinedAction =
               declined && (action === "decline" || action === "cancel") ? action : undefined;
-            const approvalDecision = declined
-              ? (declinedAction ?? "decline")
-              : blocked
-                ? "not_required"
-                : policy.action === "require_approval"
-                  ? "approved"
-                  : "not_required";
+            // Elicitation inside an already-reviewed operation is a
+            // plugin/runtime interaction, not a second authorization grant.
+            // Keep the bound policy decision intact so a plugin decline cannot
+            // manufacture an impossible allow+declined or approved+failed
+            // receipt. A cancel is an operation cancellation; a plain decline
+            // is an ordinary opaque operation failure.
+            const approvalDecision =
+              policy.action === "require_approval" ? "approved" : "not_required";
             result = baseResult({
               policy,
-              approval: baseApproval(
-                policy,
-                approvalDecision === "decline"
-                  ? "declined"
-                  : approvalDecision === "cancel"
-                    ? "cancelled"
-                    : approvalDecision,
-                new Date().toISOString(),
-              ),
+              approval: baseApproval(policy, approvalDecision, new Date().toISOString()),
               providerReconciliation: { status: "unavailable" },
-              status: blocked
-                ? "blocked"
-                : declined && declinedAction === "cancel"
-                  ? "cancelled"
-                  : "failed",
+              status: declined && declinedAction === "cancel" ? "cancelled" : "failed",
               failure: {
-                code: blocked
-                  ? "policy_blocked"
-                  : declined
-                    ? "approval_declined"
+                code:
+                  declined && declinedAction === "cancel"
+                    ? "operation_cancelled"
                     : safeFailureCode(error),
                 ...(errorStatus !== undefined ? { status: errorStatus } : {}),
                 retryable: !blocked && !declined,

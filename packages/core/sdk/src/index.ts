@@ -295,6 +295,7 @@ export {
   type Plugin,
   type PluginSpec,
   type PluginCtx,
+  type OperationPluginCtx,
   type PluginExtensions,
   type ConfiguredPlugin,
   type AnyPlugin,

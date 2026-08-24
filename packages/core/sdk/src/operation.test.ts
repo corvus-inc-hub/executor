@@ -343,6 +343,10 @@ describe("carrier-neutral operation attestation", () => {
   it.effect("gives operation handlers a capability-scoped plugin context", () =>
     Effect.gen(function* () {
       let ambientCapabilities = false;
+      let ownerMutable = false;
+      let ambientKey = false;
+      let symbolMutable = false;
+      let accessorMutable = false;
       const scopedPlugin = definePlugin(() => ({
         id: "attestation-scoped-context" as const,
         storage: () => ({
@@ -363,17 +367,38 @@ describe("carrier-neutral operation attestation", () => {
                 execute: ({ value }, context) =>
                   Effect.sync(() => {
                     const storage = context.ctx.storage;
-                    const storageHasWrite =
+                    const storageHasMutation =
                       typeof storage === "object" &&
                       storage !== null &&
-                      Reflect.get(storage, "putValue") !== undefined;
+                      (Reflect.get(storage, "putValue") !== undefined ||
+                        Reflect.get(storage, "appendOperations") !== undefined);
+                    ownerMutable = Reflect.set(context.ctx.owner, "tenant", "redirected");
+                    symbolMutable = Reflect.set(context.ctx, Symbol("ambient"), "redirected");
+                    accessorMutable = Reflect.defineProperty(context.ctx, "storage", {
+                      get: () => ({ appendOperations: () => undefined }),
+                    });
+                    expect(Object.getPrototypeOf(context.ctx)).toBe(null);
+                    expect(Object.getPrototypeOf(context.ctx.owner)).toBe(null);
+                    ambientKey = Reflect.ownKeys(context.ctx).some((key) =>
+                      [
+                        "storage",
+                        "pluginStorage",
+                        "core",
+                        "connections",
+                        "providers",
+                        "oauth",
+                        "execute",
+                        "transaction",
+                      ].includes(String(key)),
+                    );
                     ambientCapabilities =
                       context.ctx.connections !== undefined ||
                       context.ctx.providers !== undefined ||
                       context.ctx.execute !== undefined ||
                       context.ctx.transaction !== undefined ||
                       context.ctx.pluginStorage !== undefined ||
-                      storageHasWrite;
+                      storageHasMutation ||
+                      !Object.isFrozen(context.ctx.owner);
                     return { value };
                   }),
               }),
@@ -393,6 +418,10 @@ describe("carrier-neutral operation attestation", () => {
       const result = yield* executor.executeOperation(request, "http");
       expect(result.status).toBe("completed");
       expect(ambientCapabilities).toBe(false);
+      expect(ownerMutable).toBe(false);
+      expect(ambientKey).toBe(false);
+      expect(symbolMutable).toBe(false);
+      expect(accessorMutable).toBe(false);
     }),
   );
 
@@ -778,6 +807,7 @@ describe("carrier-neutral operation attestation", () => {
       const request = yield* makeRequest(operation, "job-approval-binding", { value: "approval" });
       const completed = yield* executor.executeOperation(request, "http");
       expect(completed.status).toBe("completed");
+      const { decidedAt: _decidedAt, ...approvalWithoutDecisionTime } = completed.approval;
       const corruptions = [
         {
           ...completed,
@@ -785,10 +815,11 @@ describe("carrier-neutral operation attestation", () => {
         },
         {
           ...completed,
-          approval: {
-            ...completed.approval,
-            sessionId: "approval:wrong-execution",
-          },
+          approval: { ...completed.approval, sessionId: "approval:wrong-execution" },
+        },
+        {
+          ...completed,
+          approval: approvalWithoutDecisionTime,
         },
       ];
       for (const corrupted of corruptions) {
@@ -807,7 +838,9 @@ describe("carrier-neutral operation attestation", () => {
           Result.match(replay, {
             onFailure: (failure) =>
               Predicate.isTagged(failure, "OperationContractError") &&
-              (failure.field === "result.approval" || failure.field === "result.binding"),
+              (failure.field === "result.approval" ||
+                failure.field === "result.binding" ||
+                failure.field === "result.state"),
             onSuccess: () => false,
           }),
         ).toBe(true);
@@ -864,6 +897,94 @@ describe("carrier-neutral operation attestation", () => {
           onSuccess: () => false,
         }),
       ).toBe(true);
+    }),
+  );
+
+  it.effect("rejects impossible policy, approval, status, and failure combinations", () =>
+    Effect.gen(function* () {
+      const inner = makeInMemoryOperationReplayStore();
+      const captureStore = {
+        ...inner,
+        settle: (input: Parameters<typeof inner.settle>[0]) => {
+          return inner.settle(input);
+        },
+      };
+      const operation = definition(
+        ToolAddress.make("attestation-state-matrix.echo"),
+        "state-matrix",
+      );
+      const plugin = definePlugin(() => ({
+        id: "attestation-state-matrix" as const,
+        storage: () => ({}),
+        staticIntegrations: () => [
+          {
+            id: "attestation-state-matrix",
+            kind: "plugin" as const,
+            name: "State matrix",
+            tools: [
+              tool({
+                name: "echo",
+                description: "State matrix operation target.",
+                inputSchema: INPUT,
+                outputSchema: OUTPUT,
+                execute: ({ value }) => Effect.succeed({ value }),
+              }),
+            ],
+          },
+        ],
+      }))();
+      const executor = yield* makeTestExecutor({
+        plugins: [plugin] as const,
+        operations: [operation],
+        operationReplayStore: captureStore,
+      });
+      const request = yield* makeRequest(operation, "job-state-matrix", { value: "matrix" });
+      const completed = yield* executor.executeOperation(request, "http");
+      expect(completed.status).toBe("completed");
+      const { output: _output, ...withoutOutput } = completed;
+      const corruptions: readonly ExecuteOperationResult[] = [
+        {
+          ...withoutOutput,
+          status: "failed",
+          outputSha256: null,
+          approval: { ...completed.approval, decision: "approved" },
+          failure: { code: "operation_failed", retryable: false },
+        },
+        {
+          ...withoutOutput,
+          status: "blocked",
+          outputSha256: null,
+          approval: { ...completed.approval, decision: "declined" },
+          failure: { code: "approval_declined", retryable: false },
+        },
+        {
+          ...withoutOutput,
+          status: "blocked",
+          outputSha256: null,
+          approval: { ...completed.approval, decision: "not_required" },
+          failure: { code: "approval_declined", retryable: false },
+        },
+      ];
+      for (const corrupted of corruptions) {
+        const replayStore = {
+          ...captureStore,
+          reserve: () => Effect.succeed({ status: "replay" as const, result: corrupted }),
+        };
+        const replayExecutor = yield* makeTestExecutor({
+          plugins: [plugin] as const,
+          operations: [operation],
+          operationReplayStore: replayStore,
+        });
+        const replay = yield* Effect.result(replayExecutor.executeOperation(request, "mcp"));
+        expect(
+          Result.match(replay, {
+            onFailure: (failure) =>
+              Predicate.isTagged(failure, "OperationContractError") &&
+              failure.field === "result.state",
+            onSuccess: () => false,
+          }),
+        ).toBe(true);
+      }
     }),
   );
 

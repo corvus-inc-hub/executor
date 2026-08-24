@@ -72,6 +72,20 @@ export interface OwnerBinding {
   readonly subject: Subject | null;
 }
 
+/**
+ * Capabilities available to a reviewed operation target.
+ *
+ * This is deliberately not a PluginCtx. Operation code already receives the
+ * resolved credential, tool row, and reviewed arguments as separate inputs;
+ * it must not inherit plugin storage, catalog mutation, credential/provider
+ * access, nested execution, transactions, or the mutable owner object used by
+ * generic lifecycle hooks.
+ */
+export interface OperationPluginCtx {
+  readonly owner: Readonly<OwnerBinding>;
+  readonly httpClientLayer: Layer.Layer<HttpClient.HttpClient>;
+}
+
 // ---------------------------------------------------------------------------
 // StorageDeps — backing passed to a plugin's `storage` factory. Plugins see
 // host-owned storage facades only. The (tenant, owner, subject) partition is
