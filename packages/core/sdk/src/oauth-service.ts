@@ -17,7 +17,8 @@
 import { Duration, Effect, Layer, Option, Schema } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 
-import type { Connection } from "./connection";
+import type { Connection, ConnectionRef } from "./connection";
+import { sha256Hex } from "./blob";
 import type { IFumaClient, StorageFailure } from "./fuma-runtime";
 import { StorageError } from "./fuma-runtime";
 import {
@@ -35,11 +36,18 @@ import {
   OAuthRegisterDynamicError,
   OAuthSessionNotFoundError,
   OAuthStartError,
+  OAUTH_COMPLETION_RECEIPT_SCHEMA_VERSION,
+  OAuthCompletionReceipt,
+  OAuthCorrelationBinding,
+  canonicalOAuthCorrelationBinding,
   type ConnectResult,
   type CreateOAuthClientInput,
   type OAuthClientOrigin,
   type OAuthClientSummary,
   type OAuthCompleteInput,
+  type OAuthCompletionReceiptLookupInput,
+  type OAuthCompletionReceipt as OAuthCompletionReceiptType,
+  type OAuthCorrelationBinding as OAuthCorrelationBindingType,
   type OAuthGrant,
   type OAuthProbeInput,
   type OAuthProbeResult,
@@ -126,6 +134,8 @@ export interface OAuthServiceDeps {
   readonly mintOAuthConnection: (
     input: MintOAuthConnectionInput,
   ) => Effect.Effect<Connection, StorageFailure>;
+  /** Load a connection for an idempotent completion replay. */
+  readonly getConnection: (ref: ConnectionRef) => Effect.Effect<Connection | null, StorageFailure>;
   /**
    * Resolve the OAuth scope policy for a `(integration, template)`:
    *  - `{ kind: "scopes", scopes }`: the scopes the integration's auth template
@@ -251,6 +261,8 @@ export const missingGrantedOAuthScopes = (
 };
 
 const decodeJsonPayload = Schema.decodeUnknownOption(Schema.UnknownFromJsonString);
+const decodeOAuthCorrelation = Schema.decodeUnknownOption(OAuthCorrelationBinding);
+const decodeOAuthCompletionReceipt = Schema.decodeUnknownOption(OAuthCompletionReceipt);
 
 /** Extract the persisted `requestedScopes` from an `oauth_session.payload`. The
  *  jsonColumn may surface as a parsed object (in-memory backends) or a JSON
@@ -279,6 +291,128 @@ const clientOwnerFromPayload = (payload: unknown): Owner | null => {
   const value = (decoded as Record<string, unknown>).clientOwner;
   return value === "user" || value === "org" ? value : null;
 };
+
+const correlationFromPayload = (payload: unknown): OAuthCorrelationBindingType | null => {
+  const decoded =
+    typeof payload === "string"
+      ? decodeJsonPayload(payload).pipe(Option.getOrElse(() => payload))
+      : payload;
+  if (decoded === null || typeof decoded !== "object") return null;
+  const value = (decoded as Record<string, unknown>).correlation;
+  return Option.getOrNull(decodeOAuthCorrelation(value));
+};
+
+const executionIdFromPayload = (payload: unknown): string | null => {
+  const decoded =
+    typeof payload === "string"
+      ? decodeJsonPayload(payload).pipe(Option.getOrElse(() => payload))
+      : payload;
+  if (decoded === null || typeof decoded !== "object") return null;
+  const value = (decoded as Record<string, unknown>).executionId;
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+};
+
+const correlationFieldIsSafe = (value: string): boolean => {
+  if (value.length === 0 || value.length > 255) return false;
+  for (const character of value) {
+    const code = character.codePointAt(0);
+    if (code === undefined || code < 0x20 || code === 0x7f) return false;
+  }
+  return true;
+};
+
+const normalizeCorrelation = (
+  input: OAuthCorrelationBindingType,
+): OAuthCorrelationBindingType | null => {
+  if (input.schemaVersion !== "executor.oauth-correlation.v1") return null;
+  const normalized = {
+    schemaVersion: input.schemaVersion,
+    attemptKey: input.attemptKey.trim(),
+    actorUserId: input.actorUserId.trim(),
+    organizationId: input.organizationId.trim(),
+    workspaceId: input.workspaceId.trim(),
+    provider: input.provider.trim(),
+  } satisfies OAuthCorrelationBindingType;
+  return Object.values(normalized).every(
+    (value) => typeof value === "string" && correlationFieldIsSafe(value),
+  )
+    ? normalized
+    : null;
+};
+
+const dateFromStored = (value: unknown): Date | null => {
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value : null;
+  }
+  if (typeof value === "number") {
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date : null;
+  }
+  if (typeof value === "string") {
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date : null;
+  }
+  return null;
+};
+
+const receiptFromRow = (row: Record<string, unknown>): OAuthCompletionReceiptType | null => {
+  const startedAt = dateFromStored(row.started_at);
+  const completedAt = dateFromStored(row.completed_at);
+  const durationMs = Number(row.duration_ms);
+  if (!startedAt || !completedAt || !Number.isFinite(durationMs)) return null;
+  return Option.getOrNull(
+    decodeOAuthCompletionReceipt({
+      schemaVersion: OAUTH_COMPLETION_RECEIPT_SCHEMA_VERSION,
+      receiptKind: "executor.oauth.completion",
+      attemptKey: String(row.attempt_key ?? ""),
+      actorUserId: String(row.actor_user_id ?? ""),
+      organizationId: String(row.organization_id ?? ""),
+      workspaceId: String(row.workspace_id ?? ""),
+      executionId: String(row.execution_id ?? ""),
+      status: String(row.status ?? ""),
+      resultReference: String(row.result_reference ?? ""),
+      provider: String(row.provider ?? ""),
+      connection: {
+        owner: row.connection_owner,
+        integration: String(row.connection_integration ?? ""),
+        name: String(row.connection_name ?? ""),
+        address: String(row.connection_address ?? ""),
+      },
+      requestHash: String(row.request_hash ?? ""),
+      descriptorHash: String(row.descriptor_hash ?? ""),
+      startedAt: startedAt.toISOString(),
+      completedAt: completedAt.toISOString(),
+      durationMs,
+    }),
+  );
+};
+
+const connectionRefFromReceipt = (receipt: OAuthCompletionReceiptType): ConnectionRef => ({
+  owner: receipt.connection.owner,
+  integration: IntegrationSlug.make(receipt.connection.integration),
+  name: ConnectionName.make(receipt.connection.name),
+});
+
+const requestHashForCompletion = (
+  state: OAuthState,
+  code: string,
+  callbackDomain: string | null,
+  descriptorHash: string,
+): Effect.Effect<string> =>
+  Effect.gen(function* () {
+    // The raw authorization code is request material, not receipt material.
+    // Bind replays to the same callback without persisting or returning it.
+    const codeHash = yield* sha256Hex(code);
+    return yield* sha256Hex(
+      JSON.stringify({
+        schemaVersion: "executor.oauth-complete.v1",
+        state: String(state),
+        callbackDomain,
+        descriptorHash,
+        codeHash,
+      }),
+    );
+  });
 
 /** Narrow a stored `grant` string to the `OAuthGrant` union, or `null` when the
  *  value is neither known grant. EXPLICIT — there is no silent fallback to
@@ -1101,6 +1235,28 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         orgSlug: deps.callbackStateOrgSlug,
       });
 
+      const correlation = input.correlation ? normalizeCorrelation(input.correlation) : null;
+      if (input.correlation && correlation === null) {
+        return yield* new OAuthStartError({
+          message: "OAuth correlation binding contains an invalid or oversized value.",
+        });
+      }
+      if (correlation && correlation.organizationId !== deps.tenant) {
+        return yield* new OAuthStartError({
+          message:
+            "OAuth correlation binding organization does not match the authenticated organization.",
+        });
+      }
+      if (correlation && deps.subject !== null && correlation.actorUserId !== deps.subject) {
+        return yield* new OAuthStartError({
+          message: "OAuth correlation binding actor does not match the authenticated user.",
+        });
+      }
+      const descriptorHash = correlation
+        ? yield* sha256Hex(canonicalOAuthCorrelationBinding(correlation))
+        : null;
+      const executionId = correlation ? crypto.randomUUID() : null;
+
       const now = new Date();
       const expiresAt = Date.now() + OAUTH2_SESSION_TTL_MS;
       yield* deps.fuma.use("oauth_session.create", (db) =>
@@ -1124,6 +1280,13 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             owner: input.owner,
             clientOwner: input.clientOwner,
             requestedScopes: authorizationRequestedScopes,
+            ...(correlation
+              ? {
+                  correlation,
+                  descriptorHash,
+                  executionId,
+                }
+              : {}),
           },
           expires_at: expiresAt,
           created_at: now,
@@ -1159,16 +1322,128 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   // -----------------------------------------------------------------------
   // complete — redeem the session, exchange the code, mint the connection.
   // -----------------------------------------------------------------------
+  const loadCompletionReceiptRow = (
+    attemptKey: string,
+  ): Effect.Effect<Record<string, unknown> | null, StorageFailure> =>
+    deps.fuma.use("oauth_completion_receipt.findFirst", (db) =>
+      looseDb(db).findFirst("oauth_completion_receipt", {
+        where: (b: any) => b("attempt_key", "=", attemptKey),
+      }),
+    );
+
+  const sameCorrelation = (
+    left: Pick<
+      OAuthCorrelationBindingType,
+      "attemptKey" | "actorUserId" | "organizationId" | "workspaceId" | "provider"
+    >,
+    right: Pick<
+      OAuthCorrelationBindingType,
+      "attemptKey" | "actorUserId" | "organizationId" | "workspaceId" | "provider"
+    >,
+  ): boolean =>
+    left.attemptKey === right.attemptKey &&
+    left.actorUserId === right.actorUserId &&
+    left.organizationId === right.organizationId &&
+    left.workspaceId === right.workspaceId &&
+    left.provider === right.provider;
+
+  const validateCompletionCorrelation = (
+    correlation: OAuthCorrelationBindingType,
+  ): Effect.Effect<void, OAuthCompleteError> => {
+    if (correlation.organizationId !== deps.tenant) {
+      return Effect.fail(
+        new OAuthCompleteError({
+          message:
+            "OAuth correlation binding organization does not match the authenticated organization.",
+          restartRequired: false,
+        }),
+      );
+    }
+    if (deps.subject !== null && correlation.actorUserId !== deps.subject) {
+      return Effect.fail(
+        new OAuthCompleteError({
+          message: "OAuth correlation binding actor does not match the authenticated user.",
+          restartRequired: false,
+        }),
+      );
+    }
+    return Effect.void;
+  };
+
   const complete = (
     input: OAuthCompleteInput,
   ): Effect.Effect<Connection, OAuthCompleteError | OAuthSessionNotFoundError | StorageFailure> =>
     Effect.gen(function* () {
+      const callbackDomain = input.callbackDomain?.trim() || null;
+      const suppliedCorrelation = input.correlation
+        ? normalizeCorrelation(input.correlation)
+        : null;
+      if (input.correlation && suppliedCorrelation === null) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth correlation binding contains an invalid or oversized value.",
+          restartRequired: false,
+        });
+      }
       const sessionRow = yield* deps.fuma.use("oauth_session.findFirst", (db) =>
         looseDb(db).findFirst("oauth_session", {
           where: (b: any) => b("state", "=", String(input.state)),
         }),
       );
       if (!sessionRow) {
+        // The session is deleted after a successful completion. A caller that
+        // lost the callback can replay the same request by supplying its
+        // non-secret binding; recovery reads the durable receipt and never
+        // invokes the provider a second time.
+        if (suppliedCorrelation) {
+          yield* validateCompletionCorrelation(suppliedCorrelation);
+          const descriptorHash = yield* sha256Hex(
+            canonicalOAuthCorrelationBinding(suppliedCorrelation),
+          );
+          const receiptRow = yield* loadCompletionReceiptRow(suppliedCorrelation.attemptKey);
+          if (receiptRow) {
+            const receipt = receiptFromRow(receiptRow);
+            if (!receipt) {
+              return yield* new OAuthCompleteError({
+                message: "OAuth completion receipt is invalid; operator recovery is required.",
+                restartRequired: false,
+              });
+            }
+            if (!sameCorrelation(suppliedCorrelation, receipt)) {
+              return yield* new OAuthCompleteError({
+                message:
+                  "OAuth completion receipt does not match the supplied correlation binding.",
+                restartRequired: false,
+              });
+            }
+            if (receipt.descriptorHash !== descriptorHash) {
+              return yield* new OAuthCompleteError({
+                message: "OAuth completion descriptor does not match the durable receipt.",
+                restartRequired: false,
+              });
+            }
+            const requestHash = yield* requestHashForCompletion(
+              input.state,
+              input.code,
+              callbackDomain,
+              descriptorHash,
+            );
+            if (receipt.requestHash !== requestHash) {
+              return yield* new OAuthCompleteError({
+                message: "OAuth completion request does not match the durable receipt.",
+                restartRequired: false,
+              });
+            }
+            const connection = yield* deps.getConnection(connectionRefFromReceipt(receipt));
+            if (!connection) {
+              return yield* new OAuthCompleteError({
+                message:
+                  "OAuth completion receipt exists but its connection is unavailable; operator recovery is required.",
+                restartRequired: false,
+              });
+            }
+            return connection;
+          }
+        }
         return yield* new OAuthSessionNotFoundError({ state: input.state });
       }
       const session = {
@@ -1192,6 +1467,103 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         clientOwner:
           clientOwnerFromPayload(sessionRow.payload) ?? (String(sessionRow.owner) as Owner),
       };
+
+      const storedCorrelation = correlationFromPayload(sessionRow.payload);
+      const correlation = suppliedCorrelation ?? storedCorrelation;
+      if (storedCorrelation && !suppliedCorrelation) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth session requires its completion correlation binding.",
+          restartRequired: false,
+        });
+      }
+      if (suppliedCorrelation && !storedCorrelation) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth session does not carry the supplied correlation binding.",
+          restartRequired: false,
+        });
+      }
+      if (
+        suppliedCorrelation &&
+        storedCorrelation &&
+        !sameCorrelation(suppliedCorrelation, storedCorrelation)
+      ) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth correlation binding does not match the OAuth session.",
+          restartRequired: false,
+        });
+      }
+      if (correlation) yield* validateCompletionCorrelation(correlation);
+      const descriptorHash = correlation
+        ? yield* sha256Hex(canonicalOAuthCorrelationBinding(correlation))
+        : null;
+      const persistedDescriptorHash = correlation
+        ? (() => {
+            const decoded =
+              typeof sessionRow.payload === "string"
+                ? decodeJsonPayload(sessionRow.payload).pipe(Option.getOrElse(() => null))
+                : sessionRow.payload;
+            if (decoded === null || typeof decoded !== "object") return null;
+            const value = (decoded as Record<string, unknown>).descriptorHash;
+            return typeof value === "string" ? value : null;
+          })()
+        : null;
+      if (descriptorHash && persistedDescriptorHash && descriptorHash !== persistedDescriptorHash) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth session correlation descriptor is invalid; restart the flow.",
+          restartRequired: true,
+        });
+      }
+      const executionId = correlation ? executionIdFromPayload(sessionRow.payload) : null;
+      if (correlation && executionId === null) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth session is missing its completion execution id; restart the flow.",
+          restartRequired: true,
+        });
+      }
+
+      // A receipt may coexist briefly with the session when process loss occurs
+      // between the transaction commit and session deletion. Resolve it before
+      // checking expiry or loading the provider client so replay never exchanges
+      // the authorization code a second time.
+      if (correlation && descriptorHash) {
+        const receiptRow = yield* loadCompletionReceiptRow(correlation.attemptKey);
+        if (receiptRow) {
+          const receipt = receiptFromRow(receiptRow);
+          if (!receipt) {
+            return yield* new OAuthCompleteError({
+              message: "OAuth completion receipt is invalid; operator recovery is required.",
+              restartRequired: false,
+            });
+          }
+          if (!sameCorrelation(correlation, receipt) || receipt.descriptorHash !== descriptorHash) {
+            return yield* new OAuthCompleteError({
+              message: "OAuth completion receipt does not match the OAuth session.",
+              restartRequired: false,
+            });
+          }
+          const requestHash = yield* requestHashForCompletion(
+            input.state,
+            input.code,
+            callbackDomain,
+            descriptorHash,
+          );
+          if (receipt.requestHash !== requestHash) {
+            return yield* new OAuthCompleteError({
+              message: "OAuth completion request does not match the durable receipt.",
+              restartRequired: false,
+            });
+          }
+          const connection = yield* deps.getConnection(connectionRefFromReceipt(receipt));
+          if (!connection) {
+            return yield* new OAuthCompleteError({
+              message:
+                "OAuth completion receipt exists but its connection is unavailable; operator recovery is required.",
+              restartRequired: false,
+            });
+          }
+          return connection;
+        }
+      }
 
       // Expired sessions are not redeemable — drop + treat as not found.
       if (Number.isFinite(session.expiresAt) && session.expiresAt <= Date.now()) {
@@ -1224,10 +1596,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       // org's actual region, signalled back on the callback as `domain`/`site`.
       // Rebind the token host to that region when it is a sibling subdomain of
       // the configured host; otherwise this is a no-op.
-      const tokenUrl = rebindTokenEndpointHostToCallbackDomain(
-        client.tokenUrl,
-        input.callbackDomain,
-      );
+      const tokenUrl = rebindTokenEndpointHostToCallbackDomain(client.tokenUrl, callbackDomain);
 
       const token = yield* exchangeAuthorizationCode({
         tokenUrl,
@@ -1250,7 +1619,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         ),
       );
 
-      const connection = yield* mintFromToken(
+      const mint = mintFromToken(
         {
           owner: session.owner,
           name: session.name,
@@ -1278,8 +1647,92 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         ),
       );
 
+      let connection: Connection;
+      if (correlation && descriptorHash && executionId) {
+        const completedAt = new Date();
+        const startedAt = dateFromStored(sessionRow.created_at) ?? completedAt;
+        const durationMs = Math.min(
+          15 * 60 * 1000,
+          Math.max(0, completedAt.getTime() - startedAt.getTime()),
+        );
+        const requestHash = yield* requestHashForCompletion(
+          input.state,
+          input.code,
+          callbackDomain,
+          descriptorHash,
+        );
+        connection = yield* deps.fuma.transaction(
+          Effect.gen(function* () {
+            const minted = yield* mint;
+            yield* deps.fuma.use("oauth_completion_receipt.create", (db) =>
+              looseDb(db).create("oauth_completion_receipt", {
+                tenant: deps.tenant,
+                attempt_key: correlation.attemptKey,
+                actor_user_id: correlation.actorUserId,
+                organization_id: correlation.organizationId,
+                workspace_id: correlation.workspaceId,
+                provider: correlation.provider,
+                execution_id: executionId,
+                status: "completed",
+                result_reference: String(minted.address),
+                connection_owner: minted.owner,
+                connection_integration: String(minted.integration),
+                connection_name: String(minted.name),
+                connection_address: String(minted.address),
+                request_hash: requestHash,
+                descriptor_hash: descriptorHash,
+                started_at: startedAt,
+                completed_at: completedAt,
+                duration_ms: durationMs,
+                created_at: completedAt,
+              }),
+            );
+            return minted;
+          }),
+        );
+      } else {
+        connection = yield* mint;
+      }
+
       yield* deleteSession(input.state);
       return connection;
+    });
+
+  const getCompletionReceipt = (
+    input: OAuthCompletionReceiptLookupInput,
+  ): Effect.Effect<OAuthCompletionReceiptType | null, OAuthCompleteError | StorageFailure> =>
+    Effect.gen(function* () {
+      const correlation = normalizeCorrelation(input.correlation);
+      if (!correlation) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth correlation binding contains an invalid or oversized value.",
+          restartRequired: false,
+        });
+      }
+      yield* validateCompletionCorrelation(correlation);
+      const descriptorHash = yield* sha256Hex(canonicalOAuthCorrelationBinding(correlation));
+      const row = yield* loadCompletionReceiptRow(correlation.attemptKey);
+      if (!row) return null;
+      const receipt = receiptFromRow(row);
+      if (!receipt) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth completion receipt is invalid; operator recovery is required.",
+          restartRequired: false,
+        });
+      }
+      if (!sameCorrelation(correlation, receipt)) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth completion receipt does not match the supplied correlation binding.",
+          restartRequired: false,
+        });
+      }
+      if (receipt.descriptorHash !== descriptorHash) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth completion descriptor does not match the durable receipt.",
+          restartRequired: false,
+        });
+      }
+      return receipt;
     });
 
   // -----------------------------------------------------------------------
@@ -1422,6 +1875,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     listClients,
     start,
     complete,
+    getCompletionReceipt,
     cancel,
     probe,
   };

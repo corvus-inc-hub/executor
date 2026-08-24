@@ -21,6 +21,7 @@ import {
   definition,
   integration,
   oauth_client,
+  oauth_completion_receipt,
   oauth_session,
   plugin_storage,
   tool,
@@ -45,6 +46,9 @@ export const purgeOrganizationData = (db: DrizzleDb, organizationId: string): Pr
     await tx.delete(connection).where(eq(connection.tenant, organizationId));
     await tx.delete(integration).where(eq(integration.tenant, organizationId));
     await tx.delete(oauth_client).where(eq(oauth_client.tenant, organizationId));
+    await tx
+      .delete(oauth_completion_receipt)
+      .where(eq(oauth_completion_receipt.tenant, organizationId));
     await tx.delete(oauth_session).where(eq(oauth_session.tenant, organizationId));
     await tx.delete(tool_policy).where(eq(tool_policy.tenant, organizationId));
     await tx.delete(plugin_storage).where(eq(plugin_storage.tenant, organizationId));

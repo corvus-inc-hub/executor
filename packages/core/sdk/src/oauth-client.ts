@@ -25,6 +25,75 @@ import {
 
 export type OAuthGrant = "authorization_code" | "client_credentials";
 
+/** Versioned, non-secret binding supplied by a caller that needs a durable
+ * OAuth completion receipt. The executor treats the organization id as an
+ * assertion until it matches its authenticated tenant and treats every other
+ * value as an exact binding to the in-flight OAuth session. The provider here
+ * is the caller's provider identity (for example, `github`), not an upstream
+ * provider receipt or credential-store key. */
+export const OAUTH_CORRELATION_SCHEMA_VERSION = "executor.oauth-correlation.v1" as const;
+
+export const OAuthCorrelationBinding = Schema.Struct({
+  schemaVersion: Schema.Literal(OAUTH_CORRELATION_SCHEMA_VERSION),
+  attemptKey: Schema.NonEmptyString,
+  actorUserId: Schema.NonEmptyString,
+  organizationId: Schema.NonEmptyString,
+  workspaceId: Schema.NonEmptyString,
+  provider: Schema.NonEmptyString,
+}).annotate({ identifier: "OAuthCorrelationBinding" });
+
+export type OAuthCorrelationBinding = typeof OAuthCorrelationBinding.Type;
+
+/** Canonical JSON for the non-secret correlation descriptor. Keep the property
+ * order explicit because this string is hashed into the durable receipt. */
+export const canonicalOAuthCorrelationBinding = (binding: OAuthCorrelationBinding): string =>
+  JSON.stringify({
+    schemaVersion: binding.schemaVersion,
+    attemptKey: binding.attemptKey,
+    actorUserId: binding.actorUserId,
+    organizationId: binding.organizationId,
+    workspaceId: binding.workspaceId,
+    provider: binding.provider,
+  });
+
+export const OAUTH_COMPLETION_RECEIPT_SCHEMA_VERSION =
+  "executor.oauth-completion-receipt.v1" as const;
+
+/** The connection identity carried by an Executor receipt. It is deliberately
+ * metadata-only and contains no access, refresh, client, or provider secret. */
+export const OAuthCompletionConnectionIdentity = Schema.Struct({
+  owner: Schema.Literals(["org", "user"]),
+  integration: Schema.NonEmptyString,
+  name: Schema.NonEmptyString,
+  address: Schema.NonEmptyString,
+}).annotate({ identifier: "OAuthCompletionConnectionIdentity" });
+
+/** Executor-owned completion evidence. `provider` is the caller's correlation
+ * label. This contract does not claim or contain provider-native evidence. */
+export const OAuthCompletionReceipt = Schema.Struct({
+  schemaVersion: Schema.Literal(OAUTH_COMPLETION_RECEIPT_SCHEMA_VERSION),
+  receiptKind: Schema.Literal("executor.oauth.completion"),
+  attemptKey: Schema.NonEmptyString,
+  actorUserId: Schema.NonEmptyString,
+  organizationId: Schema.NonEmptyString,
+  workspaceId: Schema.NonEmptyString,
+  executionId: Schema.NonEmptyString,
+  status: Schema.Literal("completed"),
+  resultReference: Schema.NonEmptyString,
+  provider: Schema.NonEmptyString,
+  connection: OAuthCompletionConnectionIdentity,
+  requestHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  descriptorHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  startedAt: Schema.String,
+  completedAt: Schema.String,
+  durationMs: Schema.Finite.check(
+    Schema.isGreaterThanOrEqualTo(0),
+    Schema.isLessThanOrEqualTo(15 * 60 * 1000),
+  ),
+}).annotate({ identifier: "OAuthCompletionReceipt" });
+
+export type OAuthCompletionReceipt = typeof OAuthCompletionReceipt.Type;
+
 /** Provider OAuth config an integration declares as one of its auth templates —
  *  what to request. (The flow itself runs off the self-contained OAuthClient.)
  *  Keyed `kind: "oauth2"` like every auth method across the plugins. */
@@ -125,6 +194,9 @@ export interface OAuthStartInput {
   readonly identityLabel?: string | null;
   /** Browser-facing callback URL for this flow. Defaults to the executor's configured redirectUri. */
   readonly redirectUri?: string | null;
+  /** Optional non-secret caller binding. When present, completion is receipt-ledgered
+   * and every completion/recovery call must present the same binding. */
+  readonly correlation?: OAuthCorrelationBinding;
 }
 
 export interface OAuthCompleteInput {
@@ -135,6 +207,13 @@ export interface OAuthCompleteInput {
    *  org's actual region rather than the statically advertised one. Used only
    *  when it is a sibling subdomain of the client's configured token host. */
   readonly callbackDomain?: string | null;
+  /** The non-secret caller binding recorded by `start`. It is required for a
+   * correlated receipt-ledgered session; legacy unbound sessions may omit it. */
+  readonly correlation?: OAuthCorrelationBinding;
+}
+
+export interface OAuthCompletionReceiptLookupInput {
+  readonly correlation: OAuthCorrelationBinding;
 }
 
 /** Probe a base/issuer URL for OAuth 2.1 authorization-server metadata so the
@@ -282,6 +361,12 @@ export interface OAuthService {
   readonly complete: (
     input: OAuthCompleteInput,
   ) => Effect.Effect<Connection, OAuthCompleteError | OAuthSessionNotFoundError | StorageFailure>;
+  /** Read the immutable Executor completion receipt after a callback response
+   * was lost. A missing receipt is represented by `null`; the binding is still
+   * checked against the authenticated tenant and the persisted attempt. */
+  readonly getCompletionReceipt: (
+    input: OAuthCompletionReceiptLookupInput,
+  ) => Effect.Effect<OAuthCompletionReceipt | null, OAuthCompleteError | StorageFailure>;
   readonly cancel: (state: OAuthState) => Effect.Effect<void, StorageFailure>;
   readonly probe: (
     input: OAuthProbeInput,

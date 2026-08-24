@@ -11,7 +11,11 @@ import {
   ToolName,
 } from "./ids";
 import { decodeOAuthCallbackState } from "./oauth";
-import { OAuthStartError } from "./oauth-client";
+import {
+  OAUTH_CORRELATION_SCHEMA_VERSION,
+  OAuthCompleteError,
+  OAuthStartError,
+} from "./oauth-client";
 import { missingGrantedOAuthScopes } from "./oauth-service";
 import { definePlugin } from "./plugin";
 import { makeTestWorkspaceHarness, memoryCredentialsPlugin } from "./test-config";
@@ -191,6 +195,108 @@ describe("oauth.start / oauth.complete", () => {
           expect(yield* server.acceptsAccessToken(out.token)).toBe(true);
         }),
       ),
+  );
+
+  it.effect("writes an immutable completion receipt and replays without a second exchange", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor } = yield* makeTestWorkspaceHarness({ plugins });
+        yield* executor.acme.seed();
+
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+
+        const correlation = {
+          schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
+          attemptKey: "attempt-oauth-receipt-1",
+          actorUserId: "test-subject",
+          organizationId: "test-tenant",
+          workspaceId: "workspace-1",
+          provider: "github",
+        } as const;
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("receipt-account"),
+          integration: INTEG,
+          template: TEMPLATE,
+          correlation,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        const missingCorrelation = yield* Effect.flip(
+          executor.oauth.complete({ state: started.state, code: callback.code }),
+        );
+        expect(Predicate.isTagged("OAuthCompleteError")(missingCorrelation)).toBe(true);
+        const completed = yield* executor.oauth.complete({
+          state: started.state,
+          code: callback.code,
+          correlation,
+        });
+        const receipt = yield* executor.oauth.getCompletionReceipt({ correlation });
+        expect(receipt).not.toBeNull();
+        if (receipt === null) return;
+        expect(receipt.status).toBe("completed");
+        expect(receipt.receiptKind).toBe("executor.oauth.completion");
+        expect(receipt.attemptKey).toBe(correlation.attemptKey);
+        expect(receipt.provider).toBe("github");
+        expect(receipt.connection.address).toBe(String(completed.address));
+        expect(receipt.durationMs).toBeGreaterThanOrEqual(0);
+        expect(receipt.durationMs).toBeLessThanOrEqual(15 * 60 * 1000);
+
+        // The receipt is metadata-only. Neither OAuth client secret nor the
+        // one-time authorization code may cross the durable result boundary.
+        const serializedReceipt = JSON.stringify(receipt);
+        expect(serializedReceipt).not.toContain("test-secret");
+        expect(serializedReceipt).not.toContain(callback.code);
+        expect(serializedReceipt).not.toContain("access_token");
+        expect(serializedReceipt).not.toContain("refresh_token");
+
+        const requestsBeforeReplay = (yield* server.requests).filter(
+          (request) => request.path === "/token",
+        ).length;
+        const replayed = yield* executor.oauth.complete({
+          state: started.state,
+          code: callback.code,
+          correlation,
+        });
+        const requestsAfterReplay = (yield* server.requests).filter(
+          (request) => request.path === "/token",
+        ).length;
+        expect(String(replayed.address)).toBe(String(completed.address));
+        expect(requestsAfterReplay).toBe(requestsBeforeReplay);
+
+        const providerMismatch = yield* Effect.flip(
+          executor.oauth.complete({
+            state: started.state,
+            code: callback.code,
+            correlation: { ...correlation, provider: "linear" },
+          }),
+        );
+        expect(Predicate.isTagged("OAuthCompleteError")(providerMismatch)).toBe(true);
+        expect(providerMismatch).toBeInstanceOf(OAuthCompleteError);
+
+        const tenantMismatch = yield* Effect.flip(
+          executor.oauth.getCompletionReceipt({
+            correlation: { ...correlation, organizationId: "other-tenant" },
+          }),
+        );
+        expect(Predicate.isTagged("OAuthCompleteError")(tenantMismatch)).toBe(true);
+      }),
+    ),
   );
 
   it.effect("carries the URL org selector in provider state without changing redirect_uri", () =>

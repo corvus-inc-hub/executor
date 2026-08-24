@@ -14,22 +14,7 @@
 
 import { Encoding, Option, Result, Schema } from "effect";
 
-export {
-  type OAuthGrant,
-  type OAuthAuthentication,
-  type OAuthClient,
-  type CreateOAuthClientInput,
-  type ConnectResult,
-  type OAuthStartInput,
-  type OAuthCompleteInput,
-  type OAuthProbeInput,
-  type OAuthProbeResult,
-  type OAuthService,
-  OAuthStartError,
-  OAuthCompleteError,
-  OAuthProbeError,
-  OAuthSessionNotFoundError,
-} from "./oauth-client";
+export * from "./oauth-client";
 
 /** The canonical credential-provider key OAuth-minted connections persist
  *  their access token under (the default writable store). */

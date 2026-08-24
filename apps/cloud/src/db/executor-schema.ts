@@ -125,6 +125,36 @@ export const oauth_session = pgTable(
   (table) => [uniqueIndex("oauth_session_uidx").on(table.tenant, table.state)],
 );
 
+export const oauth_completion_receipt = pgTable(
+  "oauth_completion_receipt",
+  {
+    attempt_key: varchar("attempt_key", { length: 255 }).notNull(),
+    actor_user_id: varchar("actor_user_id", { length: 255 }).notNull(),
+    organization_id: varchar("organization_id", { length: 255 }).notNull(),
+    workspace_id: varchar("workspace_id", { length: 255 }).notNull(),
+    provider: varchar("provider", { length: 255 }).notNull(),
+    execution_id: varchar("execution_id", { length: 255 }).notNull(),
+    status: varchar("status", { length: 255 }).notNull(),
+    result_reference: text("result_reference").notNull(),
+    connection_owner: varchar("connection_owner", { length: 255 }).notNull(),
+    connection_integration: varchar("connection_integration", { length: 255 }).notNull(),
+    connection_name: varchar("connection_name", { length: 255 }).notNull(),
+    connection_address: text("connection_address").notNull(),
+    request_hash: varchar("request_hash", { length: 255 }).notNull(),
+    descriptor_hash: varchar("descriptor_hash", { length: 255 }).notNull(),
+    started_at: timestamp("started_at").notNull(),
+    completed_at: timestamp("completed_at").notNull(),
+    duration_ms: bigint("duration_ms", { mode: "bigint" }).notNull(),
+    created_at: timestamp("created_at").notNull(),
+    row_id: varchar("row_id", { length: 255 })
+      .primaryKey()
+      .notNull()
+      .$defaultFn(() => createId()),
+    tenant: varchar("tenant", { length: 255 }).notNull(),
+  },
+  (table) => [uniqueIndex("oauth_completion_receipt_uidx").on(table.tenant, table.attempt_key)],
+);
+
 export const tool = pgTable(
   "tool",
   {

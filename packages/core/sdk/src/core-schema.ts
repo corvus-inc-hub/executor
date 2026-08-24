@@ -255,6 +255,37 @@ export const coreTables = defineTables({
     ["tenant", "state"],
   ),
 
+  // Immutable, tenant-scoped evidence that an authorization-code completion
+  // minted a connection. This is Executor evidence only: `provider` is the
+  // caller's non-secret correlation label, never a provider-native receipt.
+  // Credential values, OAuth codes, client secrets, and refresh material are
+  // intentionally absent. The attempt key is unique per tenant so a lost
+  // callback can be recovered without re-running the provider exchange.
+  oauth_completion_receipt: tenantExecutorTable(
+    "oauth_completion_receipt",
+    {
+      attempt_key: keyColumn("attempt_key"),
+      actor_user_id: keyColumn("actor_user_id"),
+      organization_id: keyColumn("organization_id"),
+      workspace_id: keyColumn("workspace_id"),
+      provider: keyColumn("provider"),
+      execution_id: keyColumn("execution_id"),
+      status: keyColumn("status"),
+      result_reference: textColumn("result_reference"),
+      connection_owner: keyColumn("connection_owner"),
+      connection_integration: keyColumn("connection_integration"),
+      connection_name: keyColumn("connection_name"),
+      connection_address: textColumn("connection_address"),
+      request_hash: keyColumn("request_hash"),
+      descriptor_hash: keyColumn("descriptor_hash"),
+      started_at: dateColumn("started_at"),
+      completed_at: dateColumn("completed_at"),
+      duration_ms: bigintColumn("duration_ms"),
+      created_at: dateColumn("created_at"),
+    },
+    ["tenant", "attempt_key"],
+  ),
+
   // Persisted, per-connection tools (option C). Address is derived from
   // (integration, owner, connection, name).
   tool: ownedExecutorTable(
@@ -332,6 +363,7 @@ export type IntegrationRow = FumaRow<CoreSchema["integration"]>;
 export type ConnectionRow = FumaRow<CoreSchema["connection"]>;
 export type OAuthClientRow = FumaRow<CoreSchema["oauth_client"]>;
 export type OAuthSessionRow = FumaRow<CoreSchema["oauth_session"]>;
+export type OAuthCompletionReceiptRow = FumaRow<CoreSchema["oauth_completion_receipt"]>;
 export type ToolRow = FumaRow<CoreSchema["tool"]>;
 /** The tool-row projection the invoke/list hot paths load: everything except
  *  the heavy `input_schema`/`output_schema` JSON, which only `tools.schema`

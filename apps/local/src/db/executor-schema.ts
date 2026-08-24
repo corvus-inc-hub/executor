@@ -109,6 +109,33 @@ export const oauth_session = sqliteTable(
   (table) => [uniqueIndex("oauth_session_uidx").on(table.tenant, table.state)],
 );
 
+export const oauth_completion_receipt = sqliteTable(
+  "oauth_completion_receipt",
+  {
+    attempt_key: text("attempt_key").notNull(),
+    actor_user_id: text("actor_user_id").notNull(),
+    organization_id: text("organization_id").notNull(),
+    workspace_id: text("workspace_id").notNull(),
+    provider: text("provider").notNull(),
+    execution_id: text("execution_id").notNull(),
+    status: text("status").notNull(),
+    result_reference: text("result_reference").notNull(),
+    connection_owner: text("connection_owner").notNull(),
+    connection_integration: text("connection_integration").notNull(),
+    connection_name: text("connection_name").notNull(),
+    connection_address: text("connection_address").notNull(),
+    request_hash: text("request_hash").notNull(),
+    descriptor_hash: text("descriptor_hash").notNull(),
+    started_at: integer("started_at").notNull(),
+    completed_at: integer("completed_at").notNull(),
+    duration_ms: integer("duration_ms").notNull(),
+    created_at: integer("created_at").notNull(),
+    row_id: text("row_id").primaryKey().notNull(),
+    tenant: text("tenant").notNull(),
+  },
+  (table) => [uniqueIndex("oauth_completion_receipt_uidx").on(table.tenant, table.attempt_key)],
+);
+
 export const tool = sqliteTable(
   "tool",
   {
