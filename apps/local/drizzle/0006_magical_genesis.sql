@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX `oauth_session_attempt_uidx` ON `oauth_session` (`tenant`,`attempt_key`);

@@ -24,7 +24,7 @@ import {
 import { definePlugin, tool, type StaticToolSchema } from "./plugin";
 import { ToolPolicyActionSchema } from "./policies";
 import type { Tool } from "./tool";
-import { OAuthCorrelationBinding } from "./oauth-client";
+import { OAuthCorrelationEnvelope } from "./oauth-client";
 
 const schemaToStandard = <A, I>(schema: Schema.Decoder<A, I>): StaticToolSchema<A, I> =>
   Schema.toStandardSchemaV1(Schema.toStandardJSONSchemaV1(schema) as never) as StaticToolSchema<
@@ -310,7 +310,7 @@ const OAuthStartInput = Schema.Struct({
   template: Schema.String,
   identityLabel: Schema.optional(Schema.NullOr(Schema.String)),
   redirectUri: Schema.optional(Schema.NullOr(Schema.String)),
-  correlation: Schema.optional(OAuthCorrelationBinding),
+  correlation: Schema.optional(OAuthCorrelationEnvelope),
 });
 const OAuthStartOutput = Schema.Union([
   Schema.Struct({

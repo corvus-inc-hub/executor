@@ -25,13 +25,12 @@ import {
 
 export type OAuthGrant = "authorization_code" | "client_credentials";
 
-/** Versioned, non-secret binding supplied by a caller that needs a durable
- * OAuth completion receipt. The executor treats the organization id as an
- * assertion until it matches its authenticated tenant and treats every other
- * value as an exact binding to the in-flight OAuth session. The provider here
- * is the caller's provider identity (for example, `github`), not an upstream
- * provider receipt or credential-store key. */
-export const OAUTH_CORRELATION_SCHEMA_VERSION = "executor.oauth-correlation.v1" as const;
+/** Versioned, non-secret binding supplied by a trusted host for a durable
+ * OAuth completion receipt. The values are signed by the host and verified by
+ * the Executor before they become an attempt binding. `workspaceId` is not
+ * inferred from caller JSON: a host verifier must resolve it against its
+ * authenticated target authority. */
+export const OAUTH_CORRELATION_SCHEMA_VERSION = "executor.oauth-correlation.v2" as const;
 
 export const OAuthCorrelationBinding = Schema.Struct({
   schemaVersion: Schema.Literal(OAUTH_CORRELATION_SCHEMA_VERSION),
@@ -43,6 +42,52 @@ export const OAuthCorrelationBinding = Schema.Struct({
 }).annotate({ identifier: "OAuthCorrelationBinding" });
 
 export type OAuthCorrelationBinding = typeof OAuthCorrelationBinding.Type;
+
+/** Server-signed envelope carried by start, complete, and the browser callback
+ * state. The signature covers `canonicalOAuthCorrelationEnvelopePayload`; the
+ * host verifier owns the key, audience, expiry, and workspace lookup. No
+ * secret is present in this envelope. */
+export const OAuthCorrelationEnvelope = Schema.Struct({
+  schemaVersion: Schema.Literal(OAUTH_CORRELATION_SCHEMA_VERSION),
+  attemptKey: Schema.NonEmptyString,
+  actorUserId: Schema.NonEmptyString,
+  organizationId: Schema.NonEmptyString,
+  workspaceId: Schema.NonEmptyString,
+  provider: Schema.NonEmptyString,
+  keyId: Schema.NonEmptyString,
+  issuedAt: Schema.NonEmptyString,
+  expiresAt: Schema.NonEmptyString,
+  signature: Schema.NonEmptyString,
+}).annotate({ identifier: "OAuthCorrelationEnvelope" });
+
+export type OAuthCorrelationEnvelope = typeof OAuthCorrelationEnvelope.Type;
+
+/** Canonical, signature-excluded JSON payload for the server-signed envelope.
+ * Hosts sign this exact property order and verify the same bytes before
+ * returning an authoritative binding to the Executor. */
+export const canonicalOAuthCorrelationEnvelopePayload = (
+  envelope: OAuthCorrelationEnvelope,
+): string =>
+  JSON.stringify({
+    schemaVersion: envelope.schemaVersion,
+    attemptKey: envelope.attemptKey,
+    actorUserId: envelope.actorUserId,
+    organizationId: envelope.organizationId,
+    workspaceId: envelope.workspaceId,
+    provider: envelope.provider,
+    keyId: envelope.keyId,
+    issuedAt: envelope.issuedAt,
+    expiresAt: envelope.expiresAt,
+  });
+
+/** Host authority for signed correlation. The host MUST verify the envelope's
+ * signature and lifetime, authenticate the organization and actor, resolve the
+ * workspace target, and return the authoritative binding. Missing verifiers
+ * are a hard failure for correlated OAuth; the Executor never falls back to
+ * treating the envelope's caller-provided workspace/provider as authority. */
+export type OAuthCorrelationVerifier = (
+  envelope: OAuthCorrelationEnvelope,
+) => Effect.Effect<OAuthCorrelationBinding, StorageFailure>;
 
 /** Canonical JSON for the non-secret correlation descriptor. Keep the property
  * order explicit because this string is hashed into the durable receipt. */
@@ -194,9 +239,9 @@ export interface OAuthStartInput {
   readonly identityLabel?: string | null;
   /** Browser-facing callback URL for this flow. Defaults to the executor's configured redirectUri. */
   readonly redirectUri?: string | null;
-  /** Optional non-secret caller binding. When present, completion is receipt-ledgered
-   * and every completion/recovery call must present the same binding. */
-  readonly correlation?: OAuthCorrelationBinding;
+  /** Optional server-signed binding. When present, completion is
+   * receipt-ledgered and the host verifier must be configured. */
+  readonly correlation?: OAuthCorrelationEnvelope;
 }
 
 export interface OAuthCompleteInput {
@@ -207,13 +252,13 @@ export interface OAuthCompleteInput {
    *  org's actual region rather than the statically advertised one. Used only
    *  when it is a sibling subdomain of the client's configured token host. */
   readonly callbackDomain?: string | null;
-  /** The non-secret caller binding recorded by `start`. It is required for a
-   * correlated receipt-ledgered session; legacy unbound sessions may omit it. */
-  readonly correlation?: OAuthCorrelationBinding;
+  /** The signed binding recorded by `start`. Browser callbacks derive this
+   * from the signed state envelope; legacy unbound sessions may omit it. */
+  readonly correlation?: OAuthCorrelationEnvelope;
 }
 
 export interface OAuthCompletionReceiptLookupInput {
-  readonly correlation: OAuthCorrelationBinding;
+  readonly correlation: OAuthCorrelationEnvelope;
 }
 
 /** Probe a base/issuer URL for OAuth 2.1 authorization-server metadata so the

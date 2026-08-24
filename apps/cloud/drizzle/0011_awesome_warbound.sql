@@ -21,5 +21,4 @@ CREATE TABLE "oauth_completion_receipt" (
 	"tenant" varchar(255) NOT NULL
 );
 --> statement-breakpoint
-ALTER TABLE "definition" ALTER COLUMN "name" SET DATA TYPE varchar(255);--> statement-breakpoint
 CREATE UNIQUE INDEX "oauth_completion_receipt_uidx" ON "oauth_completion_receipt" USING btree ("tenant","attempt_key");

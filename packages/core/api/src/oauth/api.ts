@@ -24,7 +24,7 @@ import {
   OAuthClientSlug,
   OAuthCompleteError,
   OAuthCompletionReceipt,
-  OAuthCorrelationBinding,
+  OAuthCorrelationEnvelope,
   OAuthProbeError,
   OAuthRegisterDynamicError,
   OAuthSessionNotFoundError,
@@ -164,7 +164,7 @@ const StartPayload = Schema.Struct({
   template: AuthTemplateSlug,
   identityLabel: Schema.optional(Schema.NullOr(Schema.String)),
   redirectUri: Schema.optional(Schema.NullOr(Schema.String)),
-  correlation: Schema.optional(OAuthCorrelationBinding),
+  correlation: Schema.optional(OAuthCorrelationEnvelope),
 });
 
 const StartResponse = Schema.Union([
@@ -189,12 +189,12 @@ const CompletePayload = Schema.Struct({
   /** Regional host echoed back by the authorization server (Datadog's
    *  `domain`/`site`); forwarded so the code is redeemed at the org's region. */
   callbackDomain: Schema.optional(Schema.NullOr(Schema.String)),
-  /** Non-secret caller binding. Required when `oauth/start` created a
-   * receipt-ledgered session; legacy unbound sessions may omit it. */
-  correlation: Schema.optional(OAuthCorrelationBinding),
+  /** Host-signed correlation envelope. Browser callbacks may carry it in
+   * OAuth state; legacy unbound sessions may omit it. */
+  correlation: Schema.optional(OAuthCorrelationEnvelope),
 });
 
-// A receipt lookup is deliberately binding-shaped rather than attempt-key-only:
+// A receipt lookup is deliberately envelope-shaped rather than attempt-key-only:
 // the Executor validates the tenant, actor, workspace, and provider before
 // returning any durable completion evidence.
 const ReceiptLookupParams = { attemptKey: Schema.NonEmptyString };
@@ -203,6 +203,10 @@ const ReceiptLookupQuery = Schema.Struct({
   organizationId: Schema.NonEmptyString,
   workspaceId: Schema.NonEmptyString,
   provider: Schema.NonEmptyString,
+  keyId: Schema.NonEmptyString,
+  issuedAt: Schema.NonEmptyString,
+  expiresAt: Schema.NonEmptyString,
+  signature: Schema.NonEmptyString,
 });
 
 // ---------------------------------------------------------------------------

@@ -195,6 +195,10 @@ export const OAuthHandlers = HttpApiBuilder.group(ExecutorApi, "oauth", (handler
               organizationId: query.organizationId,
               workspaceId: query.workspaceId,
               provider: query.provider,
+              keyId: query.keyId,
+              issuedAt: query.issuedAt,
+              expiresAt: query.expiresAt,
+              signature: query.signature,
             },
           });
         }),
@@ -224,7 +228,7 @@ export const OAuthHandlers = HttpApiBuilder.group(ExecutorApi, "oauth", (handler
         Effect.gen(function* () {
           const executor = yield* ExecutorService;
           const html = yield* runOAuthCallback({
-            complete: ({ state, code, callbackDomain }) =>
+            complete: ({ state, code, callbackDomain, correlation }) =>
               executor.oauth
                 .complete({
                   // `runOAuthCallback`'s `state` is a raw string from the URL;
@@ -232,6 +236,7 @@ export const OAuthHandlers = HttpApiBuilder.group(ExecutorApi, "oauth", (handler
                   state: OAuthState.make(state),
                   code: code ?? "",
                   callbackDomain,
+                  ...(correlation ? { correlation } : {}),
                 })
                 .pipe(
                   Effect.tapError((cause: unknown) =>

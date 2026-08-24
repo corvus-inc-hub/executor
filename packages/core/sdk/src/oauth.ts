@@ -13,6 +13,10 @@
 // ---------------------------------------------------------------------------
 
 import { Encoding, Option, Result, Schema } from "effect";
+import {
+  OAuthCorrelationEnvelope,
+  type OAuthCorrelationEnvelope as OAuthCorrelationEnvelopeType,
+} from "./oauth-client";
 
 export * from "./oauth-client";
 
@@ -25,7 +29,8 @@ export const OAUTH2_SESSION_TTL_MS = 15 * 60 * 1000;
 
 const OAuthCallbackStateSchema = Schema.Struct({
   state: Schema.String,
-  orgSlug: Schema.String,
+  orgSlug: Schema.optional(Schema.String),
+  correlation: Schema.optional(OAuthCorrelationEnvelope),
 });
 
 export type OAuthCallbackState = typeof OAuthCallbackStateSchema.Type;
@@ -44,10 +49,17 @@ const encodeOAuthCallbackStateJson = Schema.encodeSync(OAuthCallbackStateFromJso
 export const encodeOAuthCallbackState = (input: {
   readonly state: string;
   readonly orgSlug?: string | null;
+  readonly correlation?: OAuthCorrelationEnvelopeType | null;
 }): string => {
   const orgSlug = input.orgSlug?.trim();
-  if (!orgSlug) return input.state;
-  return Encoding.encodeBase64Url(encodeOAuthCallbackStateJson({ state: input.state, orgSlug }));
+  if (!orgSlug && !input.correlation) return input.state;
+  return Encoding.encodeBase64Url(
+    encodeOAuthCallbackStateJson({
+      state: input.state,
+      ...(orgSlug ? { orgSlug } : {}),
+      ...(input.correlation ? { correlation: input.correlation } : {}),
+    }),
+  );
 };
 
 /** Decode a callback state value minted by `encodeOAuthCallbackState`.
@@ -63,6 +75,11 @@ export const decodeOAuthCallbackState = (
   if (json === null) return null;
   const decoded = Option.getOrNull(decodeOAuthCallbackStateJson(json));
   if (decoded === null) return null;
-  const orgSlug = decoded.orgSlug.trim();
-  return orgSlug ? { state: decoded.state, orgSlug } : null;
+  const orgSlug = decoded.orgSlug?.trim();
+  if (!orgSlug && !decoded.correlation) return null;
+  return {
+    state: decoded.state,
+    ...(orgSlug ? { orgSlug } : {}),
+    ...(decoded.correlation ? { correlation: decoded.correlation } : {}),
+  };
 };

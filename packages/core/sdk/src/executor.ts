@@ -92,7 +92,7 @@ import {
   type MintOAuthConnectionInput,
   type OAuthScopePolicy,
 } from "./oauth-service";
-import type { OAuthService } from "./oauth-client";
+import type { OAuthCorrelationVerifier, OAuthService } from "./oauth-client";
 import {
   comparePolicyRow,
   isValidPattern,
@@ -427,6 +427,10 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
   readonly redirectUri?: string;
   /** Optional URL selected organization slug to carry inside OAuth `state`. */
   readonly oauthCallbackStateOrgSlug?: string;
+  /** Host authority for correlated OAuth. It verifies the signed envelope,
+   * authenticates actor/organization, and resolves the workspace target. If
+   * absent, correlated OAuth fails closed. */
+  readonly verifyOAuthCorrelation?: OAuthCorrelationVerifier;
   readonly oauthEndpointUrlPolicy?: OAuthEndpointUrlPolicy;
   /**
    * Enable the built-in `core-tools` plugin which contributes agent-facing
@@ -3866,6 +3870,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       // OAuth (cloud, self-host) derive a real `${webBaseUrl}/oauth/callback`.
       redirectUri: config.redirectUri ?? null,
       callbackStateOrgSlug: config.oauthCallbackStateOrgSlug ?? null,
+      verifyCorrelationEnvelope: config.verifyOAuthCorrelation,
     });
 
     // ------------------------------------------------------------------

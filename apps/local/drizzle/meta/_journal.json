@@ -36,6 +36,20 @@
       "when": 1787594789878,
       "tag": "0004_real_mikhail_rasputin",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1787599272401,
+      "tag": "0005_aspiring_sabra",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1787600112049,
+      "tag": "0006_magical_genesis",
+      "breakpoints": true
     }
   ]
 }

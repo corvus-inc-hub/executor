@@ -7,7 +7,11 @@
 
 import { describe, expect, it } from "@effect/vitest";
 import { Data, Effect, Schema } from "effect";
-import { encodeOAuthCallbackState } from "@executor-js/sdk";
+import {
+  encodeOAuthCallbackState,
+  OAUTH_CORRELATION_SCHEMA_VERSION,
+  type OAuthCorrelationEnvelope,
+} from "@executor-js/sdk";
 
 import {
   OAUTH_POPUP_MESSAGE_TYPE,
@@ -181,6 +185,7 @@ describe("runOAuthCallback", () => {
       code: string | null;
       error: string | null;
       callbackDomain: string | null;
+      correlation: OAuthCorrelationEnvelope | null;
     }> = [];
     await Effect.runPromise(
       runOAuthCallback<GoogleAuth, never, never>({
@@ -200,18 +205,43 @@ describe("runOAuthCallback", () => {
       }),
     );
     expect(received).toEqual([
-      { state: "s1", code: "code1", error: null, callbackDomain: "us5.datadoghq.com" },
+      {
+        state: "s1",
+        code: "code1",
+        error: null,
+        callbackDomain: "us5.datadoghq.com",
+        correlation: null,
+      },
     ]);
   });
 
   it("completes wrapped callback state with the raw OAuth session state", async () => {
-    const providerState = encodeOAuthCallbackState({ state: "session-raw", orgSlug: "default" });
-    const received: Array<{ state: string }> = [];
+    const correlation: OAuthCorrelationEnvelope = {
+      schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
+      attemptKey: "attempt-popup-1",
+      actorUserId: "actor-1",
+      organizationId: "org-1",
+      workspaceId: "workspace-1",
+      provider: "acme",
+      keyId: "test",
+      issuedAt: "2026-08-24T19:00:00.000Z",
+      expiresAt: "2026-08-24T20:00:00.000Z",
+      signature: "signed-by-host",
+    };
+    const providerState = encodeOAuthCallbackState({
+      state: "session-raw",
+      orgSlug: "default",
+      correlation,
+    });
+    const received: Array<{
+      state: string;
+      correlation: OAuthCorrelationEnvelope | null;
+    }> = [];
 
     const html = await Effect.runPromise(
       runOAuthCallback<GoogleAuth, never, never>({
         complete: (params) => {
-          received.push({ state: params.state });
+          received.push({ state: params.state, correlation: params.correlation });
           return Effect.succeed({
             kind: "oauth2",
             accessTokenSecretId: "s",
@@ -224,7 +254,7 @@ describe("runOAuthCallback", () => {
       }),
     );
 
-    expect(received).toEqual([{ state: "session-raw" }]);
+    expect(received).toEqual([{ state: "session-raw", correlation }]);
     expect(html).toContain('"sessionId":"session-raw"');
     expect(html).not.toContain(`"sessionId":"${providerState}"`);
   });

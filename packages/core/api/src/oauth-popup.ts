@@ -15,6 +15,7 @@ import { Cause, Effect } from "effect";
 import {
   decodeOAuthCallbackState,
   OAUTH_POPUP_MESSAGE_TYPE,
+  type OAuthCorrelationEnvelope,
   type OAuthPopupResult,
 } from "@executor-js/sdk";
 
@@ -152,6 +153,7 @@ export type RunOAuthCallbackInput<TAuth, E, R> = {
     readonly code: string | null;
     readonly error: string | null;
     readonly callbackDomain: string | null;
+    readonly correlation: OAuthCorrelationEnvelope | null;
   }) => Effect.Effect<TAuth, E, R>;
   readonly urlParams: OAuthCallbackUrlParams;
   /** Map a plugin-specific error into a short summary and optional details. */
@@ -192,6 +194,7 @@ export const runOAuthCallback = <TAuth, E, R>(
             code: input.urlParams.code ?? null,
             error: null,
             callbackDomain: input.urlParams.domain ?? input.urlParams.site ?? null,
+            correlation: callbackState?.correlation ?? null,
           })
           .pipe(
             Effect.map(

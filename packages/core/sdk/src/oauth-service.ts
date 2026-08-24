@@ -37,8 +37,10 @@ import {
   OAuthSessionNotFoundError,
   OAuthStartError,
   OAUTH_COMPLETION_RECEIPT_SCHEMA_VERSION,
+  OAUTH_CORRELATION_SCHEMA_VERSION,
   OAuthCompletionReceipt,
   OAuthCorrelationBinding,
+  OAuthCorrelationEnvelope,
   canonicalOAuthCorrelationBinding,
   type ConnectResult,
   type CreateOAuthClientInput,
@@ -48,6 +50,8 @@ import {
   type OAuthCompletionReceiptLookupInput,
   type OAuthCompletionReceipt as OAuthCompletionReceiptType,
   type OAuthCorrelationBinding as OAuthCorrelationBindingType,
+  type OAuthCorrelationEnvelope as OAuthCorrelationEnvelopeType,
+  type OAuthCorrelationVerifier,
   type OAuthGrant,
   type OAuthProbeInput,
   type OAuthProbeResult,
@@ -136,6 +140,9 @@ export interface OAuthServiceDeps {
   ) => Effect.Effect<Connection, StorageFailure>;
   /** Load a connection for an idempotent completion replay. */
   readonly getConnection: (ref: ConnectionRef) => Effect.Effect<Connection | null, StorageFailure>;
+  /** Host-authenticated verifier for signed correlation envelopes. Correlated
+   * flows fail closed when this authority is not configured. */
+  readonly verifyCorrelationEnvelope?: OAuthCorrelationVerifier;
   /**
    * Resolve the OAuth scope policy for a `(integration, template)`:
    *  - `{ kind: "scopes", scopes }`: the scopes the integration's auth template
@@ -180,6 +187,7 @@ type LooseDb = {
     name: string,
     options: unknown,
   ) => Promise<readonly Record<string, unknown>[]>;
+  readonly updateMany: (name: string, options: unknown) => Promise<void>;
 };
 const looseDb = (db: unknown): LooseDb => db as LooseDb;
 
@@ -262,7 +270,14 @@ export const missingGrantedOAuthScopes = (
 
 const decodeJsonPayload = Schema.decodeUnknownOption(Schema.UnknownFromJsonString);
 const decodeOAuthCorrelation = Schema.decodeUnknownOption(OAuthCorrelationBinding);
+const decodeOAuthCorrelationEnvelope = Schema.decodeUnknownOption(OAuthCorrelationEnvelope);
 const decodeOAuthCompletionReceipt = Schema.decodeUnknownOption(OAuthCompletionReceipt);
+
+const OAUTH_ATTEMPT_LEASE_MS = 30_000;
+const OAUTH_ATTEMPT_WAIT_MS = 30_000;
+const OAUTH_ATTEMPT_POLL_MS = 100;
+
+type OAuthAttemptStatus = "pending" | "exchanging" | "completed" | "failed";
 
 /** Extract the persisted `requestedScopes` from an `oauth_session.payload`. The
  *  jsonColumn may surface as a parsed object (in-memory backends) or a JSON
@@ -302,14 +317,12 @@ const correlationFromPayload = (payload: unknown): OAuthCorrelationBindingType |
   return Option.getOrNull(decodeOAuthCorrelation(value));
 };
 
-const executionIdFromPayload = (payload: unknown): string | null => {
+const envelopeFromStored = (value: unknown): OAuthCorrelationEnvelopeType | null => {
   const decoded =
-    typeof payload === "string"
-      ? decodeJsonPayload(payload).pipe(Option.getOrElse(() => payload))
-      : payload;
-  if (decoded === null || typeof decoded !== "object") return null;
-  const value = (decoded as Record<string, unknown>).executionId;
-  return typeof value === "string" && value.trim().length > 0 ? value : null;
+    typeof value === "string"
+      ? decodeJsonPayload(value).pipe(Option.getOrElse(() => value))
+      : value;
+  return decoded == null ? null : Option.getOrNull(decodeOAuthCorrelationEnvelope(decoded));
 };
 
 const correlationFieldIsSafe = (value: string): boolean => {
@@ -324,7 +337,7 @@ const correlationFieldIsSafe = (value: string): boolean => {
 const normalizeCorrelation = (
   input: OAuthCorrelationBindingType,
 ): OAuthCorrelationBindingType | null => {
-  if (input.schemaVersion !== "executor.oauth-correlation.v1") return null;
+  if (input.schemaVersion !== "executor.oauth-correlation.v2") return null;
   const normalized = {
     schemaVersion: input.schemaVersion,
     attemptKey: input.attemptKey.trim(),
@@ -339,6 +352,40 @@ const normalizeCorrelation = (
     ? normalized
     : null;
 };
+
+const normalizeCorrelationEnvelope = (
+  input: OAuthCorrelationEnvelopeType,
+): OAuthCorrelationEnvelopeType | null => {
+  if (input.schemaVersion !== "executor.oauth-correlation.v2") return null;
+  const normalized = {
+    schemaVersion: input.schemaVersion,
+    attemptKey: input.attemptKey.trim(),
+    actorUserId: input.actorUserId.trim(),
+    organizationId: input.organizationId.trim(),
+    workspaceId: input.workspaceId.trim(),
+    provider: input.provider.trim(),
+    keyId: input.keyId.trim(),
+    issuedAt: input.issuedAt.trim(),
+    expiresAt: input.expiresAt.trim(),
+    signature: input.signature.trim(),
+  } satisfies OAuthCorrelationEnvelopeType;
+  return Object.values(normalized).every(
+    (value) => typeof value === "string" && correlationFieldIsSafe(value),
+  )
+    ? normalized
+    : null;
+};
+
+const bindingFromEnvelope = (
+  envelope: OAuthCorrelationEnvelopeType,
+): OAuthCorrelationBindingType => ({
+  schemaVersion: envelope.schemaVersion,
+  attemptKey: envelope.attemptKey,
+  actorUserId: envelope.actorUserId,
+  organizationId: envelope.organizationId,
+  workspaceId: envelope.workspaceId,
+  provider: envelope.provider,
+});
 
 const dateFromStored = (value: unknown): Date | null => {
   if (value instanceof Date) {
@@ -700,6 +747,269 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           ),
       }),
     );
+
+  const verifySignedCorrelation = (
+    input: OAuthCorrelationEnvelopeType,
+  ): Effect.Effect<OAuthCorrelationBindingType, StorageFailure> => {
+    const envelope = normalizeCorrelationEnvelope(input);
+    if (!envelope) {
+      return Effect.fail(
+        new StorageError({
+          message: "OAuth correlation envelope is invalid or oversized.",
+          cause: undefined,
+        }),
+      );
+    }
+    if (!deps.verifyCorrelationEnvelope) {
+      return Effect.fail(
+        new StorageError({
+          message: "OAuth correlation verification authority is not configured.",
+          cause: undefined,
+        }),
+      );
+    }
+    return deps.verifyCorrelationEnvelope(envelope).pipe(
+      Effect.flatMap((binding) => {
+        const normalized = normalizeCorrelation(binding);
+        const envelopeBinding = bindingFromEnvelope(envelope);
+        if (
+          !normalized ||
+          normalized.attemptKey !== envelopeBinding.attemptKey ||
+          normalized.actorUserId !== envelopeBinding.actorUserId ||
+          normalized.organizationId !== envelopeBinding.organizationId ||
+          normalized.provider !== envelopeBinding.provider
+        ) {
+          return Effect.fail(
+            new StorageError({
+              message: "OAuth correlation verifier returned a mismatched binding.",
+              cause: undefined,
+            }),
+          );
+        }
+        return Effect.succeed(normalized);
+      }),
+    );
+  };
+
+  const trustedCorrelationForStart = (
+    envelope: OAuthCorrelationEnvelopeType,
+    provider: string,
+  ): Effect.Effect<OAuthCorrelationBindingType, OAuthStartError | StorageFailure> =>
+    verifySignedCorrelation(envelope).pipe(
+      Effect.mapError(
+        (cause) =>
+          new OAuthStartError({
+            // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: the verifier exposes a typed StorageFailure message
+            message: cause.message,
+          }),
+      ),
+      Effect.flatMap((binding) => {
+        if (binding.organizationId !== deps.tenant) {
+          return Effect.fail(
+            new OAuthStartError({
+              message:
+                "OAuth correlation binding organization does not match the authenticated organization.",
+            }),
+          );
+        }
+        if (deps.subject === null || binding.actorUserId !== deps.subject) {
+          return Effect.fail(
+            new OAuthStartError({
+              message: "Correlated OAuth requires the authenticated actor subject.",
+            }),
+          );
+        }
+        if (binding.provider !== provider) {
+          return Effect.fail(
+            new OAuthStartError({
+              message: "OAuth correlation provider does not match the selected integration.",
+            }),
+          );
+        }
+        return Effect.succeed(binding);
+      }),
+    );
+
+  const loadAttemptByKey = (
+    attemptKey: string,
+  ): Effect.Effect<Record<string, unknown> | null, StorageFailure> =>
+    deps.fuma.use("oauth_attempt.findFirst", (db) =>
+      looseDb(db).findFirst("oauth_attempt", {
+        where: (b: any) => b("attempt_key", "=", attemptKey),
+      }),
+    );
+
+  const attemptBindingFromRow = (
+    row: Record<string, unknown>,
+  ): OAuthCorrelationBindingType | null => {
+    const binding = {
+      schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
+      attemptKey: String(row.attempt_key ?? ""),
+      actorUserId: String(row.actor_user_id ?? ""),
+      organizationId: String(row.organization_id ?? ""),
+      workspaceId: String(row.workspace_id ?? ""),
+      provider: String(row.provider ?? ""),
+    } satisfies OAuthCorrelationBindingType;
+    return normalizeCorrelation(binding);
+  };
+
+  const reserveAttemptAndSession = (input: {
+    readonly keys: { readonly tenant: string; readonly owner: Owner; readonly subject: string };
+    readonly state: OAuthState;
+    readonly authorizationUrl: string;
+    readonly flowRedirectUri: string;
+    readonly verifier: string;
+    readonly now: Date;
+    readonly expiresAt: number;
+    readonly client: OAuthClientSlug;
+    readonly clientOwner: Owner;
+    readonly owner: Owner;
+    readonly integration: IntegrationSlug;
+    readonly name: ConnectionName;
+    readonly template: AuthTemplateSlug;
+    readonly identityLabel: string | null | undefined;
+    readonly requestedScopes: readonly string[];
+    readonly correlation: OAuthCorrelationBindingType;
+    readonly envelope: OAuthCorrelationEnvelopeType;
+    readonly descriptorHash: string;
+    readonly executionId: string;
+  }): Effect.Effect<boolean, StorageFailure> =>
+    deps.fuma
+      .transaction(
+        Effect.gen(function* () {
+          yield* deps.fuma.use("oauth_attempt.create", (db) =>
+            looseDb(db).create("oauth_attempt", {
+              tenant: input.keys.tenant,
+              attempt_key: input.correlation.attemptKey,
+              state: String(input.state),
+              actor_user_id: input.correlation.actorUserId,
+              organization_id: input.correlation.organizationId,
+              workspace_id: input.correlation.workspaceId,
+              provider: input.correlation.provider,
+              integration: String(input.integration),
+              execution_id: input.executionId,
+              descriptor_hash: input.descriptorHash,
+              status: "pending",
+              lease_token: null,
+              lease_expires_at: null,
+              authorization_url: input.authorizationUrl,
+              started_at: input.now,
+              updated_at: input.now,
+              completed_at: null,
+            }),
+          );
+          yield* deps.fuma.use("oauth_session.create", (db) =>
+            looseDb(db).create("oauth_session", {
+              tenant: input.keys.tenant,
+              owner: input.keys.owner,
+              subject: input.keys.subject,
+              state: String(input.state),
+              client_slug: String(input.client),
+              integration: String(input.integration),
+              name: String(input.name),
+              template: String(input.template),
+              redirect_url: input.flowRedirectUri,
+              pkce_verifier: input.verifier,
+              identity_label: input.identityLabel ?? null,
+              payload: {
+                owner: input.owner,
+                clientOwner: input.clientOwner,
+                requestedScopes: input.requestedScopes,
+              },
+              attempt_key: input.correlation.attemptKey,
+              actor_user_id: input.correlation.actorUserId,
+              workspace_id: input.correlation.workspaceId,
+              provider: input.correlation.provider,
+              descriptor_hash: input.descriptorHash,
+              execution_id: input.executionId,
+              correlation_envelope: input.envelope,
+              expires_at: input.expiresAt,
+              created_at: input.now,
+            }),
+          );
+        }),
+      )
+      .pipe(
+        Effect.as(true),
+        Effect.catchTag("UniqueViolationError", () => Effect.succeed(false)),
+      );
+
+  const claimAttempt = (
+    attemptKey: string,
+  ): Effect.Effect<
+    | { readonly kind: "claimed"; readonly token: string }
+    | { readonly kind: "completed" }
+    | { readonly kind: "waiting" }
+    | { readonly kind: "missing" }
+    | { readonly kind: "failed" },
+    StorageFailure
+  > =>
+    Effect.gen(function* () {
+      const row = yield* loadAttemptByKey(attemptKey);
+      if (!row) return { kind: "missing" } as const;
+      const status = String(row.status) as OAuthAttemptStatus;
+      if (status === "completed") return { kind: "completed" } as const;
+      if (status === "failed") return { kind: "failed" } as const;
+      const leaseExpiresAt = row.lease_expires_at == null ? 0 : Number(row.lease_expires_at);
+      if (status === "exchanging" && leaseExpiresAt > Date.now()) {
+        return { kind: "waiting" } as const;
+      }
+      const token = crypto.randomUUID();
+      const now = Date.now();
+      yield* deps.fuma.transaction(
+        Effect.gen(function* () {
+          yield* deps.fuma.use("oauth_attempt.claim", (db) =>
+            looseDb(db).updateMany("oauth_attempt", {
+              // The predicate is the claim. It makes pending -> exchanging
+              // atomic and only lets a lease-expired owner take recovery; a
+              // concurrent callback cannot silently replace a live owner.
+              where: (b: any) =>
+                b.and(
+                  b("attempt_key", "=", attemptKey),
+                  b.or(
+                    b("status", "=", "pending"),
+                    b.and(b("status", "=", "exchanging"), b("lease_expires_at", "<=", now)),
+                  ),
+                ),
+              set: {
+                status: "exchanging",
+                lease_token: token,
+                lease_expires_at: now + OAUTH_ATTEMPT_LEASE_MS,
+                updated_at: new Date(now),
+              },
+            }),
+          );
+        }),
+      );
+      const claimed = yield* loadAttemptByKey(attemptKey);
+      if (claimed?.lease_token === token && String(claimed.status) === "exchanging") {
+        return { kind: "claimed", token } as const;
+      }
+      return { kind: "waiting" } as const;
+    });
+
+  const waitForAttemptWinner = (
+    attemptKey: string,
+  ): Effect.Effect<"completed" | "retry" | "failed", StorageFailure> =>
+    Effect.gen(function* () {
+      const deadline = Date.now() + OAUTH_ATTEMPT_WAIT_MS;
+      while (Date.now() < deadline) {
+        yield* Effect.promise(
+          () => new Promise<void>((resolve) => setTimeout(resolve, OAUTH_ATTEMPT_POLL_MS)),
+        );
+        const row = yield* loadAttemptByKey(attemptKey);
+        if (!row) return "retry" as const;
+        const status = String(row.status) as OAuthAttemptStatus;
+        if (status === "completed") {
+          return "completed" as const;
+        }
+        if (status === "failed") return "failed" as const;
+        if (status !== "exchanging" || Number(row.lease_expires_at ?? 0) <= Date.now()) {
+          return "retry" as const;
+        }
+      }
+      return "retry" as const;
+    });
 
   // -----------------------------------------------------------------------
   // createClient — write the oauth_client row.
@@ -1171,6 +1481,11 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
 
       // client_credentials: exchange immediately and mint the connection.
       if (client.grant === "client_credentials") {
+        if (input.correlation) {
+          return yield* new OAuthStartError({
+            message: "Durable OAuth completion correlation requires authorization_code.",
+          });
+        }
         const token = yield* exchangeClientCredentials({
           tokenUrl: client.tokenUrl,
           clientId: client.clientId,
@@ -1226,72 +1541,32 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           ? requestedScopes
           : yield* filterAuthorizationCodeScopes(client, requestedScopes);
 
-      // authorization_code: persist a session + build the authorize URL.
+      // Correlated authorization-code flows are host-authorized. The selected
+      // integration is the authoritative provider identity; unsigned caller
+      // JSON cannot relabel the attempt.
+      const provider = String(input.integration);
+      const envelope = input.correlation ? normalizeCorrelationEnvelope(input.correlation) : null;
+      if (input.correlation && envelope === null) {
+        return yield* new OAuthStartError({
+          message: "OAuth correlation envelope is invalid or oversized.",
+        });
+      }
+      const correlation = envelope ? yield* trustedCorrelationForStart(envelope, provider) : null;
+      const descriptorHash = correlation
+        ? yield* sha256Hex(canonicalOAuthCorrelationBinding(correlation))
+        : null;
+      const executionId = correlation ? crypto.randomUUID() : null;
+
+      // authorization_code: build the authorize URL and reserve the durable
+      // attempt/session together before returning a browser redirect.
       const verifier = createPkceCodeVerifier();
       const challenge = yield* Effect.promise(() => createPkceCodeChallenge(verifier));
       const state = OAuthState.make(createOAuthState());
       const providerState = encodeOAuthCallbackState({
         state: String(state),
         orgSlug: deps.callbackStateOrgSlug,
+        correlation: envelope,
       });
-
-      const correlation = input.correlation ? normalizeCorrelation(input.correlation) : null;
-      if (input.correlation && correlation === null) {
-        return yield* new OAuthStartError({
-          message: "OAuth correlation binding contains an invalid or oversized value.",
-        });
-      }
-      if (correlation && correlation.organizationId !== deps.tenant) {
-        return yield* new OAuthStartError({
-          message:
-            "OAuth correlation binding organization does not match the authenticated organization.",
-        });
-      }
-      if (correlation && deps.subject !== null && correlation.actorUserId !== deps.subject) {
-        return yield* new OAuthStartError({
-          message: "OAuth correlation binding actor does not match the authenticated user.",
-        });
-      }
-      const descriptorHash = correlation
-        ? yield* sha256Hex(canonicalOAuthCorrelationBinding(correlation))
-        : null;
-      const executionId = correlation ? crypto.randomUUID() : null;
-
-      const now = new Date();
-      const expiresAt = Date.now() + OAUTH2_SESSION_TTL_MS;
-      yield* deps.fuma.use("oauth_session.create", (db) =>
-        looseDb(db).create("oauth_session", {
-          tenant: keys.tenant,
-          owner: keys.owner,
-          subject: keys.subject,
-          state: String(state),
-          client_slug: String(input.client),
-          integration: String(input.integration),
-          name: String(input.name),
-          template: String(input.template),
-          redirect_url: flowRedirectUri,
-          pkce_verifier: verifier,
-          identity_label: input.identityLabel ?? null,
-          // Persist the requested scope set (declared ∪ client, filtered to the
-          // authorization-code flow) so `complete`'s recorded-scope fallback
-          // reflects exactly what was requested when the AS omits `scope`,
-          // without re-resolving the integration's declared scopes at completion.
-          payload: {
-            owner: input.owner,
-            clientOwner: input.clientOwner,
-            requestedScopes: authorizationRequestedScopes,
-            ...(correlation
-              ? {
-                  correlation,
-                  descriptorHash,
-                  executionId,
-                }
-              : {}),
-          },
-          expires_at: expiresAt,
-          created_at: now,
-        }),
-      );
 
       const authorizationUrl = yield* Effect.try({
         try: () =>
@@ -1316,7 +1591,95 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           }),
       });
 
-      return { status: "redirect", authorizationUrl, state } as const;
+      if (!correlation || !descriptorHash || !executionId || !envelope) {
+        const now = new Date();
+        const expiresAt = Date.now() + OAUTH2_SESSION_TTL_MS;
+        yield* deps.fuma.use("oauth_session.create", (db) =>
+          looseDb(db).create("oauth_session", {
+            tenant: keys.tenant,
+            owner: keys.owner,
+            subject: keys.subject,
+            state: String(state),
+            client_slug: String(input.client),
+            integration: String(input.integration),
+            name: String(input.name),
+            template: String(input.template),
+            redirect_url: flowRedirectUri,
+            pkce_verifier: verifier,
+            identity_label: input.identityLabel ?? null,
+            payload: {
+              owner: input.owner,
+              clientOwner: input.clientOwner,
+              requestedScopes: authorizationRequestedScopes,
+            },
+            attempt_key: null,
+            actor_user_id: null,
+            workspace_id: null,
+            provider: null,
+            descriptor_hash: null,
+            execution_id: null,
+            correlation_envelope: null,
+            expires_at: expiresAt,
+            created_at: now,
+          }),
+        );
+        return { status: "redirect", authorizationUrl, state } as const;
+      }
+
+      const now = new Date();
+      const expiresAt = Date.now() + OAUTH2_SESSION_TTL_MS;
+      const reserved = yield* reserveAttemptAndSession({
+        keys,
+        state,
+        authorizationUrl,
+        flowRedirectUri,
+        verifier,
+        now,
+        expiresAt,
+        client: input.client,
+        clientOwner: input.clientOwner,
+        owner: input.owner,
+        integration: input.integration,
+        name: input.name,
+        template: input.template,
+        identityLabel: input.identityLabel,
+        requestedScopes: authorizationRequestedScopes,
+        correlation,
+        envelope,
+        descriptorHash,
+        executionId,
+      });
+      if (reserved) return { status: "redirect", authorizationUrl, state } as const;
+
+      // Same attempt key is idempotent. A conflicting binding is rejected;
+      // otherwise return the original redirect or the durable winner.
+      const existing = yield* loadAttemptByKey(correlation.attemptKey);
+      const existingBinding = existing ? attemptBindingFromRow(existing) : null;
+      if (!existing || !existingBinding || !sameCorrelation(existingBinding, correlation)) {
+        return yield* new OAuthStartError({
+          message: "OAuth attempt key is already reserved for a different binding.",
+        });
+      }
+      if (String(existing.status) === "completed") {
+        const row = yield* deps.fuma.use("oauth_completion_receipt.findFirst", (db) =>
+          looseDb(db).findFirst("oauth_completion_receipt", {
+            where: (b: any) => b("attempt_key", "=", correlation.attemptKey),
+          }),
+        );
+        const receipt = row ? receiptFromRow(row) : null;
+        const connection = receipt
+          ? yield* deps.getConnection(connectionRefFromReceipt(receipt))
+          : null;
+        if (connection) return { status: "connected", connection } as const;
+        return yield* new OAuthStartError({
+          message: "Completed OAuth attempt is missing its connection receipt.",
+        });
+      }
+      return {
+        status: "redirect",
+        authorizationUrl: String(existing.authorization_url),
+        state: OAuthState.make(String(existing.state)),
+      } as const;
     });
 
   // -----------------------------------------------------------------------
@@ -1349,6 +1712,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
 
   const validateCompletionCorrelation = (
     correlation: OAuthCorrelationBindingType,
+    expectedProvider?: string,
   ): Effect.Effect<void, OAuthCompleteError> => {
     if (correlation.organizationId !== deps.tenant) {
       return Effect.fail(
@@ -1359,10 +1723,18 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         }),
       );
     }
-    if (deps.subject !== null && correlation.actorUserId !== deps.subject) {
+    if (deps.subject === null || correlation.actorUserId !== deps.subject) {
       return Effect.fail(
         new OAuthCompleteError({
-          message: "OAuth correlation binding actor does not match the authenticated user.",
+          message: "Correlated OAuth requires the authenticated actor subject.",
+          restartRequired: false,
+        }),
+      );
+    }
+    if (expectedProvider !== undefined && correlation.provider !== expectedProvider) {
+      return Effect.fail(
+        new OAuthCompleteError({
+          message: "OAuth correlation provider does not match the OAuth session.",
           restartRequired: false,
         }),
       );
@@ -1370,17 +1742,33 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     return Effect.void;
   };
 
+  const trustedCorrelationForComplete = (
+    envelope: OAuthCorrelationEnvelopeType,
+    expectedProvider?: string,
+  ): Effect.Effect<OAuthCorrelationBindingType, OAuthCompleteError | StorageFailure> =>
+    verifySignedCorrelation(envelope).pipe(
+      Effect.mapError(
+        (cause) =>
+          new OAuthCompleteError({
+            // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: the verifier exposes a typed StorageFailure message
+            message: cause.message,
+            restartRequired: false,
+          }),
+      ),
+      Effect.tap((binding) => validateCompletionCorrelation(binding, expectedProvider)),
+    );
+
   const complete = (
     input: OAuthCompleteInput,
   ): Effect.Effect<Connection, OAuthCompleteError | OAuthSessionNotFoundError | StorageFailure> =>
     Effect.gen(function* () {
       const callbackDomain = input.callbackDomain?.trim() || null;
-      const suppliedCorrelation = input.correlation
-        ? normalizeCorrelation(input.correlation)
+      const suppliedEnvelope = input.correlation
+        ? normalizeCorrelationEnvelope(input.correlation)
         : null;
-      if (input.correlation && suppliedCorrelation === null) {
+      if (input.correlation && suppliedEnvelope === null) {
         return yield* new OAuthCompleteError({
-          message: "OAuth correlation binding contains an invalid or oversized value.",
+          message: "OAuth correlation envelope is invalid or oversized.",
           restartRequired: false,
         });
       }
@@ -1394,8 +1782,8 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         // lost the callback can replay the same request by supplying its
         // non-secret binding; recovery reads the durable receipt and never
         // invokes the provider a second time.
-        if (suppliedCorrelation) {
-          yield* validateCompletionCorrelation(suppliedCorrelation);
+        if (suppliedEnvelope) {
+          const suppliedCorrelation = yield* trustedCorrelationForComplete(suppliedEnvelope);
           const descriptorHash = yield* sha256Hex(
             canonicalOAuthCorrelationBinding(suppliedCorrelation),
           );
@@ -1466,17 +1854,38 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         // owner for same-owner connects.
         clientOwner:
           clientOwnerFromPayload(sessionRow.payload) ?? (String(sessionRow.owner) as Owner),
+        attemptKey: sessionRow.attempt_key == null ? null : String(sessionRow.attempt_key),
+        actorUserId: sessionRow.actor_user_id == null ? null : String(sessionRow.actor_user_id),
+        workspaceId: sessionRow.workspace_id == null ? null : String(sessionRow.workspace_id),
+        provider: sessionRow.provider == null ? null : String(sessionRow.provider),
+        descriptorHashStored:
+          sessionRow.descriptor_hash == null ? null : String(sessionRow.descriptor_hash),
+        executionIdStored: sessionRow.execution_id == null ? null : String(sessionRow.execution_id),
+        correlationEnvelope: envelopeFromStored(sessionRow.correlation_envelope),
       };
 
-      const storedCorrelation = correlationFromPayload(sessionRow.payload);
+      const firstClassStoredCorrelation =
+        session.attemptKey && session.actorUserId && session.workspaceId && session.provider
+          ? normalizeCorrelation({
+              schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
+              attemptKey: session.attemptKey,
+              actorUserId: session.actorUserId,
+              organizationId: deps.tenant,
+              workspaceId: session.workspaceId,
+              provider: session.provider,
+            })
+          : null;
+      const storedCorrelation =
+        firstClassStoredCorrelation ??
+        (session.correlationEnvelope
+          ? normalizeCorrelation(bindingFromEnvelope(session.correlationEnvelope))
+          : null) ??
+        correlationFromPayload(sessionRow.payload);
+      const suppliedCorrelation = suppliedEnvelope
+        ? yield* trustedCorrelationForComplete(suppliedEnvelope, session.provider ?? undefined)
+        : null;
       const correlation = suppliedCorrelation ?? storedCorrelation;
-      if (storedCorrelation && !suppliedCorrelation) {
-        return yield* new OAuthCompleteError({
-          message: "OAuth session requires its completion correlation binding.",
-          restartRequired: false,
-        });
-      }
-      if (suppliedCorrelation && !storedCorrelation) {
+      if (storedCorrelation && suppliedCorrelation === null && suppliedEnvelope) {
         return yield* new OAuthCompleteError({
           message: "OAuth session does not carry the supplied correlation binding.",
           restartRequired: false,
@@ -1492,28 +1901,19 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           restartRequired: false,
         });
       }
-      if (correlation) yield* validateCompletionCorrelation(correlation);
+      if (correlation)
+        yield* validateCompletionCorrelation(correlation, session.provider ?? undefined);
       const descriptorHash = correlation
         ? yield* sha256Hex(canonicalOAuthCorrelationBinding(correlation))
         : null;
-      const persistedDescriptorHash = correlation
-        ? (() => {
-            const decoded =
-              typeof sessionRow.payload === "string"
-                ? decodeJsonPayload(sessionRow.payload).pipe(Option.getOrElse(() => null))
-                : sessionRow.payload;
-            if (decoded === null || typeof decoded !== "object") return null;
-            const value = (decoded as Record<string, unknown>).descriptorHash;
-            return typeof value === "string" ? value : null;
-          })()
-        : null;
+      const persistedDescriptorHash = session.descriptorHashStored;
       if (descriptorHash && persistedDescriptorHash && descriptorHash !== persistedDescriptorHash) {
         return yield* new OAuthCompleteError({
           message: "OAuth session correlation descriptor is invalid; restart the flow.",
           restartRequired: true,
         });
       }
-      const executionId = correlation ? executionIdFromPayload(sessionRow.payload) : null;
+      const executionId = correlation ? session.executionIdStored : null;
       if (correlation && executionId === null) {
         return yield* new OAuthCompleteError({
           message: "OAuth session is missing its completion execution id; restart the flow.",
@@ -1565,6 +1965,55 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         }
       }
 
+      const correlatedAttemptKey = correlation?.attemptKey;
+      let claim = correlatedAttemptKey ? yield* claimAttempt(correlatedAttemptKey) : null;
+      while (claim && claim.kind === "waiting") {
+        const winner = yield* waitForAttemptWinner(correlatedAttemptKey ?? "");
+        if (winner === "completed") {
+          const row = yield* loadCompletionReceiptRow(correlatedAttemptKey ?? "");
+          const receipt = row ? receiptFromRow(row) : null;
+          const connection = receipt
+            ? yield* deps.getConnection(connectionRefFromReceipt(receipt))
+            : null;
+          if (connection) return connection;
+          return yield* new OAuthCompleteError({
+            message: "OAuth attempt completed without a recoverable connection receipt.",
+            restartRequired: false,
+          });
+        }
+        if (winner === "failed") {
+          return yield* new OAuthCompleteError({
+            message: "OAuth attempt failed; restart the flow.",
+            restartRequired: true,
+          });
+        }
+        claim = yield* claimAttempt(correlatedAttemptKey ?? "");
+      }
+      if (claim && claim.kind === "completed") {
+        const row = yield* loadCompletionReceiptRow(correlatedAttemptKey ?? "");
+        const receipt = row ? receiptFromRow(row) : null;
+        const connection = receipt
+          ? yield* deps.getConnection(connectionRefFromReceipt(receipt))
+          : null;
+        if (connection) return connection;
+        return yield* new OAuthCompleteError({
+          message: "OAuth attempt completed without a recoverable connection receipt.",
+          restartRequired: false,
+        });
+      }
+      if (claim && claim.kind === "failed") {
+        return yield* new OAuthCompleteError({
+          message: "OAuth attempt failed; restart the flow.",
+          restartRequired: true,
+        });
+      }
+      if (claim && claim.kind === "missing") {
+        return yield* new OAuthCompleteError({
+          message: "OAuth attempt reservation is missing; restart the flow.",
+          restartRequired: true,
+        });
+      }
+
       // Expired sessions are not redeemable — drop + treat as not found.
       if (Number.isFinite(session.expiresAt) && session.expiresAt <= Date.now()) {
         yield* deleteSession(input.state);
@@ -1598,54 +2047,122 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       // the configured host; otherwise this is a no-op.
       const tokenUrl = rebindTokenEndpointHostToCallbackDomain(client.tokenUrl, callbackDomain);
 
-      const token = yield* exchangeAuthorizationCode({
-        tokenUrl,
-        clientId: client.clientId,
-        clientSecret: client.clientSecret,
-        redirectUrl: session.redirectUrl,
-        codeVerifier: session.pkceVerifier,
-        code: input.code,
-        resource: client.resource ?? undefined,
-        endpointUrlPolicy: deps.endpointUrlPolicy,
-        fetch,
-      }).pipe(
-        Effect.mapError(
-          (cause) =>
-            new OAuthCompleteError({
-              // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: OAuth2Error carries a typed `message` field
-              message: `OAuth code exchange failed: ${cause.message}`,
-              restartRequired: cause.error === "invalid_grant",
-            }),
-        ),
-      );
-
-      const mint = mintFromToken(
-        {
+      const intent = correlation ? yield* loadCredentialIntent(correlation.attemptKey) : null;
+      let mint: Effect.Effect<Connection, OAuthCompleteError | StorageFailure>;
+      const recoveredIntent = intent
+        ? yield* mintFromStoredIntent(intent).pipe(Effect.catch(() => Effect.succeed(null)))
+        : null;
+      if (recoveredIntent) {
+        mint = deps.mintOAuthConnection(recoveredIntent).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OAuthCompleteError({
+                // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: minting exposes a typed StorageFailure message
+                message: `Failed to mint OAuth connection: ${cause.message}`,
+                restartRequired: false,
+              }),
+          ),
+        );
+      } else {
+        const token = yield* exchangeAuthorizationCode({
+          tokenUrl,
+          clientId: client.clientId,
+          clientSecret: client.clientSecret,
+          redirectUrl: session.redirectUrl,
+          codeVerifier: session.pkceVerifier,
+          code: input.code,
+          resource: client.resource ?? undefined,
+          endpointUrlPolicy: deps.endpointUrlPolicy,
+          fetch,
+        }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new OAuthCompleteError({
+                // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: OAuth2Error carries a typed `message` field
+                message: `OAuth code exchange failed: ${cause.message}`,
+                restartRequired: cause.error === "invalid_grant",
+              }),
+          ),
+        );
+        const target = {
           owner: session.owner,
           name: session.name,
           integration: session.integration,
           template: session.template,
           identityLabel: session.identityLabel ?? token.idTokenIdentityLabel ?? null,
-        },
-        client,
-        token,
-        // The scopes `start` requested (the integration's declared set), persisted
-        // on the session. Empty only for a corrupt/legacy session with no payload.
-        session.requestedScopes ?? [],
-        session.clientOwner,
-        // Persist the regional token endpoint ONLY when it differs from the
-        // client's configured one, so refresh redeems against the same region.
-        tokenUrl === client.tokenUrl ? null : tokenUrl,
-      ).pipe(
-        Effect.mapError(
-          (cause) =>
-            new OAuthCompleteError({
-              // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
-              message: `Failed to mint OAuth connection: ${cause.message}`,
-              restartRequired: false,
-            }),
-        ),
-      );
+        };
+        if (correlation) {
+          // Establish the durable intent before any provider write. The intent
+          // must survive an external write that outlives a rolled-back DB txn.
+          const stored = yield* persistCredentialIntent({
+            attemptKey: correlation.attemptKey,
+            target,
+            client,
+            token,
+            requestedScopes: session.requestedScopes ?? [],
+            clientOwner: session.clientOwner,
+            oauthTokenUrl: tokenUrl === client.tokenUrl ? null : tokenUrl,
+          }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OAuthCompleteError({
+                  // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
+                  message: `Failed to persist OAuth credential intent: ${cause.message}`,
+                  restartRequired: false,
+                }),
+            ),
+          );
+          mint = deps
+            .mintOAuthConnection({
+              owner: target.owner,
+              name: target.name,
+              integration: target.integration,
+              template: target.template,
+              identityLabel: target.identityLabel ?? null,
+              provider: String(stored.provider.key),
+              itemId: stored.itemId,
+              oauthClient: OAuthClientSlug.make(client.slug),
+              oauthClientOwner: session.clientOwner,
+              refreshItemId: stored.refreshItemId,
+              expiresAt: stored.expiresAt,
+              oauthScope: stored.oauthScope,
+              missingOAuthScopes: stored.missingOAuthScopes,
+              oauthTokenUrl: tokenUrl === client.tokenUrl ? null : tokenUrl,
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OAuthCompleteError({
+                    // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
+                    message: `Failed to mint OAuth connection: ${cause.message}`,
+                    restartRequired: false,
+                  }),
+              ),
+            );
+        } else {
+          mint = mintFromToken(
+            target,
+            client,
+            token,
+            // The scopes `start` requested (the integration's declared set), persisted
+            // on the session. Empty only for a corrupt/legacy session with no payload.
+            session.requestedScopes ?? [],
+            session.clientOwner,
+            // Persist the regional token endpoint ONLY when it differs from the
+            // client's configured one, so refresh redeems against the same region.
+            tokenUrl === client.tokenUrl ? null : tokenUrl,
+          ).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OAuthCompleteError({
+                  // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
+                  message: `Failed to mint OAuth connection: ${cause.message}`,
+                  restartRequired: false,
+                }),
+            ),
+          );
+        }
+      }
 
       let connection: Connection;
       if (correlation && descriptorHash && executionId) {
@@ -1661,9 +2178,12 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           callbackDomain,
           descriptorHash,
         );
-        connection = yield* deps.fuma.transaction(
+        // Provider writes and connection minting are external to the receipt
+        // transaction. The durable credential intent makes this recoverable if
+        // the process dies after minting but before the metadata commit.
+        connection = yield* mint;
+        yield* deps.fuma.transaction(
           Effect.gen(function* () {
-            const minted = yield* mint;
             yield* deps.fuma.use("oauth_completion_receipt.create", (db) =>
               looseDb(db).create("oauth_completion_receipt", {
                 tenant: deps.tenant,
@@ -1674,11 +2194,11 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
                 provider: correlation.provider,
                 execution_id: executionId,
                 status: "completed",
-                result_reference: String(minted.address),
-                connection_owner: minted.owner,
-                connection_integration: String(minted.integration),
-                connection_name: String(minted.name),
-                connection_address: String(minted.address),
+                result_reference: String(connection.address),
+                connection_owner: connection.owner,
+                connection_integration: String(connection.integration),
+                connection_name: String(connection.name),
+                connection_address: String(connection.address),
                 request_hash: requestHash,
                 descriptor_hash: descriptorHash,
                 started_at: startedAt,
@@ -1687,7 +2207,19 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
                 created_at: completedAt,
               }),
             );
-            return minted;
+            yield* markCredentialIntentCommitted(correlation.attemptKey, completedAt);
+            yield* deps.fuma.use("oauth_attempt.complete", (db) =>
+              looseDb(db).updateMany("oauth_attempt", {
+                where: (b: any) => b("attempt_key", "=", correlation.attemptKey),
+                set: {
+                  status: "completed",
+                  lease_token: null,
+                  lease_expires_at: null,
+                  updated_at: completedAt,
+                  completed_at: completedAt,
+                },
+              }),
+            );
           }),
         );
       } else {
@@ -1702,14 +2234,14 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     input: OAuthCompletionReceiptLookupInput,
   ): Effect.Effect<OAuthCompletionReceiptType | null, OAuthCompleteError | StorageFailure> =>
     Effect.gen(function* () {
-      const correlation = normalizeCorrelation(input.correlation);
-      if (!correlation) {
+      const envelope = normalizeCorrelationEnvelope(input.correlation);
+      if (!envelope) {
         return yield* new OAuthCompleteError({
-          message: "OAuth correlation binding contains an invalid or oversized value.",
+          message: "OAuth correlation envelope is invalid or oversized.",
           restartRequired: false,
         });
       }
-      yield* validateCompletionCorrelation(correlation);
+      const correlation = yield* trustedCorrelationForComplete(envelope);
       const descriptorHash = yield* sha256Hex(canonicalOAuthCorrelationBinding(correlation));
       const row = yield* loadCompletionReceiptRow(correlation.attemptKey);
       if (!row) return null;
@@ -1740,6 +2272,206 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   // value (+ refresh) in the default writable provider, then write the
   // connection row with OAuth lifecycle fields + produce its tools.
   // -----------------------------------------------------------------------
+  const loadCredentialIntent = (
+    attemptKey: string,
+  ): Effect.Effect<Record<string, unknown> | null, StorageFailure> =>
+    deps.fuma.use("oauth_credential_intent.findFirst", (db) =>
+      looseDb(db).findFirst("oauth_credential_intent", {
+        where: (b: any) => b("attempt_key", "=", attemptKey),
+      }),
+    );
+
+  const decodeMissingScopes = (value: unknown): readonly string[] => {
+    const decoded =
+      typeof value === "string"
+        ? decodeJsonPayload(value).pipe(Option.getOrElse(() => null))
+        : value;
+    return Array.isArray(decoded)
+      ? decoded.filter((scope): scope is string => typeof scope === "string")
+      : [];
+  };
+
+  const persistCredentialIntent = (input: {
+    readonly attemptKey: string;
+    readonly target: {
+      readonly owner: Owner;
+      readonly name: ConnectionName;
+      readonly integration: IntegrationSlug;
+      readonly template: AuthTemplateSlug;
+      readonly identityLabel?: string | null;
+    };
+    readonly client: LoadedOAuthClient;
+    readonly token: OAuth2TokenResponse;
+    readonly requestedScopes: readonly string[];
+    readonly clientOwner: Owner;
+    readonly oauthTokenUrl: string | null;
+  }): Effect.Effect<
+    {
+      readonly provider: CredentialProvider;
+      readonly itemId: string;
+      readonly refreshItemId: string | null;
+      readonly oauthScope: string | null;
+      readonly expiresAt: number | null;
+      readonly missingOAuthScopes: readonly string[];
+    },
+    StorageFailure
+  > =>
+    Effect.gen(function* () {
+      const provider = deps.defaultWritableProvider();
+      if (!provider || !provider.set) {
+        return yield* new StorageError({
+          message:
+            "No default writable credential provider is registered to store the OAuth access token.",
+          cause: undefined,
+        });
+      }
+      const itemId = accessItemId(input.target.owner, input.target.integration, input.target.name);
+      const refreshItemId = input.token.refresh_token ? refreshItemIdFor(itemId) : null;
+      const oauthScope = recordedOAuthScope(input.token, input.requestedScopes);
+      const missingOAuthScopes =
+        input.client.grant === "authorization_code"
+          ? missingGrantedOAuthScopes(input.requestedScopes, oauthScope)
+          : [];
+      const accessTokenHash = yield* sha256Hex(input.token.access_token);
+      const refreshTokenHash = input.token.refresh_token
+        ? yield* sha256Hex(input.token.refresh_token)
+        : null;
+      const now = new Date();
+      const existing = yield* loadCredentialIntent(input.attemptKey);
+      if (!existing) {
+        yield* deps.fuma.use("oauth_credential_intent.create", (db) =>
+          looseDb(db).create("oauth_credential_intent", {
+            tenant: deps.tenant,
+            attempt_key: input.attemptKey,
+            owner: input.target.owner,
+            integration: String(input.target.integration),
+            name: String(input.target.name),
+            template: String(input.target.template),
+            provider_key: String(provider.key),
+            item_id: itemId,
+            refresh_item_id: refreshItemId,
+            oauth_client: String(input.client.slug),
+            oauth_client_owner: input.clientOwner,
+            oauth_token_url: input.oauthTokenUrl,
+            identity_label: input.target.identityLabel ?? null,
+            expires_at: expiresAtFrom(input.token),
+            oauth_scope: oauthScope,
+            missing_oauth_scopes: missingOAuthScopes,
+            access_token_hash: accessTokenHash,
+            refresh_token_hash: refreshTokenHash,
+            status: "pending",
+            created_at: now,
+            updated_at: now,
+            stored_at: null,
+            committed_at: null,
+          }),
+        );
+      } else if (
+        String(existing.item_id) !== itemId ||
+        String(existing.access_token_hash) !== accessTokenHash ||
+        String(existing.provider_key) !== String(provider.key)
+      ) {
+        return yield* new StorageError({
+          message: "OAuth credential intent does not match the reserved attempt.",
+          cause: undefined,
+        });
+      }
+
+      // Provider writes are external to the Fuma transaction. The intent is
+      // durable before the write and hashes make a crash after set() recoverable
+      // without exchanging the one-time authorization code again.
+      const existingAccess = yield* provider.get(ProviderItemId.make(itemId));
+      if (existingAccess === null || (yield* sha256Hex(existingAccess)) !== accessTokenHash) {
+        yield* provider.set(ProviderItemId.make(itemId), input.token.access_token);
+      }
+      if (refreshItemId && input.token.refresh_token) {
+        const existingRefresh = yield* provider.get(ProviderItemId.make(refreshItemId));
+        if (existingRefresh === null || (yield* sha256Hex(existingRefresh)) !== refreshTokenHash) {
+          yield* provider.set(ProviderItemId.make(refreshItemId), input.token.refresh_token);
+        }
+      }
+      yield* deps.fuma.use("oauth_credential_intent.markStored", (db) =>
+        looseDb(db).updateMany("oauth_credential_intent", {
+          where: (b: any) => b("attempt_key", "=", input.attemptKey),
+          set: { status: "stored", stored_at: now, updated_at: now },
+        }),
+      );
+      return {
+        provider,
+        itemId,
+        refreshItemId,
+        oauthScope,
+        expiresAt: expiresAtFrom(input.token),
+        missingOAuthScopes,
+      };
+    });
+
+  const markCredentialIntentCommitted = (
+    attemptKey: string,
+    now: Date,
+  ): Effect.Effect<void, StorageFailure> =>
+    deps.fuma
+      .use("oauth_credential_intent.markCommitted", (db) =>
+        looseDb(db).updateMany("oauth_credential_intent", {
+          where: (b: any) => b("attempt_key", "=", attemptKey),
+          set: { status: "committed", committed_at: now, updated_at: now },
+        }),
+      )
+      .pipe(Effect.asVoid);
+
+  const mintFromStoredIntent = (
+    row: Record<string, unknown>,
+  ): Effect.Effect<MintOAuthConnectionInput, StorageFailure> =>
+    Effect.gen(function* () {
+      const provider = deps.defaultWritableProvider();
+      if (!provider) {
+        return yield* new StorageError({
+          message: "Credential provider for OAuth recovery is unavailable.",
+          cause: undefined,
+        });
+      }
+      if (String(row.provider_key ?? "") !== String(provider.key)) {
+        return yield* new StorageError({
+          message: "OAuth credential intent provider does not match the configured provider.",
+          cause: undefined,
+        });
+      }
+      const access = yield* provider.get(ProviderItemId.make(String(row.item_id)));
+      if (!access || (yield* sha256Hex(access)) !== String(row.access_token_hash)) {
+        return yield* new StorageError({
+          message: "OAuth credential intent is not recoverable from the credential provider.",
+          cause: undefined,
+        });
+      }
+      const refreshItemId = row.refresh_item_id == null ? null : String(row.refresh_item_id);
+      if (refreshItemId && row.refresh_token_hash) {
+        const refresh = yield* provider.get(ProviderItemId.make(refreshItemId));
+        if (!refresh || (yield* sha256Hex(refresh)) !== String(row.refresh_token_hash)) {
+          return yield* new StorageError({
+            message:
+              "OAuth refresh credential intent is not recoverable from the credential provider.",
+            cause: undefined,
+          });
+        }
+      }
+      return {
+        owner: String(row.owner) as Owner,
+        name: ConnectionName.make(String(row.name)),
+        integration: IntegrationSlug.make(String(row.integration)),
+        template: AuthTemplateSlug.make(String(row.template)),
+        identityLabel: row.identity_label == null ? null : String(row.identity_label),
+        provider: String(row.provider_key),
+        itemId: String(row.item_id),
+        oauthClient: OAuthClientSlug.make(String(row.oauth_client)),
+        oauthClientOwner: String(row.oauth_client_owner) as Owner,
+        refreshItemId,
+        expiresAt: row.expires_at == null ? null : Number(row.expires_at),
+        oauthScope: row.oauth_scope == null ? null : String(row.oauth_scope),
+        missingOAuthScopes: decodeMissingScopes(row.missing_oauth_scopes),
+        oauthTokenUrl: row.oauth_token_url == null ? null : String(row.oauth_token_url),
+      };
+    });
+
   const mintFromToken = (
     target: {
       readonly owner: Owner;
@@ -1759,8 +2491,36 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     /** Regional token endpoint override to persist when the code was redeemed
      *  off the client's configured host; null to use the client's token URL. */
     oauthTokenUrl: string | null,
+    attemptKey?: string,
   ): Effect.Effect<Connection, StorageFailure> =>
     Effect.gen(function* () {
+      if (attemptKey) {
+        const stored = yield* persistCredentialIntent({
+          attemptKey,
+          target,
+          client,
+          token,
+          requestedScopes,
+          clientOwner,
+          oauthTokenUrl,
+        });
+        return yield* deps.mintOAuthConnection({
+          owner: target.owner,
+          name: target.name,
+          integration: target.integration,
+          template: target.template,
+          identityLabel: target.identityLabel ?? null,
+          provider: String(stored.provider.key),
+          itemId: stored.itemId,
+          oauthClient: OAuthClientSlug.make(client.slug),
+          oauthClientOwner: clientOwner,
+          refreshItemId: stored.refreshItemId,
+          expiresAt: stored.expiresAt,
+          oauthScope: stored.oauthScope,
+          missingOAuthScopes: stored.missingOAuthScopes,
+          oauthTokenUrl,
+        });
+      }
       const provider = deps.defaultWritableProvider();
       if (!provider || !provider.set) {
         return yield* new StorageError({
