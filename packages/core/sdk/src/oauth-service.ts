@@ -14,7 +14,7 @@
 // redeems the session, exchanges the code, and mints the connection.
 // ---------------------------------------------------------------------------
 
-import { Duration, Effect, Layer, Option, Schema } from "effect";
+import { Duration, Effect, Layer, Option, Predicate, Schema } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 
 import type { Connection, ConnectionRef } from "./connection";
@@ -78,6 +78,7 @@ import {
   exchangeClientCredentials,
   isLoopbackHttpUrl,
   rebindTokenEndpointHostToCallbackDomain,
+  sanitizeOAuthBoundaryText,
   type OAuth2TokenResponse,
   type OAuthEndpointUrlPolicy,
 } from "./oauth-helpers";
@@ -143,6 +144,13 @@ export interface OAuthServiceDeps {
   /** Host-authenticated verifier for signed correlation envelopes. Correlated
    * flows fail closed when this authority is not configured. */
   readonly verifyCorrelationEnvelope?: OAuthCorrelationVerifier;
+  /** Hosted UI surfaces set this true until their signed correlation verifier
+   *  is wired. It fail-closes legacy authorization-code starts rather than
+   *  silently making receipt guarantees optional. */
+  readonly requireOAuthCorrelation?: boolean;
+  /** Test-only timing overrides for lease/recovery boundary tests. */
+  readonly oauthAttemptLeaseMs?: number;
+  readonly oauthAttemptHeartbeatMs?: number;
   /**
    * Resolve the OAuth scope policy for a `(integration, template)`:
    *  - `{ kind: "scopes", scopes }`: the scopes the integration's auth template
@@ -193,8 +201,15 @@ const looseDb = (db: unknown): LooseDb => db as LooseDb;
 
 /** Where an OAuth-minted access token is stored in the default provider. The
  *  refresh token lives at the same id with a `:refresh` suffix. */
-const accessItemId = (owner: Owner, integration: IntegrationSlug, name: ConnectionName): string =>
-  `oauth:${owner}:${integration}:${name}`;
+const accessItemId = (
+  owner: Owner,
+  integration: IntegrationSlug,
+  name: ConnectionName,
+  attemptKey?: string,
+): string =>
+  attemptKey
+    ? `oauth:${owner}:${integration}:${name}:attempt:${shortStableHash(attemptKey)}`
+    : `oauth:${owner}:${integration}:${name}`;
 const refreshItemIdFor = (accessId: string): string => `${accessId}:refresh`;
 
 /** Order-preserving de-duplication of a scope list. */
@@ -276,8 +291,15 @@ const decodeOAuthCompletionReceipt = Schema.decodeUnknownOption(OAuthCompletionR
 const OAUTH_ATTEMPT_LEASE_MS = 30_000;
 const OAUTH_ATTEMPT_WAIT_MS = 30_000;
 const OAUTH_ATTEMPT_POLL_MS = 100;
+const OAUTH_ATTEMPT_HEARTBEAT_MS = 5_000;
 
 type OAuthAttemptStatus = "pending" | "exchanging" | "completed" | "failed";
+
+type OAuthAttemptClaim = {
+  readonly attemptKey: string;
+  readonly token: string;
+  readonly generation: number;
+};
 
 /** Extract the persisted `requestedScopes` from an `oauth_session.payload`. The
  *  jsonColumn may surface as a parsed object (in-memory backends) or a JSON
@@ -652,6 +674,11 @@ const validateClientEndpoints = (
 export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   const httpClientLayer = deps.httpClientLayer ?? FetchHttpClient.layer;
   const fetch = deps.fetch;
+  const attemptLeaseMs = Math.max(100, deps.oauthAttemptLeaseMs ?? OAUTH_ATTEMPT_LEASE_MS);
+  const attemptHeartbeatMs = Math.min(
+    Math.max(25, deps.oauthAttemptHeartbeatMs ?? OAUTH_ATTEMPT_HEARTBEAT_MS),
+    Math.max(25, Math.floor(attemptLeaseMs / 3)),
+  );
   // EXPLICIT — no localhost default. `null` means this executor has no OAuth
   // callback; redirect-requiring flows fail loudly via `requireRedirectUri`.
   const redirectUri = deps.redirectUri;
@@ -777,6 +804,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           normalized.attemptKey !== envelopeBinding.attemptKey ||
           normalized.actorUserId !== envelopeBinding.actorUserId ||
           normalized.organizationId !== envelopeBinding.organizationId ||
+          normalized.workspaceId !== envelopeBinding.workspaceId ||
           normalized.provider !== envelopeBinding.provider
         ) {
           return Effect.fail(
@@ -800,7 +828,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         (cause) =>
           new OAuthStartError({
             // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: the verifier exposes a typed StorageFailure message
-            message: cause.message,
+            message: sanitizeOAuthBoundaryText(cause.message),
           }),
       ),
       Effect.flatMap((binding) => {
@@ -891,6 +919,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               descriptor_hash: input.descriptorHash,
               status: "pending",
               lease_token: null,
+              lease_generation: 0,
               lease_expires_at: null,
               authorization_url: input.authorizationUrl,
               started_at: input.now,
@@ -937,7 +966,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   const claimAttempt = (
     attemptKey: string,
   ): Effect.Effect<
-    | { readonly kind: "claimed"; readonly token: string }
+    | { readonly kind: "claimed"; readonly claim: OAuthAttemptClaim }
     | { readonly kind: "completed" }
     | { readonly kind: "waiting" }
     | { readonly kind: "missing" }
@@ -955,6 +984,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         return { kind: "waiting" } as const;
       }
       const token = crypto.randomUUID();
+      const generation = Number(row.lease_generation ?? 0) + 1;
       const now = Date.now();
       yield* deps.fuma.transaction(
         Effect.gen(function* () {
@@ -974,7 +1004,8 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               set: {
                 status: "exchanging",
                 lease_token: token,
-                lease_expires_at: now + OAUTH_ATTEMPT_LEASE_MS,
+                lease_generation: generation,
+                lease_expires_at: now + attemptLeaseMs,
                 updated_at: new Date(now),
               },
             }),
@@ -982,10 +1013,97 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         }),
       );
       const claimed = yield* loadAttemptByKey(attemptKey);
-      if (claimed?.lease_token === token && String(claimed.status) === "exchanging") {
-        return { kind: "claimed", token } as const;
+      if (
+        claimed?.lease_token === token &&
+        Number(claimed.lease_generation ?? 0) === generation &&
+        String(claimed.status) === "exchanging"
+      ) {
+        return {
+          kind: "claimed",
+          claim: { attemptKey, token, generation },
+        } as const;
       }
       return { kind: "waiting" } as const;
+    });
+
+  const renewAttemptLease = (claim: OAuthAttemptClaim): Effect.Effect<void, StorageFailure> =>
+    Effect.gen(function* () {
+      const now = Date.now();
+      yield* deps.fuma.use("oauth_attempt.renew", (db) =>
+        looseDb(db).updateMany("oauth_attempt", {
+          where: (b: any) =>
+            b.and(
+              b("attempt_key", "=", claim.attemptKey),
+              b("status", "=", "exchanging"),
+              b("lease_token", "=", claim.token),
+              b("lease_generation", "=", claim.generation),
+            ),
+          set: {
+            lease_expires_at: now + attemptLeaseMs,
+            updated_at: new Date(now),
+          },
+        }),
+      );
+      const row = yield* loadAttemptByKey(claim.attemptKey);
+      if (
+        !row ||
+        String(row.status) !== "exchanging" ||
+        row.lease_token !== claim.token ||
+        Number(row.lease_generation ?? 0) !== claim.generation ||
+        Number(row.lease_expires_at ?? 0) <= now
+      ) {
+        return yield* new StorageError({
+          message: "OAuth attempt lease was lost during completion.",
+          cause: undefined,
+        });
+      }
+    });
+
+  const assertAttemptClaim = (claim: OAuthAttemptClaim): Effect.Effect<void, StorageFailure> =>
+    Effect.gen(function* () {
+      const row = yield* loadAttemptByKey(claim.attemptKey);
+      const now = Date.now();
+      if (
+        !row ||
+        String(row.status) !== "exchanging" ||
+        row.lease_token !== claim.token ||
+        Number(row.lease_generation ?? 0) !== claim.generation ||
+        Number(row.lease_expires_at ?? 0) <= now
+      ) {
+        return yield* new StorageError({
+          message: "OAuth attempt lease is no longer authoritative.",
+          cause: undefined,
+        });
+      }
+    });
+
+  const withAttemptHeartbeat = <A, E>(
+    claim: OAuthAttemptClaim,
+    effect: Effect.Effect<A, E | StorageFailure>,
+  ): Effect.Effect<A, E | StorageFailure> =>
+    Effect.gen(function* () {
+      yield* renewAttemptLease(claim);
+      const heartbeat = Effect.gen(function* () {
+        while (true) {
+          yield* Effect.promise(
+            () => new Promise<void>((resolve) => setTimeout(resolve, attemptHeartbeatMs)),
+          );
+          yield* renewAttemptLease(claim);
+        }
+      }).pipe(Effect.catch(() => Effect.succeed<"lost">("lost")));
+      // `race` waits for the heartbeat when the main effect fails.  That would
+      // leave a failed callback hanging until the lease expires.  `raceFirst`
+      // preserves the first success *or failure* and interrupts the heartbeat.
+      const winner = yield* effect
+        .pipe(Effect.map((value) => ({ kind: "effect" as const, value })))
+        .pipe(Effect.raceFirst(heartbeat.pipe(Effect.map(() => ({ kind: "lost" as const })))));
+      if (winner.kind === "lost") {
+        return yield* new StorageError({
+          message: "OAuth attempt lease heartbeat failed; completion stopped.",
+          cause: undefined,
+        });
+      }
+      return winner.value;
     });
 
   const waitForAttemptWinner = (
@@ -1290,7 +1408,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           // LAN origin trips `invalid_redirect_uri`. Turn that opaque RFC code
           // into guidance the user can act on instead of the raw error.
           // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: OAuthDiscoveryError carries a typed `message`
-          const rawMessage = cause.message;
+          const rawMessage = sanitizeOAuthBoundaryText(cause.message);
           const message =
             cause.error === "invalid_redirect_uri" && !isLoopbackHttpUrl(flowRedirectUri)
               ? `Automatic OAuth setup failed: this server only approves loopback redirect ` +
@@ -1462,7 +1580,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             (cause) =>
               new OAuthStartError({
                 // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
-                message: `Failed to resolve OAuth scope policy: ${cause.message}`,
+                message: `Failed to resolve OAuth scope policy: ${sanitizeOAuthBoundaryText(cause.message)}`,
               }),
           ),
         );
@@ -1473,7 +1591,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
                 (cause) =>
                   new OAuthStartError({
                     // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: OAuthDiscoveryError carries a typed `message` field
-                    message: `Failed to discover OAuth scopes: ${cause.message}`,
+                    message: `Failed to discover OAuth scopes: ${sanitizeOAuthBoundaryText(cause.message)}`,
                   }),
               ),
             )
@@ -1499,7 +1617,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             (cause) =>
               new OAuthStartError({
                 // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: OAuth2Error carries a typed `message` field
-                message: `OAuth client-credentials exchange failed: ${cause.message}`,
+                message: `OAuth client-credentials exchange failed: ${sanitizeOAuthBoundaryText(cause.message)}`,
               }),
           ),
         );
@@ -1516,11 +1634,18 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             (cause) =>
               new OAuthStartError({
                 // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
-                message: `Failed to mint OAuth connection: ${cause.message}`,
+                message: `Failed to mint OAuth connection: ${sanitizeOAuthBoundaryText(cause.message)}`,
               }),
           ),
         );
         return { status: "connected", connection } as const;
+      }
+
+      if (deps.requireOAuthCorrelation && !input.correlation) {
+        return yield* new OAuthStartError({
+          message:
+            "OAuth completion correlation is required for the hosted authorization-code flow.",
+        });
       }
 
       // authorization_code requires our callback to receive the code — fail
@@ -1587,7 +1712,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         catch: (cause) =>
           new OAuthStartError({
             // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: surface the URL-construction failure
-            message: `Failed to build authorization URL: ${String(cause)}`,
+            message: `Failed to build authorization URL: ${sanitizeOAuthBoundaryText(String(cause))}`,
           }),
       });
 
@@ -1885,6 +2010,13 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         ? yield* trustedCorrelationForComplete(suppliedEnvelope, session.provider ?? undefined)
         : null;
       const correlation = suppliedCorrelation ?? storedCorrelation;
+      if (deps.requireOAuthCorrelation && !suppliedEnvelope) {
+        return yield* new OAuthCompleteError({
+          message:
+            "OAuth completion correlation envelope is required; legacy uncorrelated callbacks are not redeemable.",
+          restartRequired: true,
+        });
+      }
       if (storedCorrelation && suppliedCorrelation === null && suppliedEnvelope) {
         return yield* new OAuthCompleteError({
           message: "OAuth session does not carry the supplied correlation binding.",
@@ -2013,6 +2145,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           restartRequired: true,
         });
       }
+      const activeClaim = claim?.kind === "claimed" ? claim.claim : null;
 
       // Expired sessions are not redeemable — drop + treat as not found.
       if (Number.isFinite(session.expiresAt) && session.expiresAt <= Date.now()) {
@@ -2047,24 +2180,81 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       // the configured host; otherwise this is a no-op.
       const tokenUrl = rebindTokenEndpointHostToCallbackDomain(client.tokenUrl, callbackDomain);
 
+      if (correlation && !activeClaim) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth attempt has no active lease; provider exchange is blocked.",
+          restartRequired: false,
+        });
+      }
+
       const intent = correlation ? yield* loadCredentialIntent(correlation.attemptKey) : null;
+      const exchangeIntent =
+        correlation && activeClaim
+          ? yield* ensureExchangeIntent({
+              claim: activeClaim,
+              state: input.state,
+              provider: correlation.provider,
+              client: OAuthClientSlug.make(client.slug),
+              codeHash: yield* sha256Hex(input.code),
+            })
+          : null;
       let mint: Effect.Effect<Connection, OAuthCompleteError | StorageFailure>;
-      const recoveredIntent = intent
-        ? yield* mintFromStoredIntent(intent).pipe(Effect.catch(() => Effect.succeed(null)))
-        : null;
+      let recoveredIntent: MintOAuthConnectionInput | null = null;
+      if (intent && activeClaim) {
+        const provider = deps.defaultWritableProvider();
+        if (!provider) {
+          return yield* new OAuthCompleteError({
+            message: "Credential provider for OAuth recovery is unavailable.",
+            restartRequired: false,
+          });
+        }
+        const itemState = yield* verifyStoredCredentialItems({ claim: activeClaim, provider });
+        if (itemState === "partial") {
+          yield* rebindCredentialItems(activeClaim);
+          yield* compensateCredentialItems({ claim: activeClaim, provider });
+          return yield* new OAuthCompleteError({
+            message:
+              "OAuth credential recovery found a partial provider write; completion is blocked pending compensation.",
+            restartRequired: false,
+          });
+        }
+        if (itemState === "complete") {
+          yield* rebindCredentialIntent(activeClaim);
+          yield* rebindExchangeIntent(activeClaim);
+          recoveredIntent = yield* mintFromStoredIntent(intent).pipe(
+            Effect.catch(() => Effect.succeed(null)),
+          );
+        }
+      }
+      if (
+        correlation &&
+        activeClaim &&
+        exchangeIntent &&
+        (String(exchangeIntent.status) === "succeeded" ||
+          (String(exchangeIntent.status) === "exchanging" &&
+            (exchangeIntent.lease_token !== activeClaim.token ||
+              Number(exchangeIntent.lease_generation ?? 0) !== activeClaim.generation))) &&
+        !recoveredIntent
+      ) {
+        return yield* new OAuthCompleteError({
+          message:
+            "OAuth provider exchange has an unknown or already-owned outcome; re-exchange is blocked.",
+          restartRequired: false,
+        });
+      }
       if (recoveredIntent) {
         mint = deps.mintOAuthConnection(recoveredIntent).pipe(
           Effect.mapError(
             (cause) =>
               new OAuthCompleteError({
                 // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: minting exposes a typed StorageFailure message
-                message: `Failed to mint OAuth connection: ${cause.message}`,
+                message: `Failed to mint OAuth connection: ${sanitizeOAuthBoundaryText(cause.message)}`,
                 restartRequired: false,
               }),
           ),
         );
       } else {
-        const token = yield* exchangeAuthorizationCode({
+        const authorizationExchange = exchangeAuthorizationCode({
           tokenUrl,
           clientId: client.clientId,
           clientSecret: client.clientSecret,
@@ -2074,13 +2264,19 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           resource: client.resource ?? undefined,
           endpointUrlPolicy: deps.endpointUrlPolicy,
           fetch,
-        }).pipe(
+        });
+        const token = yield* (
+          activeClaim
+            ? withAttemptHeartbeat(activeClaim, authorizationExchange)
+            : authorizationExchange
+        ).pipe(
           Effect.mapError(
             (cause) =>
               new OAuthCompleteError({
                 // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: OAuth2Error carries a typed `message` field
-                message: `OAuth code exchange failed: ${cause.message}`,
-                restartRequired: cause.error === "invalid_grant",
+                message: `OAuth code exchange failed: ${sanitizeOAuthBoundaryText(cause.message)}`,
+                restartRequired:
+                  Predicate.isTagged("OAuth2Error")(cause) && cause.error === "invalid_grant",
               }),
           ),
         );
@@ -2092,10 +2288,16 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           identityLabel: session.identityLabel ?? token.idTokenIdentityLabel ?? null,
         };
         if (correlation) {
+          if (!activeClaim) {
+            return yield* new StorageError({
+              message: "OAuth attempt lease is missing before credential persistence.",
+              cause: undefined,
+            });
+          }
           // Establish the durable intent before any provider write. The intent
           // must survive an external write that outlives a rolled-back DB txn.
           const stored = yield* persistCredentialIntent({
-            attemptKey: correlation.attemptKey,
+            claim: activeClaim,
             target,
             client,
             token,
@@ -2107,10 +2309,18 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               (cause) =>
                 new OAuthCompleteError({
                   // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
-                  message: `Failed to persist OAuth credential intent: ${cause.message}`,
+                  message: `Failed to persist OAuth credential intent: ${sanitizeOAuthBoundaryText(cause.message)}`,
                   restartRequired: false,
                 }),
             ),
+          );
+          yield* withAttemptHeartbeat(
+            activeClaim,
+            markExchangeSucceeded({
+              claim: activeClaim,
+              accessTokenHash: yield* sha256Hex(token.access_token),
+              refreshTokenHash: token.refresh_token ? yield* sha256Hex(token.refresh_token) : null,
+            }),
           );
           mint = deps
             .mintOAuthConnection({
@@ -2134,7 +2344,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
                 (cause) =>
                   new OAuthCompleteError({
                     // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
-                    message: `Failed to mint OAuth connection: ${cause.message}`,
+                    message: `Failed to mint OAuth connection: ${sanitizeOAuthBoundaryText(cause.message)}`,
                     restartRequired: false,
                   }),
               ),
@@ -2156,7 +2366,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               (cause) =>
                 new OAuthCompleteError({
                   // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
-                  message: `Failed to mint OAuth connection: ${cause.message}`,
+                  message: `Failed to mint OAuth connection: ${sanitizeOAuthBoundaryText(cause.message)}`,
                   restartRequired: false,
                 }),
             ),
@@ -2166,6 +2376,12 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
 
       let connection: Connection;
       if (correlation && descriptorHash && executionId) {
+        if (!activeClaim) {
+          return yield* new StorageError({
+            message: "OAuth completion lease is missing; durable receipt commit is blocked.",
+            cause: undefined,
+          });
+        }
         const completedAt = new Date();
         const startedAt = dateFromStored(sessionRow.created_at) ?? completedAt;
         const durationMs = Math.min(
@@ -2181,9 +2397,44 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         // Provider writes and connection minting are external to the receipt
         // transaction. The durable credential intent makes this recoverable if
         // the process dies after minting but before the metadata commit.
-        connection = yield* mint;
+        connection = activeClaim ? yield* withAttemptHeartbeat(activeClaim, mint) : yield* mint;
+        if (activeClaim) yield* assertAttemptClaim(activeClaim);
         yield* deps.fuma.transaction(
           Effect.gen(function* () {
+            yield* deps.fuma.use("oauth_attempt.complete", (db) =>
+              looseDb(db).updateMany("oauth_attempt", {
+                where: (b: any) =>
+                  b.and(
+                    b("attempt_key", "=", correlation.attemptKey),
+                    b("status", "=", "exchanging"),
+                    b("lease_token", "=", activeClaim.token),
+                    b("lease_generation", "=", activeClaim.generation),
+                  ),
+                set: {
+                  status: "completed",
+                  lease_expires_at: null,
+                  updated_at: completedAt,
+                  completed_at: completedAt,
+                },
+              }),
+            );
+            const completed = yield* deps.fuma.use("oauth_attempt.complete.verify", (db) =>
+              looseDb(db).findFirst("oauth_attempt", {
+                where: (b: any) =>
+                  b.and(
+                    b("attempt_key", "=", correlation.attemptKey),
+                    b("status", "=", "completed"),
+                    b("lease_token", "=", activeClaim.token),
+                    b("lease_generation", "=", activeClaim.generation),
+                  ),
+              }),
+            );
+            if (!completed) {
+              return yield* new StorageError({
+                message: "OAuth completion lease CAS failed before receipt write.",
+                cause: undefined,
+              });
+            }
             yield* deps.fuma.use("oauth_completion_receipt.create", (db) =>
               looseDb(db).create("oauth_completion_receipt", {
                 tenant: deps.tenant,
@@ -2204,24 +2455,45 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
                 started_at: startedAt,
                 completed_at: completedAt,
                 duration_ms: durationMs,
+                lease_token: activeClaim.token,
+                lease_generation: activeClaim.generation,
                 created_at: completedAt,
               }),
             );
-            yield* markCredentialIntentCommitted(correlation.attemptKey, completedAt);
-            yield* deps.fuma.use("oauth_attempt.complete", (db) =>
-              looseDb(db).updateMany("oauth_attempt", {
-                where: (b: any) => b("attempt_key", "=", correlation.attemptKey),
-                set: {
-                  status: "completed",
-                  lease_token: null,
-                  lease_expires_at: null,
-                  updated_at: completedAt,
-                  completed_at: completedAt,
-                },
-              }),
+            yield* markCredentialIntentCommitted(activeClaim, completedAt);
+            const committedIntent = yield* deps.fuma.use(
+              "oauth_credential_intent.commit.verify",
+              (db) =>
+                looseDb(db).findFirst("oauth_credential_intent", {
+                  where: (b: any) =>
+                    b.and(
+                      b("attempt_key", "=", correlation.attemptKey),
+                      b("status", "=", "committed"),
+                      b("lease_token", "=", activeClaim.token),
+                      b("lease_generation", "=", activeClaim.generation),
+                    ),
+                }),
             );
+            if (!committedIntent) {
+              return yield* new StorageError({
+                message: "OAuth credential intent CAS failed before receipt commit.",
+                cause: undefined,
+              });
+            }
           }),
         );
+        const completedAttempt = yield* loadAttemptByKey(activeClaim.attemptKey);
+        if (
+          !completedAttempt ||
+          String(completedAttempt.status) !== "completed" ||
+          completedAttempt.lease_token !== activeClaim.token ||
+          Number(completedAttempt.lease_generation ?? 0) !== activeClaim.generation
+        ) {
+          return yield* new StorageError({
+            message: "OAuth completion lease was lost before durable receipt commit.",
+            cause: undefined,
+          });
+        }
       } else {
         connection = yield* mint;
       }
@@ -2281,6 +2553,205 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       }),
     );
 
+  const loadExchangeIntent = (
+    attemptKey: string,
+  ): Effect.Effect<Record<string, unknown> | null, StorageFailure> =>
+    deps.fuma.use("oauth_exchange_intent.findFirst", (db) =>
+      looseDb(db).findFirst("oauth_exchange_intent", {
+        where: (b: any) => b("attempt_key", "=", attemptKey),
+      }),
+    );
+
+  const ensureExchangeIntent = (input: {
+    readonly claim: OAuthAttemptClaim;
+    readonly state: OAuthState;
+    readonly provider: string;
+    readonly client: OAuthClientSlug;
+    readonly codeHash: string;
+  }): Effect.Effect<Record<string, unknown>, OAuthCompleteError | StorageFailure> =>
+    Effect.gen(function* () {
+      yield* assertAttemptClaim(input.claim);
+      const now = new Date();
+      const existing = yield* loadExchangeIntent(input.claim.attemptKey);
+      if (!existing) {
+        yield* deps.fuma
+          .transaction(
+            deps.fuma.use("oauth_exchange_intent.create", (db) =>
+              looseDb(db).create("oauth_exchange_intent", {
+                tenant: deps.tenant,
+                attempt_key: input.claim.attemptKey,
+                state: String(input.state),
+                provider: input.provider,
+                client_slug: String(input.client),
+                code_hash: input.codeHash,
+                // This is an Executor transaction key only. It is not provider
+                // evidence; providers that lack idempotency/readback remain
+                // fail-closed after an unknown exchange outcome.
+                provider_transaction_key: `executor:${input.claim.attemptKey}`,
+                status: "prepared",
+                lease_token: input.claim.token,
+                lease_generation: input.claim.generation,
+                access_token_hash: null,
+                refresh_token_hash: null,
+                started_at: now,
+                updated_at: now,
+                completed_at: null,
+                failure_code: null,
+              }),
+            ),
+          )
+          .pipe(Effect.catchTag("UniqueViolationError", () => Effect.void));
+      }
+      const row = yield* loadExchangeIntent(input.claim.attemptKey);
+      if (!row) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth exchange intent disappeared; operator recovery is required.",
+          restartRequired: false,
+        });
+      }
+      if (
+        String(row.code_hash) !== input.codeHash ||
+        String(row.provider) !== input.provider ||
+        String(row.client_slug) !== String(input.client)
+      ) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth exchange intent does not match the reserved attempt.",
+          restartRequired: false,
+        });
+      }
+      const status = String(row.status);
+      if (status === "succeeded") return row;
+      if (status === "failed" || status === "unknown") {
+        return yield* new OAuthCompleteError({
+          message: "OAuth exchange outcome is terminal; restart the flow.",
+          restartRequired: true,
+        });
+      }
+      if (status === "exchanging") {
+        // The caller decides whether this is recoverable from the durable
+        // credential outbox.  Returning the row here is intentional: blindly
+        // rejecting would strand a successful provider exchange after a
+        // process crash, while blindly re-exchanging would consume a one-time
+        // code twice.
+        return row;
+      }
+      yield* deps.fuma.use("oauth_exchange_intent.begin", (db) =>
+        looseDb(db).updateMany("oauth_exchange_intent", {
+          where: (b: any) =>
+            b.and(
+              b("attempt_key", "=", input.claim.attemptKey),
+              b("status", "=", "prepared"),
+              b("lease_token", "=", input.claim.token),
+              b("lease_generation", "=", input.claim.generation),
+            ),
+          set: { status: "exchanging", updated_at: now },
+        }),
+      );
+      const claimed = yield* loadExchangeIntent(input.claim.attemptKey);
+      if (
+        !claimed ||
+        String(claimed.status) !== "exchanging" ||
+        claimed.lease_token !== input.claim.token ||
+        Number(claimed.lease_generation ?? 0) !== input.claim.generation
+      ) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth exchange intent was reclaimed; provider outcome is serialized.",
+          restartRequired: false,
+        });
+      }
+      return claimed;
+    });
+
+  const markExchangeSucceeded = (input: {
+    readonly claim: OAuthAttemptClaim;
+    readonly accessTokenHash: string;
+    readonly refreshTokenHash: string | null;
+  }): Effect.Effect<void, StorageFailure> =>
+    Effect.gen(function* () {
+      yield* assertAttemptClaim(input.claim);
+      const now = new Date();
+      yield* deps.fuma.use("oauth_exchange_intent.succeed", (db) =>
+        looseDb(db).updateMany("oauth_exchange_intent", {
+          where: (b: any) =>
+            b.and(
+              b("attempt_key", "=", input.claim.attemptKey),
+              b("status", "=", "exchanging"),
+              b("lease_token", "=", input.claim.token),
+              b("lease_generation", "=", input.claim.generation),
+            ),
+          set: {
+            status: "succeeded",
+            access_token_hash: input.accessTokenHash,
+            refresh_token_hash: input.refreshTokenHash,
+            completed_at: now,
+            updated_at: now,
+          },
+        }),
+      );
+      const row = yield* loadExchangeIntent(input.claim.attemptKey);
+      if (!row || String(row.status) !== "succeeded") {
+        return yield* new StorageError({
+          message: "OAuth exchange lifecycle commit was lost.",
+          cause: undefined,
+        });
+      }
+    });
+
+  const rebindExchangeIntent = (
+    claim: OAuthAttemptClaim,
+  ): Effect.Effect<Record<string, unknown> | null, StorageFailure> =>
+    Effect.gen(function* () {
+      yield* assertAttemptClaim(claim);
+      yield* deps.fuma.use("oauth_exchange_intent.rebind", (db) =>
+        looseDb(db).updateMany("oauth_exchange_intent", {
+          where: (b: any) =>
+            b.and(
+              b("attempt_key", "=", claim.attemptKey),
+              b.or(b("status", "=", "exchanging"), b("status", "=", "succeeded")),
+            ),
+          set: {
+            lease_token: claim.token,
+            lease_generation: claim.generation,
+            updated_at: new Date(),
+          },
+        }),
+      );
+      return yield* loadExchangeIntent(claim.attemptKey);
+    });
+
+  const rebindCredentialIntent = (
+    claim: OAuthAttemptClaim,
+  ): Effect.Effect<Record<string, unknown> | null, StorageFailure> =>
+    Effect.gen(function* () {
+      yield* assertAttemptClaim(claim);
+      yield* deps.fuma.use("oauth_credential_intent.rebind", (db) =>
+        looseDb(db).updateMany("oauth_credential_intent", {
+          where: (b: any) => b("attempt_key", "=", claim.attemptKey),
+          set: {
+            lease_token: claim.token,
+            lease_generation: claim.generation,
+            updated_at: new Date(),
+          },
+        }),
+      );
+      return yield* loadCredentialIntent(claim.attemptKey);
+    });
+
+  const rebindCredentialItems = (claim: OAuthAttemptClaim): Effect.Effect<void, StorageFailure> =>
+    Effect.gen(function* () {
+      yield* assertAttemptClaim(claim);
+      yield* deps.fuma.use("oauth_credential_item.rebind", (db) =>
+        looseDb(db).updateMany("oauth_credential_item", {
+          where: (b: any) => b("attempt_key", "=", claim.attemptKey),
+          set: {
+            lease_token: claim.token,
+            lease_generation: claim.generation,
+            updated_at: new Date(),
+          },
+        }),
+      );
+    });
+
   const decodeMissingScopes = (value: unknown): readonly string[] => {
     const decoded =
       typeof value === "string"
@@ -2291,8 +2762,227 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       : [];
   };
 
+  type CredentialItemSpec = {
+    readonly kind: "access" | "refresh";
+    readonly itemId: string;
+    readonly token: string;
+    readonly tokenHash: string;
+  };
+
+  const loadCredentialItems = (
+    attemptKey: string,
+  ): Effect.Effect<readonly Record<string, unknown>[], StorageFailure> =>
+    deps.fuma.use("oauth_credential_item.findMany", (db) =>
+      looseDb(db).findMany("oauth_credential_item", {
+        where: (b: any) => b("attempt_key", "=", attemptKey),
+      }),
+    );
+
+  const ensureCredentialItems = (input: {
+    readonly claim: OAuthAttemptClaim;
+    readonly provider: CredentialProvider;
+    readonly specs: readonly CredentialItemSpec[];
+  }): Effect.Effect<void, StorageFailure> =>
+    Effect.gen(function* () {
+      yield* assertAttemptClaim(input.claim);
+      const now = new Date();
+      for (const spec of input.specs) {
+        const existing = yield* deps.fuma.use("oauth_credential_item.findFirst", (db) =>
+          looseDb(db).findFirst("oauth_credential_item", {
+            where: (b: any) =>
+              b.and(b("attempt_key", "=", input.claim.attemptKey), b("item_kind", "=", spec.kind)),
+          }),
+        );
+        if (!existing) {
+          yield* deps.fuma
+            .use("oauth_credential_item.create", (db) =>
+              looseDb(db).create("oauth_credential_item", {
+                tenant: deps.tenant,
+                attempt_key: input.claim.attemptKey,
+                item_kind: spec.kind,
+                required: true,
+                provider_key: String(input.provider.key),
+                item_id: spec.itemId,
+                token_hash: spec.tokenHash,
+                status: "planned",
+                lease_token: input.claim.token,
+                lease_generation: input.claim.generation,
+                created_at: now,
+                updated_at: now,
+                stored_at: null,
+                compensated_at: null,
+              }),
+            )
+            .pipe(Effect.catchTag("UniqueViolationError", () => Effect.void));
+        }
+        const row = yield* deps.fuma.use("oauth_credential_item.findFirst", (db) =>
+          looseDb(db).findFirst("oauth_credential_item", {
+            where: (b: any) =>
+              b.and(b("attempt_key", "=", input.claim.attemptKey), b("item_kind", "=", spec.kind)),
+          }),
+        );
+        if (
+          !row ||
+          String(row.item_id) !== spec.itemId ||
+          String(row.token_hash) !== spec.tokenHash ||
+          String(row.provider_key) !== String(input.provider.key)
+        ) {
+          return yield* new StorageError({
+            message: "OAuth credential item intent does not match the reserved attempt.",
+            cause: undefined,
+          });
+        }
+      }
+    });
+
+  const writeCredentialItem = (input: {
+    readonly claim: OAuthAttemptClaim;
+    readonly provider: CredentialProvider;
+    readonly spec: CredentialItemSpec;
+  }): Effect.Effect<void, StorageFailure> =>
+    Effect.gen(function* () {
+      yield* assertAttemptClaim(input.claim);
+      const now = new Date();
+      yield* deps.fuma.use("oauth_credential_item.claim", (db) =>
+        looseDb(db).updateMany("oauth_credential_item", {
+          where: (b: any) =>
+            b.and(
+              b("attempt_key", "=", input.claim.attemptKey),
+              b("item_kind", "=", input.spec.kind),
+              b.or(
+                b("status", "=", "planned"),
+                b.and(
+                  b("status", "=", "writing"),
+                  b("lease_token", "=", input.claim.token),
+                  b("lease_generation", "=", input.claim.generation),
+                ),
+              ),
+            ),
+          set: {
+            status: "writing",
+            lease_token: input.claim.token,
+            lease_generation: input.claim.generation,
+            updated_at: now,
+          },
+        }),
+      );
+      const current = yield* deps.fuma.use("oauth_credential_item.findFirst", (db) =>
+        looseDb(db).findFirst("oauth_credential_item", {
+          where: (b: any) =>
+            b.and(
+              b("attempt_key", "=", input.claim.attemptKey),
+              b("item_kind", "=", input.spec.kind),
+            ),
+        }),
+      );
+      if (!current || current.lease_token !== input.claim.token) {
+        return yield* new StorageError({
+          message: "OAuth credential item was reclaimed by another worker.",
+          cause: undefined,
+        });
+      }
+      const existing = yield* input.provider.get(ProviderItemId.make(input.spec.itemId));
+      if (existing === null || (yield* sha256Hex(existing)) !== input.spec.tokenHash) {
+        yield* assertAttemptClaim(input.claim);
+        if (input.provider.set === undefined) {
+          return yield* new StorageError({
+            message: "OAuth credential provider is not writable.",
+            cause: undefined,
+          });
+        }
+        yield* input.provider.set(ProviderItemId.make(input.spec.itemId), input.spec.token);
+      }
+      yield* assertAttemptClaim(input.claim);
+      yield* deps.fuma.use("oauth_credential_item.stored", (db) =>
+        looseDb(db).updateMany("oauth_credential_item", {
+          where: (b: any) =>
+            b.and(
+              b("attempt_key", "=", input.claim.attemptKey),
+              b("item_kind", "=", input.spec.kind),
+              b("status", "=", "writing"),
+              b("lease_token", "=", input.claim.token),
+              b("lease_generation", "=", input.claim.generation),
+            ),
+          set: { status: "stored", stored_at: now, updated_at: now },
+        }),
+      );
+    });
+
+  const verifyStoredCredentialItems = (input: {
+    readonly claim: OAuthAttemptClaim;
+    readonly provider: CredentialProvider;
+  }): Effect.Effect<"complete" | "partial" | "missing", StorageFailure> =>
+    Effect.gen(function* () {
+      const rows = yield* loadCredentialItems(input.claim.attemptKey);
+      if (rows.length === 0) return "missing" as const;
+      let stored = 0;
+      for (const row of rows) {
+        const itemId = String(row.item_id ?? "");
+        const tokenHash = String(row.token_hash ?? "");
+        const value = yield* input.provider.get(ProviderItemId.make(itemId));
+        if (String(row.status) === "stored" && value && (yield* sha256Hex(value)) === tokenHash) {
+          stored += 1;
+          continue;
+        }
+        if (value && (yield* sha256Hex(value)) === tokenHash) {
+          stored += 1;
+          continue;
+        }
+        if (String(row.status) === "writing" || String(row.status) === "stored") {
+          return "partial" as const;
+        }
+      }
+      if (stored === rows.length) return "complete";
+      // A planned item alongside a stored item is still a partial external
+      // effect. Recovery must compensate it instead of treating the exchange
+      // as missing and risking an unauthorized re-exchange.
+      return stored > 0 ? "partial" : "missing";
+    });
+
+  const compensateCredentialItems = (input: {
+    readonly claim: OAuthAttemptClaim;
+    readonly provider: CredentialProvider;
+  }): Effect.Effect<void, StorageFailure> =>
+    Effect.gen(function* () {
+      yield* assertAttemptClaim(input.claim);
+      const rows = yield* loadCredentialItems(input.claim.attemptKey);
+      if (rows.length === 0) return;
+      if (!input.provider.delete) {
+        return yield* new StorageError({
+          message:
+            "OAuth credential recovery found a partial provider write but the provider cannot compensate it.",
+          cause: undefined,
+        });
+      }
+      for (const row of rows) {
+        const itemId = String(row.item_id ?? "");
+        const tokenHash = String(row.token_hash ?? "");
+        const value = yield* input.provider.get(ProviderItemId.make(itemId));
+        if (value && (yield* sha256Hex(value)) === tokenHash) {
+          yield* assertAttemptClaim(input.claim);
+          yield* input.provider.delete(ProviderItemId.make(itemId));
+        }
+        yield* deps.fuma.use("oauth_credential_item.compensated", (db) =>
+          looseDb(db).updateMany("oauth_credential_item", {
+            where: (b: any) =>
+              b.and(
+                b("attempt_key", "=", input.claim.attemptKey),
+                b("item_id", "=", itemId),
+                b("lease_token", "=", input.claim.token),
+                b("lease_generation", "=", input.claim.generation),
+              ),
+            set: {
+              status: "compensated",
+              compensated_at: new Date(),
+              updated_at: new Date(),
+            },
+          }),
+        );
+      }
+    });
+
   const persistCredentialIntent = (input: {
-    readonly attemptKey: string;
+    readonly claim: OAuthAttemptClaim;
     readonly target: {
       readonly owner: Owner;
       readonly name: ConnectionName;
@@ -2317,6 +3007,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     StorageFailure
   > =>
     Effect.gen(function* () {
+      yield* assertAttemptClaim(input.claim);
       const provider = deps.defaultWritableProvider();
       if (!provider || !provider.set) {
         return yield* new StorageError({
@@ -2325,7 +3016,15 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           cause: undefined,
         });
       }
-      const itemId = accessItemId(input.target.owner, input.target.integration, input.target.name);
+      // A correlated connection gets an attempt-scoped item id.  This keeps a
+      // reclaimed generation from overwriting a prior attempt's credential
+      // while remaining deterministic for recovery and idempotent retries.
+      const itemId = accessItemId(
+        input.target.owner,
+        input.target.integration,
+        input.target.name,
+        input.claim.attemptKey,
+      );
       const refreshItemId = input.token.refresh_token ? refreshItemIdFor(itemId) : null;
       const oauthScope = recordedOAuthScope(input.token, input.requestedScopes);
       const missingOAuthScopes =
@@ -2337,12 +3036,12 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         ? yield* sha256Hex(input.token.refresh_token)
         : null;
       const now = new Date();
-      const existing = yield* loadCredentialIntent(input.attemptKey);
+      const existing = yield* loadCredentialIntent(input.claim.attemptKey);
       if (!existing) {
         yield* deps.fuma.use("oauth_credential_intent.create", (db) =>
           looseDb(db).create("oauth_credential_intent", {
             tenant: deps.tenant,
-            attempt_key: input.attemptKey,
+            attempt_key: input.claim.attemptKey,
             owner: input.target.owner,
             integration: String(input.target.integration),
             name: String(input.target.name),
@@ -2360,6 +3059,8 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             access_token_hash: accessTokenHash,
             refresh_token_hash: refreshTokenHash,
             status: "pending",
+            lease_token: input.claim.token,
+            lease_generation: input.claim.generation,
             created_at: now,
             updated_at: now,
             stored_at: null,
@@ -2368,7 +3069,9 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         );
       } else if (
         String(existing.item_id) !== itemId ||
+        String(existing.refresh_item_id ?? "") !== String(refreshItemId ?? "") ||
         String(existing.access_token_hash) !== accessTokenHash ||
+        String(existing.refresh_token_hash ?? "") !== String(refreshTokenHash ?? "") ||
         String(existing.provider_key) !== String(provider.key)
       ) {
         return yield* new StorageError({
@@ -2377,23 +3080,40 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         });
       }
 
-      // Provider writes are external to the Fuma transaction. The intent is
-      // durable before the write and hashes make a crash after set() recoverable
-      // without exchanging the one-time authorization code again.
-      const existingAccess = yield* provider.get(ProviderItemId.make(itemId));
-      if (existingAccess === null || (yield* sha256Hex(existingAccess)) !== accessTokenHash) {
-        yield* provider.set(ProviderItemId.make(itemId), input.token.access_token);
+      const specs: CredentialItemSpec[] = [
+        { kind: "access", itemId, token: input.token.access_token, tokenHash: accessTokenHash },
+      ];
+      if (refreshItemId && input.token.refresh_token && refreshTokenHash) {
+        specs.push({
+          kind: "refresh",
+          itemId: refreshItemId,
+          token: input.token.refresh_token,
+          tokenHash: refreshTokenHash,
+        });
       }
-      if (refreshItemId && input.token.refresh_token) {
-        const existingRefresh = yield* provider.get(ProviderItemId.make(refreshItemId));
-        if (existingRefresh === null || (yield* sha256Hex(existingRefresh)) !== refreshTokenHash) {
-          yield* provider.set(ProviderItemId.make(refreshItemId), input.token.refresh_token);
-        }
+      // Each external write has its own durable outbox row.  Never exchange a
+      // code again because one item was partial: recovery reconciles or
+      // compensates these rows instead.
+      yield* ensureCredentialItems({ claim: input.claim, provider, specs });
+      for (const spec of specs) {
+        yield* writeCredentialItem({ claim: input.claim, provider, spec });
       }
+      yield* assertAttemptClaim(input.claim);
       yield* deps.fuma.use("oauth_credential_intent.markStored", (db) =>
         looseDb(db).updateMany("oauth_credential_intent", {
-          where: (b: any) => b("attempt_key", "=", input.attemptKey),
-          set: { status: "stored", stored_at: now, updated_at: now },
+          where: (b: any) =>
+            b.and(
+              b("attempt_key", "=", input.claim.attemptKey),
+              b("lease_token", "=", input.claim.token),
+              b("lease_generation", "=", input.claim.generation),
+            ),
+          set: {
+            status: "stored",
+            lease_token: input.claim.token,
+            lease_generation: input.claim.generation,
+            stored_at: now,
+            updated_at: now,
+          },
         }),
       );
       return {
@@ -2407,14 +3127,25 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     });
 
   const markCredentialIntentCommitted = (
-    attemptKey: string,
+    claim: OAuthAttemptClaim,
     now: Date,
   ): Effect.Effect<void, StorageFailure> =>
     deps.fuma
       .use("oauth_credential_intent.markCommitted", (db) =>
         looseDb(db).updateMany("oauth_credential_intent", {
-          where: (b: any) => b("attempt_key", "=", attemptKey),
-          set: { status: "committed", committed_at: now, updated_at: now },
+          where: (b: any) =>
+            b.and(
+              b("attempt_key", "=", claim.attemptKey),
+              b("lease_token", "=", claim.token),
+              b("lease_generation", "=", claim.generation),
+            ),
+          set: {
+            status: "committed",
+            lease_token: claim.token,
+            lease_generation: claim.generation,
+            committed_at: now,
+            updated_at: now,
+          },
         }),
       )
       .pipe(Effect.asVoid);
@@ -2491,36 +3222,8 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     /** Regional token endpoint override to persist when the code was redeemed
      *  off the client's configured host; null to use the client's token URL. */
     oauthTokenUrl: string | null,
-    attemptKey?: string,
   ): Effect.Effect<Connection, StorageFailure> =>
     Effect.gen(function* () {
-      if (attemptKey) {
-        const stored = yield* persistCredentialIntent({
-          attemptKey,
-          target,
-          client,
-          token,
-          requestedScopes,
-          clientOwner,
-          oauthTokenUrl,
-        });
-        return yield* deps.mintOAuthConnection({
-          owner: target.owner,
-          name: target.name,
-          integration: target.integration,
-          template: target.template,
-          identityLabel: target.identityLabel ?? null,
-          provider: String(stored.provider.key),
-          itemId: stored.itemId,
-          oauthClient: OAuthClientSlug.make(client.slug),
-          oauthClientOwner: clientOwner,
-          refreshItemId: stored.refreshItemId,
-          expiresAt: stored.expiresAt,
-          oauthScope: stored.oauthScope,
-          missingOAuthScopes: stored.missingOAuthScopes,
-          oauthTokenUrl,
-        });
-      }
       const provider = deps.defaultWritableProvider();
       if (!provider || !provider.set) {
         return yield* new StorageError({
@@ -2600,7 +3303,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           (cause) =>
             new OAuthProbeError({
               // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: OAuthDiscoveryError carries a typed `message` field
-              message: `OAuth discovery failed: ${cause.message}`,
+              message: `OAuth discovery failed: ${sanitizeOAuthBoundaryText(cause.message)}`,
             }),
         ),
       );

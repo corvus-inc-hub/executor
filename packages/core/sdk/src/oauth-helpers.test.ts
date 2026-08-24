@@ -21,6 +21,7 @@ import {
   exchangeClientCredentials,
   idTokenIdentityLabel,
   refreshAccessToken,
+  sanitizeOAuthBoundaryText,
   shouldRefreshToken,
 } from "./oauth-helpers";
 import { serveTestHttpApp } from "./testing";
@@ -682,6 +683,19 @@ describe("exchangeAuthorizationCode", () => {
         }),
     ),
   );
+});
+
+describe("OAuth boundary diagnostics", () => {
+  it("removes provider query material, bearer values, control text, and truncates", () => {
+    const output = sanitizeOAuthBoundaryText(
+      "https://provider.example/callback?client_secret=secret-123&code=one-time Bearer bearer-secret\nstack=token-value",
+    );
+    expect(output).not.toContain("secret-123");
+    expect(output).not.toContain("one-time");
+    expect(output).not.toContain("bearer-secret");
+    expect(output).toContain("https://provider.example/callback");
+    expect(output).not.toContain("\n");
+  });
 });
 
 describe("exchangeClientCredentials", () => {

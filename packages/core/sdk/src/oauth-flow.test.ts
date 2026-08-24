@@ -7,6 +7,8 @@ import {
   IntegrationSlug,
   OAuthClientSlug,
   OAuthState,
+  ProviderItemId,
+  ProviderKey,
   ToolAddress,
   ToolName,
 } from "./ids";
@@ -17,6 +19,7 @@ import {
   OAuthStartError,
 } from "./oauth-client";
 import { missingGrantedOAuthScopes } from "./oauth-service";
+import { sha256Hex } from "./blob";
 import { StorageError } from "./fuma-runtime";
 import { definePlugin } from "./plugin";
 import { makeTestWorkspaceHarness, memoryCredentialsPlugin } from "./test-config";
@@ -102,6 +105,36 @@ const recoveryPlugin = definePlugin(() => ({
       }),
   }),
 }))();
+
+let failPartialRefreshWrite = true;
+const partialCredentialStore = new Map<string, string>();
+const partialCredentialsPlugin = definePlugin(() => ({
+  id: "partial-credentials" as const,
+  storage: () => ({}),
+  credentialProviders: [
+    {
+      key: ProviderKey.make("partial-memory"),
+      writable: true,
+      get: (id: ProviderItemId) =>
+        Effect.sync(() => partialCredentialStore.get(String(id)) ?? null),
+      set: (id: ProviderItemId, value: string) =>
+        String(id).endsWith(":refresh") && failPartialRefreshWrite
+          ? Effect.fail(
+              new StorageError({
+                message: "intentional refresh outbox write failure",
+                cause: undefined,
+              }),
+            )
+          : Effect.sync(() => {
+              partialCredentialStore.set(String(id), value);
+            }),
+      delete: (id: ProviderItemId) =>
+        Effect.sync(() => {
+          partialCredentialStore.delete(String(id));
+        }),
+    },
+  ],
+}));
 
 const plugins = [memoryCredentialsPlugin(), oauthPlugin] as const;
 
@@ -439,6 +472,177 @@ describe("oauth.start / oauth.complete", () => {
         const error = yield* Effect.flip(executor.oauth.getCompletionReceipt({ correlation }));
         expect(Predicate.isTagged("OAuthCompleteError")(error)).toBe(true);
       }),
+    ),
+  );
+
+  it.effect("stale lease reclaim blocks an exchange-intent ABA replay", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor, config } = yield* makeTestWorkspaceHarness({
+          plugins,
+        });
+        yield* executor.acme.seed();
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+        const correlation = {
+          schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
+          attemptKey: "attempt-oauth-lease-aba-1",
+          actorUserId: "test-subject",
+          organizationId: "test-tenant",
+          workspaceId: "workspace-1",
+          provider: "acme",
+          keyId: "test",
+          issuedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          signature: "test-signature",
+        } as const;
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("lease-aba"),
+          integration: INTEG,
+          template: TEMPLATE,
+          correlation,
+        });
+        if (started.status !== "redirect") return;
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        const codeHash = yield* sha256Hex(callback.code);
+        const now = new Date();
+        yield* Effect.promise(() =>
+          config.db.create("oauth_exchange_intent", {
+            tenant: "test-tenant",
+            attempt_key: correlation.attemptKey,
+            state: String(started.state),
+            provider: "acme",
+            client_slug: String(CLIENT),
+            code_hash: codeHash,
+            provider_transaction_key: `executor:${correlation.attemptKey}`,
+            status: "exchanging",
+            lease_token: "stale-worker",
+            lease_generation: 1,
+            access_token_hash: null,
+            refresh_token_hash: null,
+            started_at: now,
+            updated_at: now,
+            completed_at: null,
+            failure_code: null,
+          }),
+        );
+        yield* Effect.promise(() =>
+          config.db.updateMany("oauth_attempt", {
+            where: (b) => b("attempt_key", "=", correlation.attemptKey),
+            set: {
+              status: "exchanging",
+              lease_token: "reclaimed-winner",
+              lease_generation: 2,
+              lease_expires_at: Date.now() - 1,
+            },
+          }),
+        );
+        const second = yield* Effect.flip(
+          executor.oauth.complete({ state: started.state, code: callback.code }),
+        );
+        expect(Predicate.isTagged("OAuthCompleteError")(second)).toBe(true);
+        const tokenRequests = (yield* server.requests).filter(
+          (request) => request.path === "/token",
+        );
+        expect(tokenRequests).toHaveLength(0);
+      }),
+    ),
+  );
+
+  it.effect("recovers partial access and refresh writes without re-exchanging", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        failPartialRefreshWrite = true;
+        partialCredentialStore.clear();
+        const partialPlugins = [partialCredentialsPlugin(), oauthPlugin] as const;
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor, config } = yield* makeTestWorkspaceHarness({ plugins: partialPlugins });
+        yield* executor.acme.seed();
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+        const correlation = {
+          schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
+          attemptKey: "attempt-oauth-partial-items-1",
+          actorUserId: "test-subject",
+          organizationId: "test-tenant",
+          workspaceId: "workspace-1",
+          provider: "acme",
+          keyId: "test",
+          issuedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          signature: "test-signature",
+        } as const;
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("partial-items"),
+          integration: INTEG,
+          template: TEMPLATE,
+          correlation,
+        });
+        if (started.status !== "redirect") return;
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        const first = yield* Effect.flip(
+          executor.oauth.complete({ state: started.state, code: callback.code }),
+        );
+        expect(Predicate.isTagged("OAuthCompleteError")(first)).toBe(true);
+        const items = yield* Effect.promise(() =>
+          config.db.findMany("oauth_credential_item", {
+            where: (b) => b("attempt_key", "=", correlation.attemptKey),
+          }),
+        );
+        expect(items).toHaveLength(2);
+        const requestsBeforeRecovery = (yield* server.requests).filter(
+          (request) => request.path === "/token",
+        ).length;
+        yield* Effect.promise(() =>
+          config.db.updateMany("oauth_attempt", {
+            where: (b) => b("attempt_key", "=", correlation.attemptKey),
+            set: { lease_expires_at: Date.now() - 1 },
+          }),
+        );
+        const second = yield* Effect.flip(
+          executor.oauth.complete({ state: started.state, code: callback.code }),
+        );
+        expect(Predicate.isTagged("OAuthCompleteError")(second)).toBe(true);
+        const requestsAfterRecovery = (yield* server.requests).filter(
+          (request) => request.path === "/token",
+        ).length;
+        expect(requestsAfterRecovery).toBe(requestsBeforeRecovery);
+        expect(
+          Array.from(partialCredentialStore.keys()).filter((key) => key.startsWith("oauth:")),
+        ).toEqual([]);
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            failPartialRefreshWrite = true;
+            partialCredentialStore.clear();
+          }),
+        ),
+      ),
     ),
   );
 
@@ -812,6 +1016,76 @@ describe("oauth.start / oauth.complete", () => {
         expect(Predicate.isTagged("OAuthStartError")(error)).toBe(true);
         const startError = error as OAuthStartError;
         expect(startError.message).toContain("redirectUri");
+      }),
+    ),
+  );
+
+  it.effect("hosted authorization-code flows refuse legacy callbacks and forged workspaces", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor } = yield* makeTestWorkspaceHarness({
+          plugins,
+          requireOAuthCorrelation: true,
+          verifyOAuthCorrelation: (envelope) =>
+            Effect.succeed({
+              schemaVersion: envelope.schemaVersion,
+              attemptKey: envelope.attemptKey,
+              actorUserId: envelope.actorUserId,
+              organizationId: envelope.organizationId,
+              workspaceId: "authoritative-workspace",
+              provider: envelope.provider,
+            }),
+        });
+        yield* executor.acme.seed();
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+        const legacy = yield* Effect.flip(
+          executor.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("legacy-blocked"),
+            integration: INTEG,
+            template: TEMPLATE,
+          }),
+        );
+        expect(Predicate.isTagged("OAuthStartError")(legacy)).toBe(true);
+        const legacyError = legacy as OAuthStartError;
+        expect(legacyError.message).toContain("correlation");
+        const envelope = {
+          schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
+          attemptKey: "attempt-oauth-forged-workspace-1",
+          actorUserId: "test-subject",
+          organizationId: "test-tenant",
+          workspaceId: "caller-workspace",
+          provider: "acme",
+          keyId: "test",
+          issuedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          signature: "test-signature",
+        } as const;
+        const forged = yield* Effect.flip(
+          executor.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("forged-workspace"),
+            integration: INTEG,
+            template: TEMPLATE,
+            correlation: envelope,
+          }),
+        );
+        expect(Predicate.isTagged("OAuthStartError")(forged)).toBe(true);
+        const forgedError = forged as OAuthStartError;
+        expect(forgedError.message).toContain("mismatched binding");
       }),
     ),
   );

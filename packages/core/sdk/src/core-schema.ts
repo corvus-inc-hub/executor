@@ -293,6 +293,7 @@ export const coreTables = defineTables({
       descriptor_hash: keyColumn("descriptor_hash"),
       status: keyColumn("status"),
       lease_token: nullableKeyColumn("lease_token"),
+      lease_generation: nullableBigintColumn("lease_generation"),
       lease_expires_at: nullableBigintColumn("lease_expires_at"),
       authorization_url: textColumn("authorization_url"),
       started_at: dateColumn("started_at"),
@@ -326,6 +327,8 @@ export const coreTables = defineTables({
       access_token_hash: keyColumn("access_token_hash"),
       refresh_token_hash: nullableKeyColumn("refresh_token_hash"),
       status: keyColumn("status"),
+      lease_token: nullableKeyColumn("lease_token"),
+      lease_generation: nullableBigintColumn("lease_generation"),
       created_at: dateColumn("created_at"),
       updated_at: dateColumn("updated_at"),
       stored_at: nullableDateColumn("stored_at"),
@@ -360,9 +363,59 @@ export const coreTables = defineTables({
       started_at: dateColumn("started_at"),
       completed_at: dateColumn("completed_at"),
       duration_ms: bigintColumn("duration_ms"),
+      lease_token: nullableKeyColumn("lease_token"),
+      lease_generation: nullableBigintColumn("lease_generation"),
       created_at: dateColumn("created_at"),
     },
     ["tenant", "attempt_key"],
+  ),
+
+  // Durable authorization-code exchange lifecycle. The code itself is never
+  // stored; an in-flight exchange is fail-closed after a crash because OAuth
+  // providers generally offer no idempotent readback for one-time codes.
+  oauth_exchange_intent: tenantExecutorTable(
+    "oauth_exchange_intent",
+    {
+      attempt_key: keyColumn("attempt_key"),
+      state: keyColumn("state"),
+      provider: keyColumn("provider"),
+      client_slug: keyColumn("client_slug"),
+      code_hash: keyColumn("code_hash"),
+      provider_transaction_key: keyColumn("provider_transaction_key"),
+      status: keyColumn("status"),
+      lease_token: nullableKeyColumn("lease_token"),
+      lease_generation: nullableBigintColumn("lease_generation"),
+      access_token_hash: nullableKeyColumn("access_token_hash"),
+      refresh_token_hash: nullableKeyColumn("refresh_token_hash"),
+      started_at: dateColumn("started_at"),
+      updated_at: dateColumn("updated_at"),
+      completed_at: nullableDateColumn("completed_at"),
+      failure_code: nullableKeyColumn("failure_code"),
+    },
+    ["tenant", "attempt_key"],
+  ),
+
+  // Per-item credential outbox. Values remain in the external credential
+  // provider; hashes and deterministic item IDs make writes idempotent and
+  // let recovery compensate partial access/refresh writes without re-exchange.
+  oauth_credential_item: tenantExecutorTable(
+    "oauth_credential_item",
+    {
+      attempt_key: keyColumn("attempt_key"),
+      item_kind: keyColumn("item_kind"),
+      required: boolColumn("required", true),
+      provider_key: keyColumn("provider_key"),
+      item_id: textColumn("item_id"),
+      token_hash: keyColumn("token_hash"),
+      status: keyColumn("status"),
+      lease_token: nullableKeyColumn("lease_token"),
+      lease_generation: nullableBigintColumn("lease_generation"),
+      created_at: dateColumn("created_at"),
+      updated_at: dateColumn("updated_at"),
+      stored_at: nullableDateColumn("stored_at"),
+      compensated_at: nullableDateColumn("compensated_at"),
+    },
+    ["tenant", "attempt_key", "item_kind"],
   ),
 
   // Persisted, per-connection tools (option C). Address is derived from

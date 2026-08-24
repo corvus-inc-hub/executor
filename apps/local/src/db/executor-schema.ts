@@ -133,6 +133,7 @@ export const oauth_attempt = sqliteTable(
     descriptor_hash: text("descriptor_hash").notNull(),
     status: text("status").notNull(),
     lease_token: text("lease_token"),
+    lease_generation: integer("lease_generation"),
     lease_expires_at: integer("lease_expires_at"),
     authorization_url: text("authorization_url").notNull(),
     started_at: integer("started_at").notNull(),
@@ -165,6 +166,8 @@ export const oauth_credential_intent = sqliteTable(
     access_token_hash: text("access_token_hash").notNull(),
     refresh_token_hash: text("refresh_token_hash"),
     status: text("status").notNull(),
+    lease_token: text("lease_token"),
+    lease_generation: integer("lease_generation"),
     created_at: integer("created_at").notNull(),
     updated_at: integer("updated_at").notNull(),
     stored_at: integer("stored_at"),
@@ -173,6 +176,54 @@ export const oauth_credential_intent = sqliteTable(
     tenant: text("tenant").notNull(),
   },
   (table) => [uniqueIndex("oauth_credential_intent_uidx").on(table.tenant, table.attempt_key)],
+);
+
+export const oauth_exchange_intent = sqliteTable(
+  "oauth_exchange_intent",
+  {
+    attempt_key: text("attempt_key").notNull(),
+    state: text("state").notNull(),
+    provider: text("provider").notNull(),
+    client_slug: text("client_slug").notNull(),
+    code_hash: text("code_hash").notNull(),
+    provider_transaction_key: text("provider_transaction_key").notNull(),
+    status: text("status").notNull(),
+    lease_token: text("lease_token"),
+    lease_generation: integer("lease_generation"),
+    access_token_hash: text("access_token_hash"),
+    refresh_token_hash: text("refresh_token_hash"),
+    started_at: integer("started_at").notNull(),
+    updated_at: integer("updated_at").notNull(),
+    completed_at: integer("completed_at"),
+    failure_code: text("failure_code"),
+    row_id: text("row_id").primaryKey().notNull(),
+    tenant: text("tenant").notNull(),
+  },
+  (table) => [uniqueIndex("oauth_exchange_intent_uidx").on(table.tenant, table.attempt_key)],
+);
+
+export const oauth_credential_item = sqliteTable(
+  "oauth_credential_item",
+  {
+    attempt_key: text("attempt_key").notNull(),
+    item_kind: text("item_kind").notNull(),
+    required: integer("required", { mode: "boolean" }).notNull().default(true),
+    provider_key: text("provider_key").notNull(),
+    item_id: text("item_id").notNull(),
+    token_hash: text("token_hash").notNull(),
+    status: text("status").notNull(),
+    lease_token: text("lease_token"),
+    lease_generation: integer("lease_generation"),
+    created_at: integer("created_at").notNull(),
+    updated_at: integer("updated_at").notNull(),
+    stored_at: integer("stored_at"),
+    compensated_at: integer("compensated_at"),
+    row_id: text("row_id").primaryKey().notNull(),
+    tenant: text("tenant").notNull(),
+  },
+  (table) => [
+    uniqueIndex("oauth_credential_item_uidx").on(table.tenant, table.attempt_key, table.item_kind),
+  ],
 );
 
 export const oauth_completion_receipt = sqliteTable(
@@ -195,6 +246,8 @@ export const oauth_completion_receipt = sqliteTable(
     started_at: integer("started_at").notNull(),
     completed_at: integer("completed_at").notNull(),
     duration_ms: integer("duration_ms").notNull(),
+    lease_token: text("lease_token"),
+    lease_generation: integer("lease_generation"),
     created_at: integer("created_at").notNull(),
     row_id: text("row_id").primaryKey().notNull(),
     tenant: text("tenant").notNull(),

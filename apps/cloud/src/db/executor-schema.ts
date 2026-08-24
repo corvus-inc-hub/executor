@@ -149,6 +149,7 @@ export const oauth_attempt = pgTable(
     descriptor_hash: varchar("descriptor_hash", { length: 255 }).notNull(),
     status: varchar("status", { length: 255 }).notNull(),
     lease_token: varchar("lease_token", { length: 255 }),
+    lease_generation: bigint("lease_generation", { mode: "bigint" }),
     lease_expires_at: bigint("lease_expires_at", { mode: "bigint" }),
     authorization_url: text("authorization_url").notNull(),
     started_at: timestamp("started_at").notNull(),
@@ -184,6 +185,8 @@ export const oauth_credential_intent = pgTable(
     access_token_hash: varchar("access_token_hash", { length: 255 }).notNull(),
     refresh_token_hash: varchar("refresh_token_hash", { length: 255 }),
     status: varchar("status", { length: 255 }).notNull(),
+    lease_token: varchar("lease_token", { length: 255 }),
+    lease_generation: bigint("lease_generation", { mode: "bigint" }),
     created_at: timestamp("created_at").notNull(),
     updated_at: timestamp("updated_at").notNull(),
     stored_at: timestamp("stored_at"),
@@ -195,6 +198,60 @@ export const oauth_credential_intent = pgTable(
     tenant: varchar("tenant", { length: 255 }).notNull(),
   },
   (table) => [uniqueIndex("oauth_credential_intent_uidx").on(table.tenant, table.attempt_key)],
+);
+
+export const oauth_exchange_intent = pgTable(
+  "oauth_exchange_intent",
+  {
+    attempt_key: varchar("attempt_key", { length: 255 }).notNull(),
+    state: varchar("state", { length: 255 }).notNull(),
+    provider: varchar("provider", { length: 255 }).notNull(),
+    client_slug: varchar("client_slug", { length: 255 }).notNull(),
+    code_hash: varchar("code_hash", { length: 255 }).notNull(),
+    provider_transaction_key: varchar("provider_transaction_key", { length: 255 }).notNull(),
+    status: varchar("status", { length: 255 }).notNull(),
+    lease_token: varchar("lease_token", { length: 255 }),
+    lease_generation: bigint("lease_generation", { mode: "bigint" }),
+    access_token_hash: varchar("access_token_hash", { length: 255 }),
+    refresh_token_hash: varchar("refresh_token_hash", { length: 255 }),
+    started_at: timestamp("started_at").notNull(),
+    updated_at: timestamp("updated_at").notNull(),
+    completed_at: timestamp("completed_at"),
+    failure_code: varchar("failure_code", { length: 255 }),
+    row_id: varchar("row_id", { length: 255 })
+      .primaryKey()
+      .notNull()
+      .$defaultFn(() => createId()),
+    tenant: varchar("tenant", { length: 255 }).notNull(),
+  },
+  (table) => [uniqueIndex("oauth_exchange_intent_uidx").on(table.tenant, table.attempt_key)],
+);
+
+export const oauth_credential_item = pgTable(
+  "oauth_credential_item",
+  {
+    attempt_key: varchar("attempt_key", { length: 255 }).notNull(),
+    item_kind: varchar("item_kind", { length: 255 }).notNull(),
+    required: boolean("required").notNull().default(true),
+    provider_key: varchar("provider_key", { length: 255 }).notNull(),
+    item_id: text("item_id").notNull(),
+    token_hash: varchar("token_hash", { length: 255 }).notNull(),
+    status: varchar("status", { length: 255 }).notNull(),
+    lease_token: varchar("lease_token", { length: 255 }),
+    lease_generation: bigint("lease_generation", { mode: "bigint" }),
+    created_at: timestamp("created_at").notNull(),
+    updated_at: timestamp("updated_at").notNull(),
+    stored_at: timestamp("stored_at"),
+    compensated_at: timestamp("compensated_at"),
+    row_id: varchar("row_id", { length: 255 })
+      .primaryKey()
+      .notNull()
+      .$defaultFn(() => createId()),
+    tenant: varchar("tenant", { length: 255 }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("oauth_credential_item_uidx").on(table.tenant, table.attempt_key, table.item_kind),
+  ],
 );
 
 export const oauth_completion_receipt = pgTable(
@@ -217,6 +274,8 @@ export const oauth_completion_receipt = pgTable(
     started_at: timestamp("started_at").notNull(),
     completed_at: timestamp("completed_at").notNull(),
     duration_ms: bigint("duration_ms", { mode: "bigint" }).notNull(),
+    lease_token: varchar("lease_token", { length: 255 }),
+    lease_generation: bigint("lease_generation", { mode: "bigint" }),
     created_at: timestamp("created_at").notNull(),
     row_id: varchar("row_id", { length: 255 })
       .primaryKey()

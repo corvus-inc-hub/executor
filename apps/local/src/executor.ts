@@ -198,6 +198,10 @@ const createLocalExecutorLayer = (options: LocalExecutorOptions = {}) => {
         // (loopback localhost is correct + intended for the local CLI, but it
         // is wired explicitly here rather than relying on a hidden default).
         redirectUri: new URL("/api/oauth/callback", webBaseUrl).toString(),
+        // Local normal UI entrypoints remain explicitly blocked until the host
+        // supplies a signed correlation verifier; CLI/test callers can still
+        // construct an Executor directly with the default false gate.
+        requireOAuthCorrelation: true,
         // Built-in agent-facing tools (integrations / connections / policies).
         coreTools: {
           webBaseUrl,

@@ -102,6 +102,10 @@ export const CloudHostConfig: Layer.Layer<HostConfig> = Layer.sync(HostConfig, (
   allowLocalNetwork: env.ALLOW_LOCAL_NETWORK === "true",
   webBaseUrl: env.VITE_PUBLIC_SITE_URL ?? "https://executor.sh",
   oauthCallbackPath: `${CLOUD_MOUNT_PREFIX}/oauth/callback`,
+  // Correlated OAuth signing is not wired in this host yet. Keep all normal
+  // authorization-code UI entrypoints fail-closed until the WorkOS/request
+  // authority supplies HostConfig.verifyOAuthCorrelation.
+  requireOAuthCorrelation: true,
   // WorkOS Vault is cloud's credential storage implementation detail, not a
   // user-selectable provider surface.
   exposeCredentialProviders: false,

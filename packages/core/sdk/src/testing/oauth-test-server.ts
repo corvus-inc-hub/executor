@@ -54,6 +54,8 @@ export interface OAuthTestServerOptions {
   readonly omitTokenResponseScopes?: readonly string[];
   readonly supportRefresh?: boolean;
   readonly tokenExpiresInSeconds?: number;
+  /** Delay token responses to exercise lease expiry and callback races. */
+  readonly tokenResponseDelayMs?: number;
   readonly invalidRefreshTokenDescription?: string;
   readonly idTokenClaims?: Readonly<Record<string, unknown>>;
   readonly refreshIdTokenClaims?: Readonly<Record<string, unknown>>;
@@ -627,6 +629,9 @@ export const serveOAuthTestServer = (
           }
 
           const grantType = params.get("grant_type");
+          if (options.tokenResponseDelayMs && options.tokenResponseDelayMs > 0) {
+            yield* Effect.sleep(options.tokenResponseDelayMs);
+          }
           if (grantType === "authorization_code") {
             const code = params.get("code");
             const redirectUri = params.get("redirect_uri");

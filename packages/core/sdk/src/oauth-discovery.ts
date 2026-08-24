@@ -27,6 +27,7 @@ import {
   buildAuthorizationUrl,
   createPkceCodeChallenge,
   createPkceCodeVerifier,
+  sanitizeOAuthBoundaryText,
   type OAuthEndpointUrlPolicy,
 } from "./oauth-helpers";
 
@@ -463,7 +464,7 @@ const interpretDcrFailure = (status: number, text: string): DcrErrorBody | DcrTr
       onNone: () =>
         new DcrTransport({
           detail: `Dynamic Client Registration endpoint returned status ${status}${
-            text ? ` — ${text.slice(0, 200)}` : ""
+            text ? ` — ${sanitizeOAuthBoundaryText(text)}` : ""
           }`,
           status,
         }),
@@ -476,7 +477,7 @@ const interpretDcrFailure = (status: number, text: string): DcrErrorBody | DcrTr
             })
           : new DcrTransport({
               detail: `Dynamic Client Registration endpoint returned status ${status}${
-                text ? ` — ${text.slice(0, 200)}` : ""
+                text ? ` — ${sanitizeOAuthBoundaryText(text)}` : ""
               }`,
               status,
             }),
@@ -484,7 +485,7 @@ const interpretDcrFailure = (status: number, text: string): DcrErrorBody | DcrTr
   }
   return new DcrTransport({
     detail: `Dynamic Client Registration endpoint returned status ${status}${
-      text ? ` — ${text.slice(0, 200)}` : ""
+      text ? ` — ${sanitizeOAuthBoundaryText(text)}` : ""
     }`,
     status,
   });
@@ -559,11 +560,14 @@ export const registerDynamicClient = (
         Effect.fail(
           new OAuthDiscoveryError({
             message: `Dynamic Client Registration failed: ${err.error}${
-              err.error_description ? ` — ${err.error_description}` : ""
+              err.error_description ? ` — ${sanitizeOAuthBoundaryText(err.error_description)}` : ""
             }`,
             status: err.status,
             error: err.error,
-            errorDescription: err.error_description,
+            errorDescription:
+              err.error_description === undefined
+                ? undefined
+                : sanitizeOAuthBoundaryText(err.error_description),
             cause: err,
           }),
         ),

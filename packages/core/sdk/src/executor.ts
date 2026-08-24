@@ -431,6 +431,13 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
    * authenticates actor/organization, and resolves the workspace target. If
    * absent, correlated OAuth fails closed. */
   readonly verifyOAuthCorrelation?: OAuthCorrelationVerifier;
+  /** Hosted UI readiness gate. When true, authorization-code OAuth refuses
+   * legacy uncorrelated starts/completions until the host supplies a signed
+   * correlation verifier. */
+  readonly requireOAuthCorrelation?: boolean;
+  /** Test-only lease timing overrides for crash/concurrency boundary tests. */
+  readonly oauthAttemptLeaseMs?: number;
+  readonly oauthAttemptHeartbeatMs?: number;
   readonly oauthEndpointUrlPolicy?: OAuthEndpointUrlPolicy;
   /**
    * Enable the built-in `core-tools` plugin which contributes agent-facing
@@ -3871,6 +3878,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       redirectUri: config.redirectUri ?? null,
       callbackStateOrgSlug: config.oauthCallbackStateOrgSlug ?? null,
       verifyCorrelationEnvelope: config.verifyOAuthCorrelation,
+      requireOAuthCorrelation: config.requireOAuthCorrelation,
+      oauthAttemptLeaseMs: config.oauthAttemptLeaseMs,
+      oauthAttemptHeartbeatMs: config.oauthAttemptHeartbeatMs,
     });
 
     // ------------------------------------------------------------------

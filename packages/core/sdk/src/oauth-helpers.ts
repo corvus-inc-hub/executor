@@ -62,6 +62,27 @@ export interface OAuthEndpointUrlPolicy {
   readonly allowHttp?: boolean;
 }
 
+/** Keep provider diagnostics useful without allowing credentials, query
+ * parameters, or stack/URL material to cross the OAuth boundary. */
+export const sanitizeOAuthBoundaryText = (value: string, max = 240): string => {
+  const scrubbedUrls = value.replaceAll(/https?:\/\/[^\s)]+/gi, (raw) => {
+    const candidate = raw.replace(/[.,;]+$/g, "");
+    if (!URL.canParse(candidate)) return "[url]";
+    const parsed = new URL(candidate);
+    return `${parsed.origin}${parsed.pathname}`;
+  });
+  const redacted = scrubbedUrls
+    .replaceAll(/Bearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+    .replaceAll(
+      /((?:access_token|refresh_token|id_token|client_secret|client_id|code|token|secret|password)[=:]\s*)[^\s&,;)}]+/gi,
+      "$1[redacted]",
+    )
+    .replaceAll(/\p{Cc}/gu, " ")
+    .replaceAll(/\s+/g, " ")
+    .trim();
+  return redacted.length > max ? `${redacted.slice(0, max)}...` : redacted;
+};
+
 export const isLoopbackHttpUrl = (value: string): boolean => {
   if (!URL.canParse(value)) return false;
   const url = new URL(value);
@@ -298,9 +319,9 @@ const redactTokenEndpointBody = (body: string): string =>
     );
 
 const tokenEndpointHttpSummary = async (response: Response): Promise<string> => {
-  const status = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+  const status = `HTTP ${response.status}${response.statusText ? ` ${sanitizeOAuthBoundaryText(response.statusText)}` : ""}`;
   const contentType = response.headers.get("content-type");
-  const url = response.url ? ` from ${response.url}` : "";
+  const url = response.url ? ` from ${sanitizeOAuthBoundaryText(response.url)}` : "";
   const parts = [`${status}${url}`];
   if (contentType) parts.push(`content-type ${contentType}`);
   const preview = await bodyPreviewFromResponse(response);
@@ -317,7 +338,7 @@ const bodyPreviewFromResponse = async (response: Response): Promise<string | und
     );
   if (!text) return undefined;
   const redacted = redactTokenEndpointBody(text.replaceAll(/\s+/g, " "));
-  return redacted.length > 500 ? `${redacted.slice(0, 500)}...` : redacted;
+  return sanitizeOAuthBoundaryText(redacted, 500);
 };
 
 const toOAuth2Error = (cause: unknown): OAuth2Error => {
@@ -336,7 +357,7 @@ const toOAuth2Error = (cause: unknown): OAuth2Error => {
           ? c.message
           : undefined;
     return new OAuth2Error({
-      message: `OAuth token exchange failed: ${description ?? code ?? "unknown error"}`,
+      message: `OAuth token exchange failed: ${sanitizeOAuthBoundaryText(String(description ?? code ?? "unknown error"))}`,
       error: code,
       cause,
     });

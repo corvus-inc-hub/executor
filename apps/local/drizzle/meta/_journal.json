@@ -50,6 +50,13 @@
       "when": 1787600112049,
       "tag": "0006_magical_genesis",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1787607843539,
+      "tag": "0007_loud_mastermind",
+      "breakpoints": true
     }
   ]
 }

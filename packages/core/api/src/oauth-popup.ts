@@ -22,6 +22,25 @@ import {
 export { OAUTH_POPUP_MESSAGE_TYPE, isOAuthPopupResult } from "@executor-js/sdk";
 export type { OAuthPopupResult } from "@executor-js/sdk";
 
+const sanitizePopupBoundaryText = (value: string, max = 240): string => {
+  const withoutUrls = value.replaceAll(/https?:\/\/[^\s)]+/gi, (raw) => {
+    const candidate = raw.replace(/[.,;]+$/g, "");
+    if (!URL.canParse(candidate)) return "[url]";
+    const parsed = new URL(candidate);
+    return `${parsed.origin}${parsed.pathname}`;
+  });
+  const redacted = withoutUrls
+    .replaceAll(/Bearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+    .replaceAll(
+      /((?:access_token|refresh_token|id_token|client_secret|client_id|code|token|secret|password)[=:]\s*)[^\s&,;)}]+/gi,
+      "$1[redacted]",
+    )
+    .replaceAll(/\p{Cc}/gu, " ")
+    .replaceAll(/\s+/g, " ")
+    .trim();
+  return redacted.length > max ? `${redacted.slice(0, max)}...` : redacted;
+};
+
 // ---------------------------------------------------------------------------
 // Completion listener — optional process-wide hook called every time an
 // OAuth flow finishes (success or failure). Lets hosts that can't use the
@@ -168,7 +187,9 @@ const providerErrorMessage = (params: OAuthCallbackUrlParams): PopupErrorMessage
   if (!value) return null;
   return {
     short: "OAuth provider rejected authorization",
-    details: error && description && description !== error ? `${error}: ${description}` : value,
+    details: sanitizePopupBoundaryText(
+      error && description && description !== error ? `${error}: ${description}` : value,
+    ),
   };
 };
 
@@ -217,12 +238,14 @@ export const runOAuthCallback = <TAuth, E, R>(
   return result.pipe(
     Effect.catchCause((cause) => {
       const { short, details } = input.toErrorMessage(Cause.squash(cause));
+      const safeShort = sanitizePopupBoundaryText(short);
+      const safeDetails = details === undefined ? undefined : sanitizePopupBoundaryText(details);
       return Effect.succeed<OAuthPopupResult<TAuth>>({
         type: OAUTH_POPUP_MESSAGE_TYPE,
         ok: false,
         sessionId,
-        error: short,
-        ...(details && details !== short ? { errorDetails: details } : {}),
+        error: safeShort,
+        ...(safeDetails && safeDetails !== safeShort ? { errorDetails: safeDetails } : {}),
       });
     }),
     Effect.tap((result) =>

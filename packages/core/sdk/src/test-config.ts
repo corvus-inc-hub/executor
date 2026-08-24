@@ -139,6 +139,9 @@ export type TestConfigOptions<TPlugins extends readonly AnyPlugin[] = readonly [
   readonly redirectUri?: string | null;
   readonly oauthCallbackStateOrgSlug?: string;
   readonly verifyOAuthCorrelation?: ExecutorConfig<TPlugins>["verifyOAuthCorrelation"];
+  readonly requireOAuthCorrelation?: boolean;
+  readonly oauthAttemptLeaseMs?: number;
+  readonly oauthAttemptHeartbeatMs?: number;
 };
 
 export const makeTestConfig = <const TPlugins extends readonly AnyPlugin[] = readonly []>(
@@ -179,6 +182,9 @@ export const makeTestConfig = <const TPlugins extends readonly AnyPlugin[] = rea
     ...(redirectUri != null ? { redirectUri } : {}),
     oauthCallbackStateOrgSlug: options?.oauthCallbackStateOrgSlug,
     verifyOAuthCorrelation: options?.verifyOAuthCorrelation ?? TEST_OAUTH_CORRELATION_VERIFIER,
+    requireOAuthCorrelation: options?.requireOAuthCorrelation,
+    oauthAttemptLeaseMs: options?.oauthAttemptLeaseMs,
+    oauthAttemptHeartbeatMs: options?.oauthAttemptHeartbeatMs,
   };
 };
 
