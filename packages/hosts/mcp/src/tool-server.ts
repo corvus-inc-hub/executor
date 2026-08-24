@@ -488,8 +488,9 @@ export const formatMcpExecutionOutcome = (
 // `execute` failures reaching the MCP host are infra defects — domain
 // failures from tools are now expressed as `ToolResult` values (success
 // channel) and flow through `formatExecuteResult`. Emit an opaque
-// generic plus a fresh correlation id and log the cause out-of-band so
-// the model can't read internal context off `.message`.
+// generic plus a fresh correlation id. Do not stringify or pretty-print the
+// cause: provider URLs, query strings, tokens, messages, and stacks are all
+// untrusted and must not reach console/Sentry-style observers.
 const newCorrelationId = (): string =>
   Math.floor(Math.random() * 0x1_0000_0000)
     .toString(16)
@@ -533,7 +534,7 @@ const toMcpFailureResult = (cause: Cause.Cause<unknown>): McpToolResult => {
   try {
     console.error(
       `[executor:mcp] execute defect correlation_id=${correlationId}`,
-      Cause.pretty(cause),
+      JSON.stringify({ hasFailure: Cause.hasFails(cause), hasDefect: Cause.hasDies(cause) }),
     );
   } catch {
     /* ignore logger failures */

@@ -353,11 +353,14 @@ export interface ExecuteOperationReplayStore<E = never> {
    */
   readonly reserve: (input: {
     readonly tenant: string;
+    /** Subject is part of replay identity when the executor is user-scoped. */
+    readonly subject?: string;
     readonly jobId: string;
     readonly requestSha256: string;
   }) => Effect.Effect<ExecuteOperationReplayReservation, E>;
   readonly settle: (input: {
     readonly tenant: string;
+    readonly subject?: string;
     readonly jobId: string;
     readonly requestSha256: string;
     readonly reservationToken: string;
@@ -405,9 +408,9 @@ export const makeInMemoryOperationReplayStore = (): ExecuteOperationReplayStore 
   const entries = new Map<string, Entry>();
   return {
     durability: "process-local" as const,
-    reserve: ({ tenant, jobId, requestSha256 }) =>
+    reserve: ({ tenant, subject, jobId, requestSha256 }) =>
       Effect.sync(() => {
-        const key = JSON.stringify([tenant, jobId]);
+        const key = JSON.stringify([tenant, subject ?? null, jobId]);
         const existing = entries.get(key);
         if (!existing) {
           const reservationToken = crypto.randomUUID();
@@ -421,9 +424,9 @@ export const makeInMemoryOperationReplayStore = (): ExecuteOperationReplayStore 
           ? { status: "replay" as const, result: existing.result }
           : { status: "in_progress" as const };
       }),
-    settle: ({ tenant, jobId, requestSha256, reservationToken, result }) =>
+    settle: ({ tenant, subject, jobId, requestSha256, reservationToken, result }) =>
       Effect.sync(() => {
-        const key = JSON.stringify([tenant, jobId]);
+        const key = JSON.stringify([tenant, subject ?? null, jobId]);
         const existing = entries.get(key);
         if (
           existing?.requestSha256 === requestSha256 &&

@@ -1,4 +1,4 @@
-import { Effect, Inspectable, Layer, Option, Predicate, Schema } from "effect";
+import { Cause, Effect, Inspectable, Layer, Option, Predicate, Schema } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 import { fumadb } from "@executor-js/fumadb";
 import { memoryAdapter } from "@executor-js/fumadb/adapters/memory";
@@ -3917,6 +3917,111 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         ),
       );
 
+    // Operation handlers receive credentials and a reviewed target from core;
+    // they do not receive the executor's ambient mutation/credential surface.
+    // Keep the existing PluginCtx type for generic handlers, but hand
+    // operation handlers a capability facade that exposes only owner, HTTP,
+    // and plugin-owned read storage. Missing capabilities fail as an opaque
+    // defect and are normalized by the operation boundary.
+    const operationPluginContext = (ctx: PluginCtx<unknown>): PluginCtx<unknown> => {
+      const isWriteCapability = (property: PropertyKey): boolean =>
+        typeof property === "string" &&
+        /^(create|delete|insert|put|set|update|remove|write|save|clear|reset|replace|publish|register|upsert|patch|run|execute|transaction)/i.test(
+          property,
+        );
+      const readOnlyStorage =
+        typeof ctx.storage === "object" && ctx.storage !== null
+          ? new Proxy(ctx.storage, {
+              get(target, property, receiver) {
+                const value = Reflect.get(target, property, receiver);
+                if (typeof value !== "function") return value;
+                if (isWriteCapability(property)) {
+                  return undefined;
+                }
+                return value.bind(target);
+              },
+              has(target, property) {
+                return !isWriteCapability(property) && Reflect.has(target, property);
+              },
+              ownKeys(target) {
+                return Reflect.ownKeys(target).filter((property) => !isWriteCapability(property));
+              },
+              getOwnPropertyDescriptor(target, property) {
+                return isWriteCapability(property)
+                  ? undefined
+                  : Reflect.getOwnPropertyDescriptor(target, property);
+              },
+            })
+          : ctx.storage;
+      const readOnlyIntegrations = new Proxy(ctx.core.integrations, {
+        get(target, property, receiver) {
+          if (property !== "get" && property !== "list") return undefined;
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+        has(target, property) {
+          return property === "get" || property === "list";
+        },
+        ownKeys() {
+          return ["get", "list"];
+        },
+        getOwnPropertyDescriptor(target, property) {
+          if (property !== "get" && property !== "list") return undefined;
+          return Reflect.getOwnPropertyDescriptor(target, property);
+        },
+      });
+      const readOnlyCore = new Proxy(ctx.core, {
+        get(target, property, _receiver) {
+          if (property === "integrations") {
+            return readOnlyIntegrations;
+          }
+          return undefined;
+        },
+        has(_target, property) {
+          return property === "integrations";
+        },
+        ownKeys() {
+          return ["integrations"];
+        },
+        getOwnPropertyDescriptor(target, property) {
+          return property === "integrations"
+            ? Reflect.getOwnPropertyDescriptor(target, property)
+            : undefined;
+        },
+      });
+      return new Proxy(ctx, {
+        get(target, property, receiver) {
+          if (property === "owner" || property === "httpClientLayer") {
+            return Reflect.get(target, property, receiver);
+          }
+          if (property === "storage") return readOnlyStorage;
+          if (property === "core") return readOnlyCore;
+          // connections/providers/pluginStorage/policies/execute/transaction
+          // are intentionally absent from this capability context.
+          return undefined;
+        },
+        has(_target, property) {
+          return (
+            property === "owner" ||
+            property === "httpClientLayer" ||
+            property === "storage" ||
+            property === "core"
+          );
+        },
+        ownKeys() {
+          return ["owner", "httpClientLayer", "storage", "core"];
+        },
+        getOwnPropertyDescriptor(target, property) {
+          return property === "owner" ||
+            property === "httpClientLayer" ||
+            property === "storage" ||
+            property === "core"
+            ? Reflect.getOwnPropertyDescriptor(target, property)
+            : undefined;
+        },
+      });
+    };
+
     const executeInternal = (
       address: ToolAddress,
       args: unknown,
@@ -4007,7 +4112,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               );
           const value = yield* wrapInvocationError(
             staticEntry.tool.handler({
-              ctx: staticEntry.ctx,
+              ctx: internal?.operation ? operationPluginContext(staticEntry.ctx) : staticEntry.ctx,
               args,
               elicit: buildElicit(address, args, handler),
             }),
@@ -4154,7 +4259,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
         const value = yield* wrapInvocationError(
           runtime.plugin.invokeTool({
-            ctx: runtime.ctx,
+            ctx: internal?.operation ? operationPluginContext(runtime.ctx) : runtime.ctx,
             toolRow: row,
             credential,
             args,
@@ -4169,6 +4274,17 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           provider: providerEvidenceFromValue(value),
         };
       }).pipe(
+        Effect.catchCause((cause) =>
+          internal?.operation && Cause.hasDies(cause)
+            ? Effect.fail(
+                new ToolInvocationError({
+                  address,
+                  message: "Operation invocation failed.",
+                  cause: {},
+                }),
+              )
+            : Effect.failCause(cause),
+        ),
         // Expected tool failures (`ToolResult.fail`) resolve through the
         // success channel, so the tracer alone would record them as healthy
         // spans. Stamp the outcome + error code so telemetry can distinguish
@@ -4583,6 +4699,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       readonly descriptor: ExecuteOperationDescriptor;
       readonly definition: ExecuteOperationDefinition;
       readonly tenant: string;
+      readonly subject: string | null;
       readonly carrier: ExecuteOperationCarrier;
     }): Effect.Effect<ExecuteOperationResult, OperationContractError> =>
       Effect.gen(function* () {
@@ -4613,6 +4730,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
         if (
           decoded.approval.tenant !== input.tenant ||
+          decoded.approval.subject !== (input.subject ?? undefined) ||
           decoded.approval.executionId !== decoded.executionId ||
           decoded.approval.jobId !== decoded.jobId ||
           decoded.approval.operationKey !== decoded.operationKey ||
@@ -4622,6 +4740,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           String(decoded.approval.target) !== String(decoded.target) ||
           decoded.approval.providerTransport !== decoded.providerTransport ||
           decoded.approval.carrier !== decoded.carrier ||
+          decoded.approval.sessionId !== `approval:${decoded.executionId}` ||
           !samePolicy(decoded.approval.policy, decoded.policy)
         ) {
           return yield* failResult("result.approval");
@@ -4658,6 +4777,65 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         }
         if (decoded.status !== "completed" && outputPresent) {
           return yield* failResult("result.output");
+        }
+
+        // The approval adapter is an authorization boundary, not a free-form
+        // annotation. Reject results whose status, policy, and decision could
+        // not have been produced by the reviewed lifecycle.
+        if (
+          decoded.status === "completed" &&
+          (decoded.policy.decision === "deny" ||
+            (decoded.policy.decision === "require_approval" &&
+              decoded.approval.decision !== "approved") ||
+            (decoded.policy.decision === "allow" && decoded.approval.decision !== "not_required"))
+        ) {
+          return yield* failResult("result.approval");
+        }
+        if (
+          decoded.policy.decision === "require_approval" &&
+          decoded.approval.decision === "not_required"
+        ) {
+          return yield* failResult("result.approval");
+        }
+        if (decoded.status === "blocked" && decoded.approval.decision === "approved") {
+          return yield* failResult("result.approval");
+        }
+        if (decoded.status === "cancelled" && decoded.approval.decision !== "cancelled") {
+          return yield* failResult("result.approval");
+        }
+        if (
+          decoded.status === "failed" &&
+          (decoded.approval.decision === "declined" || decoded.approval.decision === "cancelled")
+        ) {
+          return yield* failResult("result.approval");
+        }
+        if (decoded.failure !== undefined) {
+          const code = decoded.failure.code;
+          if (
+            decoded.status === "cancelled" &&
+            code !== "operation_cancelled" &&
+            code !== "approval_cancelled"
+          ) {
+            return yield* failResult("result.failure");
+          }
+          if (
+            decoded.status === "blocked" &&
+            code !== "policy_blocked" &&
+            code !== "approval_handler_required" &&
+            code !== "approval_declined"
+          ) {
+            return yield* failResult("result.failure");
+          }
+          if (
+            decoded.status === "failed" &&
+            (code === "operation_cancelled" ||
+              code === "approval_cancelled" ||
+              code === "policy_blocked" ||
+              code === "approval_handler_required" ||
+              code === "approval_declined")
+          ) {
+            return yield* failResult("result.failure");
+          }
         }
 
         const reconciliation = decoded.providerReconciliation;
@@ -4791,6 +4969,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     > => {
       type ReservationBinding = {
         readonly tenant: string;
+        readonly subject: string | null;
         readonly jobId: string;
         readonly requestSha256: string;
         readonly reservationToken: string;
@@ -4928,48 +5107,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           };
         };
 
-        const reservation = yield* operationReplayStore.reserve({
-          tenant,
-          jobId: sanitizedRequest.jobId,
-          requestSha256: sanitizedRequest.requestSha256,
-        });
-        if (reservation.status === "replay") {
-          return yield* validateAndRebindOperationResult({
-            raw: reservation.result,
-            request: sanitizedRequest,
-            descriptor,
-            definition,
-            tenant,
-            carrier,
-          });
-        }
-        if (reservation.status === "conflict") {
-          return yield* new OperationRequestHashMismatchError({
-            expected: reservation.requestSha256,
-            actual: sanitizedRequest.requestSha256,
-          });
-        }
-        if (reservation.status === "in_progress") {
-          return yield* new OperationContractError({
-            field: "jobId",
-            reason: "replay_in_progress",
-          });
-        }
-        const reservationToken = reservation.reservationToken;
-        reservationBinding = {
-          tenant,
-          jobId: sanitizedRequest.jobId,
-          requestSha256: sanitizedRequest.requestSha256,
-          reservationToken,
-          request: sanitizedRequest,
-          descriptor,
-          definition,
-          carrier,
-        };
-        // If policy resolution itself is interrupted, there is no policy
-        // snapshot to bind yet. A conservative deny snapshot still gives the
-        // host a typed terminal cancellation instead of leaving an in-flight
-        // reservation forever. It is replaced immediately after resolution.
+        // Install the conservative terminal result before reserve. The
+        // reserve effect may commit in a durable adapter immediately before
+        // the fiber is interrupted, so acquisition and local ownership are
+        // one uninterruptible scope rather than a racy yield followed by an
+        // assignment.
         const pendingCancellationPolicy: EffectivePolicy = {
           action: "block",
           source: "plugin-default",
@@ -4990,6 +5132,56 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             failure: { code: "operation_cancelled", retryable: false },
           });
 
+        const reservation = yield* Effect.uninterruptible(
+          operationReplayStore
+            .reserve({
+              tenant,
+              subject: subject ?? undefined,
+              jobId: sanitizedRequest.jobId,
+              requestSha256: sanitizedRequest.requestSha256,
+            })
+            .pipe(
+              Effect.tap((candidate) => {
+                if (candidate.status !== "reserved") return Effect.void;
+                reservationBinding = {
+                  tenant,
+                  subject,
+                  jobId: sanitizedRequest.jobId,
+                  requestSha256: sanitizedRequest.requestSha256,
+                  reservationToken: candidate.reservationToken,
+                  request: sanitizedRequest,
+                  descriptor,
+                  definition,
+                  carrier,
+                };
+                return Effect.void;
+              }),
+            ),
+        );
+        if (reservation.status === "replay") {
+          return yield* validateAndRebindOperationResult({
+            raw: reservation.result,
+            request: sanitizedRequest,
+            descriptor,
+            definition,
+            tenant,
+            subject,
+            carrier,
+          });
+        }
+        if (reservation.status === "conflict") {
+          return yield* new OperationRequestHashMismatchError({
+            expected: reservation.requestSha256,
+            actual: sanitizedRequest.requestSha256,
+          });
+        }
+        if (reservation.status === "in_progress") {
+          return yield* new OperationContractError({
+            field: "jobId",
+            reason: "replay_in_progress",
+          });
+        }
+        const reservationToken = reservation.reservationToken;
         const policy = yield* operationTargetPolicy(descriptor.target);
         const approvalContext: ExecuteOperationApprovalContext = {
           tenant,
@@ -5056,7 +5248,16 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                   reason: "invalid_value",
                 });
               }
-              const decision = yield* approvalEffect;
+              const decision = yield* approvalEffect.pipe(
+                Effect.catchCause(() =>
+                  Effect.fail(
+                    new OperationContractError({
+                      field: "approval.handler",
+                      reason: "invalid_value",
+                    }),
+                  ),
+                ),
+              );
               if (!isExecuteOperationApprovalDecision(decision)) {
                 return yield* new OperationContractError({
                   field: "approval.decision",
@@ -5245,10 +5446,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           descriptor,
           definition,
           tenant,
+          subject,
           carrier,
         });
         const settleStatus = yield* operationReplayStore.settle({
           tenant,
+          subject: subject ?? undefined,
           jobId: sanitizedRequest.jobId,
           requestSha256: sanitizedRequest.requestSha256,
           reservationToken,
@@ -5263,34 +5466,58 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         reservationSettled = true;
         return validatedResult;
       }).pipe(
-        Effect.onInterrupt(() => {
-          const binding = reservationBinding;
-          const makeCancelled = cancellationResultFactory;
-          if (!binding || !makeCancelled || reservationSettled) return Effect.void;
-          return validateAndRebindOperationResult({
-            raw: makeCancelled(),
-            request: binding.request,
-            descriptor: binding.descriptor,
-            definition: binding.definition,
-            tenant: binding.tenant,
-            carrier: binding.carrier,
+        // Never let an adapter/plugin defect carry provider-owned data into
+        // an observer. Typed failures retain their contract identity; defects
+        // become an opaque contract error and the finalizer still settles the
+        // reservation below.
+        Effect.catchCause((cause) =>
+          Cause.hasDies(cause)
+            ? Effect.fail(
+                new OperationContractError({ field: "execution", reason: "invalid_value" }),
+              )
+            : Effect.failCause(cause),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            const binding = reservationBinding;
+            const makeCancelled = cancellationResultFactory;
+            const store = operationReplayStore;
+            if (!binding || !makeCancelled || !store || reservationSettled) return Effect.void;
+            return validateAndRebindOperationResult({
+              raw: makeCancelled(),
+              request: binding.request,
+              descriptor: binding.descriptor,
+              definition: binding.definition,
+              tenant: binding.tenant,
+              subject: binding.subject,
+              carrier: binding.carrier,
+            }).pipe(
+              Effect.flatMap((result) =>
+                store
+                  .settle({
+                    tenant: binding.tenant,
+                    subject: binding.subject ?? undefined,
+                    jobId: binding.jobId,
+                    requestSha256: binding.requestSha256,
+                    reservationToken: binding.reservationToken,
+                    result,
+                  })
+                  .pipe(
+                    Effect.tap((status) => {
+                      if (status === "settled") reservationSettled = true;
+                      return Effect.void;
+                    }),
+                    Effect.asVoid,
+                  ),
+              ),
+              Effect.ignore,
+            );
           }).pipe(
-            Effect.flatMap((result) =>
-              operationReplayStore
-                ? operationReplayStore
-                    .settle({
-                      tenant: binding.tenant,
-                      jobId: binding.jobId,
-                      requestSha256: binding.requestSha256,
-                      reservationToken: binding.reservationToken,
-                      result,
-                    })
-                    .pipe(Effect.asVoid)
-                : Effect.void,
-            ),
-            Effect.ignore,
-          );
-        }),
+            Effect.flatten,
+            Effect.uninterruptible,
+            Effect.catchCause(() => Effect.void),
+          ),
+        ),
       );
     };
 

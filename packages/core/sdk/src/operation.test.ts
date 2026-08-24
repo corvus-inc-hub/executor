@@ -21,6 +21,7 @@ import {
   type ExecuteOperationRequest,
 } from "./operation";
 import { createExecutor } from "./executor";
+import { StorageError } from "./fuma-runtime";
 import {
   GOLDEN_OPERATION_DEFINITION,
   GOLDEN_OPERATION_DESCRIPTOR,
@@ -339,6 +340,62 @@ describe("carrier-neutral operation attestation", () => {
     }),
   );
 
+  it.effect("gives operation handlers a capability-scoped plugin context", () =>
+    Effect.gen(function* () {
+      let ambientCapabilities = false;
+      const scopedPlugin = definePlugin(() => ({
+        id: "attestation-scoped-context" as const,
+        storage: () => ({
+          getValue: () => "readable",
+          putValue: () => "must-not-be exposed",
+        }),
+        staticIntegrations: () => [
+          {
+            id: "attestation-scoped-context",
+            kind: "plugin" as const,
+            name: "Scoped context",
+            tools: [
+              tool({
+                name: "echo",
+                description: "Scoped operation target.",
+                inputSchema: INPUT,
+                outputSchema: OUTPUT,
+                execute: ({ value }, context) =>
+                  Effect.sync(() => {
+                    const storage = context.ctx.storage;
+                    const storageHasWrite =
+                      typeof storage === "object" &&
+                      storage !== null &&
+                      Reflect.get(storage, "putValue") !== undefined;
+                    ambientCapabilities =
+                      context.ctx.connections !== undefined ||
+                      context.ctx.providers !== undefined ||
+                      context.ctx.execute !== undefined ||
+                      context.ctx.transaction !== undefined ||
+                      context.ctx.pluginStorage !== undefined ||
+                      storageHasWrite;
+                    return { value };
+                  }),
+              }),
+            ],
+          },
+        ],
+      }))();
+      const operation = definition(
+        ToolAddress.make("attestation-scoped-context.echo"),
+        "scoped-context",
+      );
+      const executor = yield* makeTestExecutor({
+        plugins: [scopedPlugin] as const,
+        operations: [operation],
+      });
+      const request = yield* makeRequest(operation, "job-scoped-context", { value: "scoped" });
+      const result = yield* executor.executeOperation(request, "http");
+      expect(result.status).toBe("completed");
+      expect(ambientCapabilities).toBe(false);
+    }),
+  );
+
   it.effect("atomically replays the same job and rejects a different request hash", () =>
     Effect.gen(function* () {
       const operation = definition();
@@ -410,6 +467,186 @@ describe("carrier-neutral operation attestation", () => {
     }),
   );
 
+  it.effect("settles a reservation after a policy-store defect so retry is not stuck", () =>
+    Effect.gen(function* () {
+      const policyDefectPlugin = definePlugin(() => ({
+        id: "attestation-policy-defect" as const,
+        storage: () => ({}),
+        toolPolicyProvider: () => ({
+          list: () =>
+            // oxlint-disable-next-line executor/no-effect-escape-hatch, executor/no-error-constructor -- adversarial defect regression
+            Effect.die(new Error("https://provider.invalid/?token=policy-sentinel")),
+        }),
+        staticIntegrations: () => [
+          {
+            id: "attestation-policy-defect",
+            kind: "plugin" as const,
+            name: "Policy defect",
+            tools: [
+              tool({
+                name: "echo",
+                description: "Policy defect target.",
+                inputSchema: INPUT,
+                outputSchema: OUTPUT,
+                execute: ({ value }) => Effect.succeed({ value }),
+              }),
+            ],
+          },
+        ],
+      }))();
+      const operation = definition(
+        ToolAddress.make("attestation-policy-defect.echo"),
+        "policy-defect",
+      );
+      const executor = yield* makeTestExecutor({
+        plugins: [policyDefectPlugin] as const,
+        operations: [operation],
+      });
+      const request = yield* makeRequest(operation, "job-policy-defect", { value: "policy" });
+      const first = yield* Effect.result(executor.executeOperation(request, "http"));
+      expect(Result.isFailure(first)).toBe(true);
+      const retry = yield* executor.executeOperation(request, "mcp");
+      expect(retry.status).toBe("cancelled");
+      expect(retry.failure?.code).toBe("operation_cancelled");
+    }),
+  );
+
+  it.effect("settles a reservation after an approval-handler defect so retry is not stuck", () =>
+    Effect.gen(function* () {
+      const operation = definition();
+      const executor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+        // oxlint-disable-next-line executor/no-effect-escape-hatch, executor/no-error-constructor -- adversarial defect regression
+        operationApproval: () => Effect.die(new Error("approval token sentinel")),
+      });
+      yield* executor.policies.create({
+        owner: "org",
+        pattern: "attestation.echo",
+        action: "require_approval",
+      });
+      const request = yield* makeRequest(operation, "job-approval-defect", { value: "approval" });
+      const first = yield* Effect.result(executor.executeOperation(request, "http"));
+      expect(
+        Result.match(first, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "approval.handler",
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+      const retry = yield* executor.executeOperation(request, "mcp");
+      expect(retry.status).toBe("cancelled");
+    }),
+  );
+
+  it.effect("normalizes a provider defect and leaves a replayable terminal result", () =>
+    Effect.gen(function* () {
+      const defectPlugin = definePlugin(() => ({
+        id: "attestation-provider-defect" as const,
+        storage: () => ({}),
+        staticIntegrations: () => [
+          {
+            id: "attestation-provider-defect",
+            kind: "plugin" as const,
+            name: "Provider defect",
+            tools: [
+              tool({
+                name: "echo",
+                description: "Provider defect target.",
+                inputSchema: INPUT,
+                outputSchema: OUTPUT,
+                execute: () =>
+                  // oxlint-disable-next-line executor/no-error-constructor -- adversarial defect regression
+                  Effect.die(new Error("https://provider.invalid/?token=provider-sentinel")),
+              }),
+            ],
+          },
+        ],
+      }))();
+      const operation = definition(
+        ToolAddress.make("attestation-provider-defect.echo"),
+        "provider-defect",
+      );
+      const executor = yield* makeTestExecutor({
+        plugins: [defectPlugin] as const,
+        operations: [operation],
+      });
+      const request = yield* makeRequest(operation, "job-provider-defect", { value: "provider" });
+      const first = yield* executor.executeOperation(request, "http");
+      expect(first.status).toBe("failed");
+      expect(first.failure?.code).toBe("operation_failed");
+      expect(JSON.stringify(first)).not.toContain("provider-sentinel");
+      const retry = yield* executor.executeOperation(request, "mcp");
+      expect(retry.status).toBe("failed");
+    }),
+  );
+
+  it.effect("normalizes a synchronous provider throw without exposing its message", () =>
+    Effect.gen(function* () {
+      const syncThrowPlugin = definePlugin(() => ({
+        id: "attestation-sync-throw" as const,
+        storage: () => ({}),
+        staticIntegrations: () => [
+          {
+            id: "attestation-sync-throw",
+            kind: "plugin" as const,
+            name: "Synchronous provider throw",
+            tools: [
+              {
+                name: "echo",
+                description: "Synchronous provider throw target.",
+                inputSchema: INPUT,
+                outputSchema: OUTPUT,
+                handler: () => {
+                  // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- adversarial defect regression
+                  throw new Error("https://provider.invalid/?access_token=sync-sentinel");
+                },
+              },
+            ],
+          },
+        ],
+      }))();
+      const operation = definition(ToolAddress.make("attestation-sync-throw.echo"), "sync-throw");
+      const executor = yield* makeTestExecutor({
+        plugins: [syncThrowPlugin] as const,
+        operations: [operation],
+      });
+      const request = yield* makeRequest(operation, "job-sync-throw", { value: "sync" });
+      const result = yield* executor.executeOperation(request, "http");
+      expect(result.status).toBe("failed");
+      expect(JSON.stringify(result)).not.toContain("sync-sentinel");
+    }),
+  );
+
+  it.effect("retries settlement after a transient store failure", () =>
+    Effect.gen(function* () {
+      const inner = makeInMemoryOperationReplayStore();
+      let settleCalls = 0;
+      const flakyStore = {
+        ...inner,
+        settle: (input: Parameters<typeof inner.settle>[0]) => {
+          settleCalls += 1;
+          return settleCalls === 1
+            ? Effect.fail(new StorageError({ message: "settlement unavailable", cause: undefined }))
+            : inner.settle(input);
+        },
+      };
+      const operation = definition();
+      const executor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+        operationReplayStore: flakyStore,
+      });
+      const request = yield* makeRequest(operation, "job-settlement-failure", { value: "settle" });
+      const first = yield* Effect.result(executor.executeOperation(request, "http"));
+      expect(Result.isFailure(first)).toBe(true);
+      expect(settleCalls).toBeGreaterThanOrEqual(2);
+      const retry = yield* executor.executeOperation(request, "mcp");
+      expect(retry.status).toBe("cancelled");
+    }),
+  );
+
   it.effect("decodes and rebinds replay results before returning them", () =>
     Effect.gen(function* () {
       const operation = definition();
@@ -445,6 +682,136 @@ describe("carrier-neutral operation attestation", () => {
           onSuccess: () => false,
         }),
       ).toBe(true);
+    }),
+  );
+
+  it.effect("does not lose a reservation if interruption races reserve completion", () =>
+    Effect.gen(function* () {
+      const inner = makeInMemoryOperationReplayStore();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const racingStore = {
+        ...inner,
+        reserve: (input: Parameters<typeof inner.reserve>[0]) =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+            return yield* inner.reserve(input);
+          }),
+      };
+      const operation = definition();
+      const executor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+        operationReplayStore: racingStore,
+      });
+      const request = yield* makeRequest(operation, "job-reserve-race", { value: "race" });
+      const fiber = yield* executor
+        .executeOperation(request, "http")
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(entered);
+      const interruption = Fiber.interrupt(fiber);
+      yield* Deferred.succeed(release, undefined);
+      yield* interruption;
+      const replay = yield* executor.executeOperation(request, "mcp");
+      expect(replay.status).toBe("cancelled");
+    }),
+  );
+
+  it.effect("rejects replay authorization bound to a different subject", () =>
+    Effect.gen(function* () {
+      const inner = makeInMemoryOperationReplayStore();
+      const captureStore = {
+        ...inner,
+        settle: (input: Parameters<typeof inner.settle>[0]) => inner.settle(input),
+      };
+      const operation = definition();
+      const firstExecutor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+        subject: "subject-one",
+        operationReplayStore: captureStore,
+      });
+      const request = yield* makeRequest(operation, "job-subject-binding", { value: "subject" });
+      const completed = yield* firstExecutor.executeOperation(request, "http");
+      const replayStore = {
+        ...captureStore,
+        reserve: () => Effect.succeed({ status: "replay" as const, result: completed }),
+      };
+      const secondExecutor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+        subject: "subject-two",
+        operationReplayStore: replayStore,
+      });
+      const replay = yield* Effect.result(secondExecutor.executeOperation(request, "mcp"));
+      expect(
+        Result.match(replay, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "result.approval",
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect("rejects corrupt approval state and session on replay", () =>
+    Effect.gen(function* () {
+      const inner = makeInMemoryOperationReplayStore();
+      const captureStore = {
+        ...inner,
+        settle: (input: Parameters<typeof inner.settle>[0]) => inner.settle(input),
+      };
+      const operation = definition();
+      const executor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+        operationReplayStore: captureStore,
+        operationApproval: () => Effect.succeed("approved" as const),
+      });
+      yield* executor.policies.create({
+        owner: "org",
+        pattern: "attestation.echo",
+        action: "require_approval",
+      });
+      const request = yield* makeRequest(operation, "job-approval-binding", { value: "approval" });
+      const completed = yield* executor.executeOperation(request, "http");
+      expect(completed.status).toBe("completed");
+      const corruptions = [
+        {
+          ...completed,
+          approval: { ...completed.approval, decision: "not_required" as const },
+        },
+        {
+          ...completed,
+          approval: {
+            ...completed.approval,
+            sessionId: "approval:wrong-execution",
+          },
+        },
+      ];
+      for (const corrupted of corruptions) {
+        const replayStore = {
+          ...captureStore,
+          reserve: () => Effect.succeed({ status: "replay" as const, result: corrupted }),
+        };
+        const replayExecutor = yield* makeTestExecutor({
+          plugins: [operationPlugin] as const,
+          operations: [operation],
+          operationApproval: () => Effect.succeed("approved" as const),
+          operationReplayStore: replayStore,
+        });
+        const replay = yield* Effect.result(replayExecutor.executeOperation(request, "mcp"));
+        expect(
+          Result.match(replay, {
+            onFailure: (failure) =>
+              Predicate.isTagged(failure, "OperationContractError") &&
+              (failure.field === "result.approval" || failure.field === "result.binding"),
+            onSuccess: () => false,
+          }),
+        ).toBe(true);
+      }
     }),
   );
 

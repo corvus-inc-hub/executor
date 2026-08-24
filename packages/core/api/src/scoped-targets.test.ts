@@ -116,6 +116,37 @@ const HTTP_PROVIDER_LEAK_OPERATION: ExecuteOperationDefinition = {
   providerTransport: "http",
 };
 
+const HTTP_DEFECT_OPERATION: ExecuteOperationDefinition = {
+  operationKey: "http.attestation.defect",
+  version: 1,
+  target: ToolAddress.make("http-defect-attestation.echo"),
+  inputSchema: OPERATION_INPUT,
+  outputSchema: OPERATION_INPUT,
+  providerTransport: "none",
+};
+
+const operationHttpDefectPlugin = definePlugin(() => ({
+  id: "http-defect-attestation" as const,
+  storage: () => ({}),
+  staticIntegrations: () => [
+    {
+      id: "http-defect-attestation",
+      kind: "plugin" as const,
+      name: "HTTP defect attestation",
+      tools: [
+        tool({
+          name: "echo",
+          description: "Throws an opaque provider defect.",
+          inputSchema: OPERATION_INPUT,
+          outputSchema: OPERATION_INPUT,
+          // oxlint-disable-next-line executor/no-effect-escape-hatch, executor/no-error-constructor -- adversarial HTTP redaction regression
+          execute: () => Effect.die(new Error("https://provider.invalid/?token=http-sentinel")),
+        }),
+      ],
+    },
+  ],
+}))();
+
 const operationHttpProviderLeakPlugin = definePlugin(() => ({
   id: "http-provider-attestation" as const,
   storage: () => ({}),
@@ -302,6 +333,35 @@ describe("core API owner-scoped writes (v2)", () => {
       expect(result.output).toBeUndefined();
       expect(result.providerReconciliation.status).toBe("unavailable");
       expect(result.providerReconciliation.receipt).toBeUndefined();
+    }),
+  );
+
+  it.effect("HTTP operation defects stay opaque and replayable", () =>
+    Effect.gen(function* () {
+      const executor = yield* createExecutor(
+        makeTestConfig({
+          plugins: [operationHttpDefectPlugin] as const,
+          operations: [HTTP_DEFECT_OPERATION],
+        }),
+      );
+      const web = yield* webHandlerFor(executor);
+      const request = yield* operationRequestFor(HTTP_DEFECT_OPERATION, "http-defect", {
+        value: "same",
+      });
+      const response = yield* Effect.promise(() =>
+        web.handler(
+          new Request("http://localhost/operations", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(request),
+          }),
+          handlerContextFor(executor),
+        ),
+      );
+      const body = JSON.stringify(yield* Effect.promise(() => response.json()));
+      expect(response.status).toBe(200);
+      expect(body).not.toContain("http-sentinel");
+      expect(body).not.toContain("provider.invalid");
     }),
   );
 

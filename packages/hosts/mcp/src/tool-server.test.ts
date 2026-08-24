@@ -1,4 +1,4 @@
-import { describe, expect, it } from "@effect/vitest";
+import { describe, expect, it, vi } from "@effect/vitest";
 import { Data, Deferred, Effect, Schema } from "effect";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -822,9 +822,10 @@ describe("MCP host server — native elicitation mode", () => {
   });
 
   it("execute tool hides defect details in MCP error results", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const engine = makeStubEngine({
       // oxlint-disable-next-line executor/no-effect-escape-hatch, executor/no-error-constructor -- boundary: test injects a defect to verify MCP error redaction
-      execute: () => Effect.die(new Error("secret internal detail")),
+      execute: () => Effect.die(new Error("https://provider.invalid/?token=mcp-sentinel")),
     });
 
     await withNativeClient(engine, ELICITATION_CAPS, async (client) => {
@@ -835,15 +836,19 @@ describe("MCP host server — native elicitation mode", () => {
       const text = textOf(result);
       expect(text).toMatch(/^Error: Internal tool error \[[0-9a-f]{8}\]$/);
       // Sensitive internal context must NOT leak through the MCP error path.
-      expect(text).not.toContain("secret internal detail");
+      expect(text).not.toContain("mcp-sentinel");
       expect(result.structuredContent).toMatchObject({
         status: "error",
       });
       const structuredError = (result.structuredContent as { readonly error?: string }).error ?? "";
       expect(structuredError).toMatch(/^Internal tool error \[[0-9a-f]{8}\]$/);
-      expect(structuredError).not.toContain("secret internal detail");
+      expect(structuredError).not.toContain("mcp-sentinel");
       expect(result.isError).toBe(true);
     });
+    const logged = consoleError.mock.calls.flat().map(String).join(" ");
+    expect(logged).not.toContain("mcp-sentinel");
+    expect(logged).not.toContain("provider.invalid");
+    consoleError.mockRestore();
   });
 
   it("form elicitation is bridged from engine to MCP client and back", async () => {
