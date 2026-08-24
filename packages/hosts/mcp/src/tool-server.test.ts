@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Data, Deferred, Effect } from "effect";
+import { Data, Deferred, Effect, Schema } from "effect";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -8,11 +8,22 @@ import type * as Cause from "effect/Cause";
 
 import {
   ElicitationId,
+  EXECUTE_OPERATION_SCHEMA_VERSION,
+  ExecuteOperationResultCodec,
+  type ExecuteOperationRequest,
+  type ExecuteOperationResult,
+  type ExecuteOperationDefinition,
   FormElicitation,
   ToolAddress,
   ToolResult,
   UrlElicitation,
+  createExecutor,
+  definePlugin,
+  deriveOperationDescriptor,
+  hashExecuteOperationRequest,
+  tool,
 } from "@executor-js/sdk";
+import { makeTestConfig } from "@executor-js/sdk/testing";
 import type { ToolFileValue } from "@executor-js/sdk";
 import type { ExecutionEngine, ExecutionResult } from "@executor-js/execution";
 
@@ -66,6 +77,7 @@ const withClient = async <E extends Cause.YieldableError>(
     | "pausedExecutionHooks"
     | "pausedExecutionLeaseMs"
     | "resumeFallback"
+    | "operationExecutor"
   >,
 ) => {
   const mcpServer = await Effect.runPromise(createExecutorMcpServer({ engine, ...config }));
@@ -153,6 +165,162 @@ const makeElicitingEngine = (
 // ---------------------------------------------------------------------------
 
 describe("MCP host server — native elicitation mode", () => {
+  it("routes execute_operation through the Executor and returns the attested envelope", async () => {
+    const request: ExecuteOperationRequest = {
+      schemaVersion: EXECUTE_OPERATION_SCHEMA_VERSION,
+      operationKey: "github.repository.inventory",
+      version: 1,
+      jobId: "mcp-job-1",
+      descriptorSha256: "1".repeat(64),
+      requestSha256: "2".repeat(64),
+      input: { owner: "Voiya-RnD", repo: "avaza-vri" },
+    };
+    const attested: ExecuteOperationResult = {
+      schemaVersion: EXECUTE_OPERATION_SCHEMA_VERSION,
+      operationKey: request.operationKey,
+      version: request.version,
+      jobId: request.jobId,
+      descriptorSha256: request.descriptorSha256,
+      requestSha256: request.requestSha256,
+      carrier: "mcp",
+      target: ToolAddress.make("tools.github.org.main.listRepository"),
+      providerTransport: "http",
+      executionId: "execution-mcp-1",
+      policy: { decision: "allow", source: "user" },
+      approval: {
+        decision: "not_required",
+        executionId: "execution-mcp-1",
+        jobId: request.jobId,
+        requestSha256: request.requestSha256,
+        target: ToolAddress.make("tools.github.org.main.listRepository"),
+        sessionId: "approval:execution-mcp-1",
+      },
+      providerReconciliation: { status: "unavailable" },
+      startedAt: "2026-08-23T00:00:00.000Z",
+      completedAt: "2026-08-23T00:00:00.010Z",
+      durationMs: 10,
+      status: "failed",
+      outputSha256: null,
+      failure: { code: "provider_receipt_unavailable", retryable: true },
+    };
+    let receivedCarrier: string | undefined;
+    await withClient(
+      makeStubEngine({}),
+      NO_CAPS,
+      async (client) => {
+        const { tools } = await client.listTools();
+        expect(tools.map((tool) => tool.name)).toContain("execute_operation");
+        const result = await client.callTool({
+          name: "execute_operation",
+          arguments: request,
+        });
+        expect(result.structuredContent).toEqual(attested);
+        expect(result.isError).toBe(true);
+      },
+      {
+        elicitationMode: { mode: "native" },
+        operationExecutor: {
+          executeOperation: (received, carrier) =>
+            Effect.sync(() => {
+              expect(received).toEqual(request);
+              receivedCarrier = carrier;
+              return attested;
+            }),
+        },
+      },
+    );
+    expect(receivedCarrier).toBe("mcp");
+  });
+
+  it("MCP operation results redact unsafe provider metadata at the Executor boundary", async () => {
+    const inputSchema = Schema.toStandardSchemaV1(
+      Schema.toStandardJSONSchemaV1(Schema.Struct({ value: Schema.String })),
+    );
+    const operation: ExecuteOperationDefinition = {
+      operationKey: "mcp.attestation.provider-leak",
+      version: 1,
+      target: ToolAddress.make("mcp-provider-attestation.echo"),
+      inputSchema,
+      outputSchema: inputSchema,
+      providerTransport: "http",
+    };
+    const plugin = definePlugin(() => ({
+      id: "mcp-provider-attestation" as const,
+      storage: () => ({}),
+      staticIntegrations: () => [
+        {
+          id: "mcp-provider-attestation",
+          kind: "plugin" as const,
+          name: "MCP provider attestation",
+          tools: [
+            tool({
+              name: "echo",
+              description: "Returns unsafe provider metadata for the boundary test.",
+              inputSchema,
+              outputSchema: inputSchema,
+              execute: ({ value }) =>
+                Effect.succeed(
+                  ToolResult.ok(
+                    { value },
+                    {
+                      provider: {
+                        transport: "http",
+                        responseSha256:
+                          "9b2d43affbf49a367028df2e1414f84c0e099ac98c3d54a8a80157fd7771af25",
+                        requestId: "Bearer leaked-provider-token",
+                        status: 200,
+                        observedAt: "2026-01-01T00:00:00.000Z",
+                      },
+                    },
+                  ),
+                ),
+            }),
+          ],
+        },
+      ],
+    }))();
+    const executor = await Effect.runPromise(
+      createExecutor(
+        makeTestConfig({
+          plugins: [plugin] as const,
+          operations: [operation],
+        }),
+      ),
+    );
+    const descriptor = await Effect.runPromise(deriveOperationDescriptor(operation));
+    const unsigned = {
+      schemaVersion: EXECUTE_OPERATION_SCHEMA_VERSION,
+      operationKey: operation.operationKey,
+      version: operation.version,
+      jobId: "mcp-provider-leak",
+      descriptorSha256: descriptor.descriptorSha256,
+      input: { value: "same" },
+      requestSha256: "0".repeat(64),
+    } satisfies ExecuteOperationRequest;
+    const request: ExecuteOperationRequest = {
+      ...unsigned,
+      requestSha256: await Effect.runPromise(hashExecuteOperationRequest(unsigned)),
+    };
+
+    await withClient(
+      makeStubEngine({}),
+      NO_CAPS,
+      async (client) => {
+        const result = await client.callTool({
+          name: "execute_operation",
+          arguments: request,
+        });
+        expect(result.isError).toBe(true);
+        const structured = ExecuteOperationResultCodec.decodeSync(result.structuredContent);
+        expect(structured.status).toBe("failed");
+        expect(structured.output).toBeUndefined();
+        expect(structured.providerReconciliation.status).toBe("unavailable");
+        expect(structured.providerReconciliation.receipt).toBeUndefined();
+      },
+      { elicitationMode: { mode: "native" }, operationExecutor: executor },
+    );
+  });
+
   it("execute tool calls engine.execute and returns result", async () => {
     const engine = makeStubEngine({
       execute: (code) => Effect.succeed({ result: `ran: ${code}` }),

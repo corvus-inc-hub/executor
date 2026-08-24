@@ -16,8 +16,10 @@ import type {
   ElicitationHandler,
   ElicitationContext,
   ElicitationRequest,
+  ExecuteOperationRequest,
   ToolFileValue,
 } from "@executor-js/sdk";
+import type { Executor } from "@executor-js/sdk";
 import type * as Tracer from "effect/Tracer";
 import {
   createExecutionEngine,
@@ -118,6 +120,10 @@ type SharedMcpServerConfig = {
     executionId: string,
     response: ResumeResponse,
   ) => Effect.Effect<ResumeFallbackOutcome | null, unknown>;
+  /** Optional scoped Executor used by the dedicated, carrier-neutral
+   * `execute_operation` tool. The generic code-execution tool remains backed by
+   * ExecutionEngine and is behaviorally unchanged. */
+  readonly operationExecutor?: Pick<Executor, "executeOperation">;
 };
 
 export type ExecutorMcpServerConfig<E extends Cause.YieldableError = Cause.YieldableError> =
@@ -753,6 +759,47 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         ),
       );
 
+    const operationResult = (result: {
+      readonly status: string;
+      readonly operationKey: string;
+      readonly [key: string]: unknown;
+    }): McpToolResult => {
+      const structuredContent: Record<string, unknown> = { ...result };
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Operation ${result.operationKey}: ${result.status}.`,
+          },
+        ],
+        structuredContent,
+        isError: result.status !== "completed",
+      };
+    };
+
+    const executeOperationCall = (
+      request: ExecuteOperationRequest,
+    ): Effect.Effect<McpToolResult> => {
+      const executor = config.operationExecutor;
+      if (!executor) {
+        return Effect.succeed({
+          content: [{ type: "text" as const, text: "Operation execution is unavailable." }],
+          structuredContent: { status: "unavailable", code: "operation_executor_unavailable" },
+          isError: true,
+        });
+      }
+      return executor.executeOperation(request, "mcp").pipe(
+        Effect.map((result) => operationResult(result)),
+        Effect.catch(() =>
+          Effect.succeed({
+            content: [{ type: "text" as const, text: "Operation execution failed." }],
+            structuredContent: { status: "error", code: "operation_failed" },
+            isError: true,
+          }),
+        ),
+      );
+    };
+
     const server = yield* Effect.sync(
       () =>
         new McpServer(
@@ -944,6 +991,32 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         attributes: { "mcp.tool.name": "execute" },
       }),
     );
+
+    if (config.operationExecutor) {
+      yield* Effect.sync(() =>
+        server.registerTool(
+          "execute_operation",
+          {
+            description:
+              "Execute a reviewed operation by registry key. The Executor resolves the target, policy, approval, credentials, and provider receipt; the caller cannot choose a tool or transport.",
+            inputSchema: {
+              schemaVersion: z.literal("executor.operation.v2"),
+              operationKey: z.string().min(1),
+              version: z.number().int().min(1),
+              jobId: z.string().min(1),
+              descriptorSha256: z.string().regex(/^[a-f0-9]{64}$/),
+              requestSha256: z.string().regex(/^[a-f0-9]{64}$/),
+              input: z.unknown(),
+            },
+          },
+          (request) => runToolEffect(executeOperationCall(request)),
+        ),
+      ).pipe(
+        Effect.withSpan("mcp.host.register_tool", {
+          attributes: { "mcp.tool.name": "execute_operation" },
+        }),
+      );
+    }
 
     yield* Effect.sync(() =>
       server.registerTool(

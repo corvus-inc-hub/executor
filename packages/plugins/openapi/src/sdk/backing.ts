@@ -6,6 +6,7 @@ import {
   ToolFileJsonSchema,
   ToolName,
   ToolResult,
+  hashOperationValue,
   authToolFailure,
   classifyHttpStatus,
   detectInsufficientScope,
@@ -19,10 +20,12 @@ import {
   type HealthCheckSpec,
   type IntegrationRecord,
   type PluginCtx,
+  type PolicyAnnotationPluginCtx,
   type ResolveToolsResult,
   type StorageFailure,
   type ToolDef,
   type ToolInvocationCredential,
+  type ToolProviderEvidence,
 } from "@executor-js/sdk/core";
 
 import {
@@ -76,6 +79,30 @@ const decodeUpstreamErrorMessageBody = Schema.decodeUnknownOption(UpstreamErrorM
 const decodeUpstreamNestedErrorBody = Schema.decodeUnknownOption(UpstreamNestedErrorBody);
 const decodeUpstreamErrorsArrayBody = Schema.decodeUnknownOption(UpstreamErrorsArrayBody);
 const decodeUpstreamDescriptionBody = Schema.decodeUnknownOption(UpstreamDescriptionBody);
+
+/**
+ * Convert the provider facts that survive the OpenAPI adapter into the shared
+ * operation receipt shape. The response hash uses the Executor canonical
+ * codec; if a provider payload is not representable by that codec we retain
+ * only the safe transport/status fact and the operation layer reports the
+ * receipt as unavailable rather than claiming a match.
+ */
+const providerEvidenceForResponse = (input: {
+  readonly status: number;
+  readonly data: unknown;
+}): Effect.Effect<ToolProviderEvidence> =>
+  Effect.gen(function* () {
+    const responseSha256 =
+      input.status >= 200 && input.status < 300
+        ? yield* hashOperationValue(input.data).pipe(Effect.option)
+        : Option.none<string>();
+    return {
+      transport: "http" as const,
+      status: input.status,
+      ...(Option.isSome(responseSha256) ? { responseSha256: responseSha256.value } : {}),
+      observedAt: new Date().toISOString(),
+    };
+  });
 
 const clampedStringify = (value: unknown): string => {
   let s: string;
@@ -139,6 +166,7 @@ const openApiAuthToolFailure = (failure: {
   readonly credentialLabel?: string;
   readonly status?: number;
   readonly details?: unknown;
+  readonly provider?: ToolProviderEvidence;
 }) =>
   authToolFailure({
     code: failure.code as Parameters<typeof authToolFailure>[0]["code"],
@@ -157,6 +185,7 @@ const openApiAuthToolFailure = (failure: {
           },
         }
       : {}),
+    ...(failure.provider !== undefined ? { provider: failure.provider } : {}),
   });
 
 /** Rewrite OpenAPI `#/components/schemas/X` refs to standard `#/$defs/X`. */
@@ -723,6 +752,7 @@ export const invokeOpenApiBackedTool = (input: {
     if (!invocation.ok) return invocation.failure;
 
     const result = invocation.result;
+    const provider = yield* providerEvidenceForResponse(result);
     const ok = result.status >= 200 && result.status < 300;
     if (!ok) {
       if (result.status === 401 || result.status === 403) {
@@ -759,6 +789,7 @@ export const invokeOpenApiBackedTool = (input: {
             credentialKind: "oauth",
             credentialLabel: "Upstream authorization",
             details: result.error,
+            provider,
           });
         }
         return openApiAuthToolFailure({
@@ -771,17 +802,22 @@ export const invokeOpenApiBackedTool = (input: {
           credentialKind: "upstream",
           credentialLabel: "Upstream authorization",
           details: result.error,
+          provider,
         });
       }
-      return ToolResult.fail({
-        code: "upstream_http_error",
-        status: result.status,
-        message: extractOpenApiUpstreamMessage(result.error, result.status),
-        details: result.error,
-      });
+      return ToolResult.fail(
+        {
+          code: "upstream_http_error",
+          status: result.status,
+          message: extractOpenApiUpstreamMessage(result.error, result.status),
+          details: result.error,
+        },
+        { provider },
+      );
     }
     return ToolResult.ok(result.data, {
       http: { status: result.status, headers: result.headers },
+      provider,
     });
   });
 
@@ -807,7 +843,7 @@ export const validateOpenApiBackedToolArgs = (input: {
   });
 
 export const resolveOpenApiBackedAnnotations = (input: {
-  readonly ctx: PluginCtx<OpenapiStore>;
+  readonly ctx: PolicyAnnotationPluginCtx<OpenapiStore>;
   readonly integration: string;
   readonly toolRows: readonly { readonly name: string }[];
 }) =>

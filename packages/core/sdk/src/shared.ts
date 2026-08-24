@@ -48,6 +48,64 @@ export type {
 export type { CredentialProvider, ProviderEntry } from "./provider";
 export type { Tool, ToolDef, ToolListFilter, ToolAnnotations } from "./tool";
 
+// Carrier-neutral operation contracts. The execution implementation remains
+// server-only on Executor.executeOperation, while these schemas are safe for
+// typed HTTP/MCP clients and browser-facing API definitions.
+export {
+  EXECUTE_OPERATION_SCHEMA_VERSION,
+  ExecuteOperationApproval,
+  ExecuteOperationApprovalDecision,
+  ExecuteOperationCarrier,
+  ExecuteOperationFailure,
+  ExecuteOperationPolicy,
+  ExecuteOperationPolicyDecision,
+  ExecuteOperationPolicySource,
+  ExecuteOperationProviderTransport,
+  ExecuteOperationRequest,
+  ExecuteOperationRequestCodec,
+  ExecuteOperationResult,
+  ExecuteOperationResultCodec,
+  ExecuteOperationStatus,
+  OperationContractError,
+  OperationDescriptorMismatchError,
+  OperationSchemaValidationError,
+  OperationSecretRejectedError,
+  OperationRequestHashMismatchError,
+  ProviderReceipt,
+  ProviderReconciliation,
+  ProviderReconciliationStatus,
+  canonicalExecuteOperationRequest,
+  canonicalOperationJson,
+  canonicalizeOperationValue,
+  deriveOperationDescriptor,
+  hashExecuteOperationRequest,
+  hashOperationValue,
+  makeInMemoryOperationReplayStore,
+  validateOperationSchema,
+  type CanonicalOperationSnapshot,
+  type ExecuteOperationDefinition,
+  type ExecuteOperationDescriptor,
+  type ExecuteOperationError,
+  type ExecuteOperationApprovalContext,
+  type ExecuteOperationApprovalHandler,
+  type ExecuteOperationReplayReservation,
+  type ExecuteOperationReplayStore,
+} from "./operation";
+
+// Deterministic adapter-conformance fixture. This is a public echo contract,
+// not a GitHub operation implementation; see the module documentation.
+export {
+  GOLDEN_OPERATION_DEFINITION,
+  GOLDEN_OPERATION_DESCRIPTOR,
+  GOLDEN_OPERATION_DESCRIPTOR_CANONICAL,
+  GOLDEN_OPERATION_DESCRIPTOR_SHA256,
+  GOLDEN_OPERATION_OUTPUT_SHA256,
+  GOLDEN_OPERATION_REQUEST,
+  GOLDEN_OPERATION_REQUEST_CANONICAL,
+  GOLDEN_OPERATION_REQUEST_SHA256,
+  GOLDEN_OPERATION_RESULT,
+} from "./operation-fixtures";
+
 // Tagged errors (Schema-based — browser-safe).
 export {
   ToolNotFoundError,

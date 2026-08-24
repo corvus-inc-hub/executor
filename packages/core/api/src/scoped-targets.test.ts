@@ -1,15 +1,23 @@
 import { HttpApiBuilder } from "effect/unstable/httpapi";
 import { HttpRouter, HttpServer } from "effect/unstable/http";
 import { describe, expect, it } from "@effect/vitest";
-import { Context, Effect, Layer } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
 
 import {
   AuthTemplateSlug,
   ConnectionName,
   IntegrationSlug,
   ToolName,
+  ToolAddress,
+  ToolResult,
+  ExecuteOperationResultCodec,
+  deriveOperationDescriptor,
+  hashExecuteOperationRequest,
   createExecutor,
   definePlugin,
+  tool,
+  type ExecuteOperationDefinition,
+  type ExecuteOperationRequest,
   type Executor,
 } from "@executor-js/sdk";
 import { makeTestConfig, memoryCredentialsPlugin } from "@executor-js/sdk/testing";
@@ -65,6 +73,107 @@ const handlerContextFor = (executor: Executor) =>
 
 const INTEGRATION = IntegrationSlug.make("vercel");
 
+const OPERATION_INPUT = Schema.toStandardSchemaV1(
+  Schema.toStandardJSONSchemaV1(Schema.Struct({ value: Schema.String })),
+);
+
+const operationHttpPlugin = definePlugin(() => ({
+  id: "http-attestation" as const,
+  storage: () => ({}),
+  staticIntegrations: () => [
+    {
+      id: "http-attestation",
+      kind: "plugin" as const,
+      name: "HTTP attestation",
+      tools: [
+        tool({
+          name: "echo",
+          description: "Echo a public value.",
+          inputSchema: OPERATION_INPUT,
+          outputSchema: OPERATION_INPUT,
+          execute: ({ value }) => Effect.succeed({ value }),
+        }),
+      ],
+    },
+  ],
+}))();
+
+const HTTP_OPERATION: ExecuteOperationDefinition = {
+  operationKey: "http.attestation.echo",
+  version: 1,
+  target: ToolAddress.make("http-attestation.echo"),
+  inputSchema: OPERATION_INPUT,
+  outputSchema: OPERATION_INPUT,
+  providerTransport: "none",
+};
+
+const HTTP_PROVIDER_LEAK_OPERATION: ExecuteOperationDefinition = {
+  operationKey: "http.attestation.provider-leak",
+  version: 1,
+  target: ToolAddress.make("http-provider-attestation.echo"),
+  inputSchema: OPERATION_INPUT,
+  outputSchema: OPERATION_INPUT,
+  providerTransport: "http",
+};
+
+const operationHttpProviderLeakPlugin = definePlugin(() => ({
+  id: "http-provider-attestation" as const,
+  storage: () => ({}),
+  staticIntegrations: () => [
+    {
+      id: "http-provider-attestation",
+      kind: "plugin" as const,
+      name: "HTTP provider attestation",
+      tools: [
+        tool({
+          name: "echo",
+          description: "Returns deliberately unsafe provider metadata.",
+          inputSchema: OPERATION_INPUT,
+          outputSchema: OPERATION_INPUT,
+          execute: ({ value }) =>
+            Effect.succeed(
+              ToolResult.ok(
+                { value },
+                {
+                  provider: {
+                    transport: "http",
+                    responseSha256:
+                      "9b2d43affbf49a367028df2e1414f84c0e099ac98c3d54a8a80157fd7771af25",
+                    requestId: "Bearer leaked-provider-token",
+                    status: 200,
+                    observedAt: "2026-01-01T00:00:00.000Z",
+                  },
+                },
+              ),
+            ),
+        }),
+      ],
+    },
+  ],
+}))();
+
+const operationRequestFor = (
+  operation: ExecuteOperationDefinition,
+  jobId: string,
+  input: unknown,
+) =>
+  Effect.gen(function* () {
+    const descriptor = yield* deriveOperationDescriptor(operation);
+    const unsigned = {
+      schemaVersion: "executor.operation.v2" as const,
+      operationKey: operation.operationKey,
+      version: operation.version,
+      jobId,
+      descriptorSha256: descriptor.descriptorSha256,
+      input,
+      requestSha256: "0".repeat(64),
+    } satisfies ExecuteOperationRequest;
+    return {
+      ...unsigned,
+      requestSha256: yield* hashExecuteOperationRequest(unsigned),
+    } satisfies ExecuteOperationRequest;
+  });
+
 // A plugin that owns the `vercel` integration and produces one tool per
 // connection so the per-connection address scheme is exercised.
 const vercelPlugin = definePlugin(() => ({
@@ -86,6 +195,97 @@ const vercelPlugin = definePlugin(() => ({
 }))();
 
 describe("core API owner-scoped writes (v2)", () => {
+  it.effect("HTTP operation carrier delegates to the same attested core envelope", () =>
+    Effect.gen(function* () {
+      const config = makeTestConfig({
+        plugins: [operationHttpPlugin] as const,
+        operations: [HTTP_OPERATION],
+      });
+      const directExecutor = yield* createExecutor(config);
+      const directRequest = yield* operationRequestFor(HTTP_OPERATION, "http-parity-direct", {
+        value: "same",
+      });
+      const direct = yield* directExecutor.executeOperation(directRequest, "internal");
+
+      const httpConfig = makeTestConfig({
+        plugins: [operationHttpPlugin] as const,
+        operations: [HTTP_OPERATION],
+      });
+      const httpExecutor = yield* createExecutor(httpConfig);
+      const web = yield* webHandlerFor(httpExecutor);
+      const context = handlerContextFor(httpExecutor);
+      const httpRequest = yield* operationRequestFor(HTTP_OPERATION, "http-parity-http", {
+        value: "same",
+      });
+      const response = yield* Effect.promise(() =>
+        web.handler(
+          new Request("http://localhost/operations", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(httpRequest),
+          }),
+          context,
+        ),
+      );
+
+      expect(response.status).toBe(200);
+      const httpResult = ExecuteOperationResultCodec.decodeSync(
+        yield* Effect.promise(() => response.json()),
+      );
+      expect(httpResult.carrier).toBe("http");
+      expect(httpResult).toMatchObject({
+        schemaVersion: direct.schemaVersion,
+        operationKey: direct.operationKey,
+        version: direct.version,
+        descriptorSha256: direct.descriptorSha256,
+        target: direct.target,
+        providerTransport: direct.providerTransport,
+        policy: direct.policy,
+        approval: { decision: direct.approval.decision },
+        providerReconciliation: direct.providerReconciliation,
+        status: direct.status,
+        outputSha256: direct.outputSha256,
+        output: direct.output,
+      });
+    }),
+  );
+
+  it.effect("HTTP operation results do not expose unsafe provider metadata", () =>
+    Effect.gen(function* () {
+      const config = makeTestConfig({
+        plugins: [operationHttpProviderLeakPlugin] as const,
+        operations: [HTTP_PROVIDER_LEAK_OPERATION],
+      });
+      const executor = yield* createExecutor(config);
+      const web = yield* webHandlerFor(executor);
+      const context = handlerContextFor(executor);
+      const request = yield* operationRequestFor(
+        HTTP_PROVIDER_LEAK_OPERATION,
+        "http-provider-leak",
+        { value: "same" },
+      );
+      const response = yield* Effect.promise(() =>
+        web.handler(
+          new Request("http://localhost/operations", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(request),
+          }),
+          context,
+        ),
+      );
+
+      expect(response.status).toBe(200);
+      const result = ExecuteOperationResultCodec.decodeSync(
+        yield* Effect.promise(() => response.json()),
+      );
+      expect(result.status).toBe("failed");
+      expect(result.output).toBeUndefined();
+      expect(result.providerReconciliation.status).toBe("unavailable");
+      expect(result.providerReconciliation.receipt).toBeUndefined();
+    }),
+  );
+
   it.effect("policy create + update target an explicit owner", () =>
     Effect.gen(function* () {
       const executor = yield* createExecutor(makeTestConfig({}));

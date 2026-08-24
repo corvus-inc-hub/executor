@@ -30,6 +30,31 @@ export const ToolHttpMetaSchema = Schema.Struct({
  */
 export type ToolHttpMeta = typeof ToolHttpMetaSchema.Type;
 
+/** Provider facts that are safe to carry into an operation attestation. Raw
+ * headers, bodies, query strings, and provider error messages stay out of the
+ * public receipt. The optional provider request hash is provider-native
+ * evidence; the Executor stamps its own operation request hash onto the
+ * public receipt. */
+export const ToolProviderEvidenceSchema = Schema.Struct({
+  transport: Schema.Literals(["http", "graphql", "mcp", "unknown"]),
+  requestId: Schema.optional(
+    Schema.NonEmptyString.check(
+      Schema.isMaxLength(256),
+      Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/),
+    ),
+  ),
+  /** Provider-native request hash; the Executor-stamped operation hash is a
+   * separate field on ProviderReceipt. */
+  providerRequestSha256: Schema.optional(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/))),
+  responseSha256: Schema.optional(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/))),
+  status: Schema.optional(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(100), Schema.isLessThanOrEqualTo(599)),
+  ),
+  observedAt: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(64)),
+});
+
+export type ToolProviderEvidence = typeof ToolProviderEvidenceSchema.Type;
+
 export const ToolFileSchema = Schema.TaggedStruct("ToolFile", {
   name: Schema.optional(Schema.String),
   mimeType: Schema.String,
@@ -52,16 +77,32 @@ const matchesToolFileSchema = Schema.is(ToolFileSchema);
 export const isToolFile = (value: unknown): value is ToolFile => matchesToolFileSchema(value);
 
 export type ToolResult<T> =
-  | { readonly ok: true; readonly data: T; readonly http?: ToolHttpMeta }
-  | { readonly ok: false; readonly error: ToolError };
+  | {
+      readonly ok: true;
+      readonly data: T;
+      readonly http?: ToolHttpMeta;
+      readonly provider?: ToolProviderEvidence;
+    }
+  | { readonly ok: false; readonly error: ToolError; readonly provider?: ToolProviderEvidence };
 
 export const ToolResult = {
-  ok: <T>(data: T, meta?: { readonly http?: ToolHttpMeta }): ToolResult<T> => ({
+  ok: <T>(
+    data: T,
+    meta?: { readonly http?: ToolHttpMeta; readonly provider?: ToolProviderEvidence },
+  ): ToolResult<T> => ({
     ok: true,
     data,
     ...(meta?.http ? { http: meta.http } : {}),
+    ...(meta?.provider ? { provider: meta.provider } : {}),
   }),
-  fail: <T = never>(error: ToolError): ToolResult<T> => ({ ok: false, error }),
+  fail: <T = never>(
+    error: ToolError,
+    meta?: { readonly provider?: ToolProviderEvidence },
+  ): ToolResult<T> => ({
+    ok: false,
+    error,
+    ...(meta?.provider ? { provider: meta.provider } : {}),
+  }),
 } as const;
 
 const ToolResultSchema = Schema.Union([
@@ -69,8 +110,13 @@ const ToolResultSchema = Schema.Union([
     ok: Schema.Literal(true),
     data: Schema.Unknown,
     http: Schema.optional(ToolHttpMetaSchema),
+    provider: Schema.optional(ToolProviderEvidenceSchema),
   }),
-  Schema.Struct({ ok: Schema.Literal(false), error: ToolErrorSchema }),
+  Schema.Struct({
+    ok: Schema.Literal(false),
+    error: ToolErrorSchema,
+    provider: Schema.optional(ToolProviderEvidenceSchema),
+  }),
 ]);
 
 const isUnknownToolResult = Schema.is(ToolResultSchema);

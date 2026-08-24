@@ -523,6 +523,17 @@ export interface ValidateToolArgsInput<TStore = unknown> {
   readonly args: unknown;
 }
 
+/**
+ * Read-only context exposed while deriving policy annotations. Credential
+ * providers, OAuth, nested execution, and connection value resolution are
+ * deliberately absent so policy metadata cannot inspect or materialize a
+ * credential before the Executor has bound approval.
+ */
+export type PolicyAnnotationPluginCtx<TStore = unknown> = Pick<
+  PluginCtx<TStore>,
+  "owner" | "storage" | "pluginStorage" | "httpClientLayer" | "core"
+>;
+
 /** Called when the executor removes / refreshes a connection owned by this
  *  plugin's integration — plugin-side cleanup or re-resolution only; the
  *  executor handles the core tool rows. */
@@ -698,7 +709,7 @@ export interface PluginSpec<
 
   /** Bulk resolve annotations for a set of tool rows under one connection. */
   readonly resolveAnnotations?: (input: {
-    readonly ctx: PluginCtx<TStore>;
+    readonly ctx: PolicyAnnotationPluginCtx<TStore>;
     readonly integration: IntegrationSlug;
     readonly connection: ConnectionName;
     readonly toolRows: readonly ToolInvocationRow[];

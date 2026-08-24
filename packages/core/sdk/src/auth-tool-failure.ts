@@ -1,4 +1,4 @@
-import { ToolResult, type ToolError } from "./tool-result";
+import { ToolResult, type ToolError, type ToolProviderEvidence } from "./tool-result";
 
 export type AuthToolFailureCode =
   | "connection_value_missing"
@@ -27,6 +27,10 @@ export type AuthToolFailureInput = {
     readonly status?: number;
     readonly details?: unknown;
   };
+  /** Safe provider transport facts, when an upstream request was actually
+   * made. Raw headers/body/error text remain in the existing redacted details
+   * path and are never part of this evidence. */
+  readonly provider?: ToolProviderEvidence;
   readonly recovery?: {
     readonly configureIntegrationTool?: string;
   };
@@ -82,5 +86,5 @@ export const authToolFailure = <T = never>(input: AuthToolFailureInput): ToolRes
       recovery: authRecovery(input.code, input.recovery),
     },
   };
-  return ToolResult.fail(error);
+  return ToolResult.fail(error, input.provider ? { provider: input.provider } : undefined);
 };

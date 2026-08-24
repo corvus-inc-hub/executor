@@ -34,6 +34,7 @@ export {
   type RunOAuthCallbackInput,
 } from "./oauth-popup";
 export { PoliciesApi } from "./policies/api";
+export { OperationsApi } from "./operations/api";
 export {
   AccountApi,
   AccountHttpApi,
