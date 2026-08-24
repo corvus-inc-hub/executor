@@ -53,7 +53,7 @@ export const makeMcpBuildServer =
       Effect.flatMap(({ engine, executor }) =>
         createExecutorMcpServer({
           engine,
-          operationExecutor: executor,
+          ...(executor.operationExecutionAvailable ? { operationExecutor: executor } : {}),
           ...(options ?? {}),
         }).pipe(
           Effect.withSpan("mcp.server.create"),

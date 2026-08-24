@@ -7,9 +7,37 @@ export {
   type Executor,
   type ExecutorConfig,
   type PromiseInvokeOptions,
+  type PromiseOperationApprovalDecision,
+  type PromiseOperationApprovalHandler,
   type PromiseOnElicitation,
   type Promisified,
 } from "./promise-executor";
+
+export {
+  EXECUTE_OPERATION_SCHEMA_VERSION,
+  ExecuteOperationApproval,
+  ExecuteOperationApprovalDecision,
+  ExecuteOperationCarrier,
+  ExecuteOperationFailure,
+  ExecuteOperationFailureCode,
+  ExecuteOperationPolicy,
+  ExecuteOperationProviderTransport,
+  ExecuteOperationRequestCodec,
+  ExecuteOperationResultCodec,
+  ExecuteOperationReplaySettleStatus,
+  ExecuteOperationStatus,
+  ProviderReceipt,
+  ProviderReconciliation,
+  ProviderReconciliationStatus,
+} from "./operation";
+export type {
+  ExecuteOperationApprovalContext,
+  ExecuteOperationDefinition,
+  ExecuteOperationRequest,
+  ExecuteOperationReplayReservation,
+  ExecuteOperationReplayStore,
+  ExecuteOperationResult,
+} from "./operation";
 
 // Identity / projection types that don't carry Effect in their signatures
 // are safe to re-export from the Effect surface. Promise consumers need

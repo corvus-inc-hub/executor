@@ -1,4 +1,4 @@
-export { ExecutorApi, CoreExecutorApi, addGroup } from "./api";
+export { ExecutorApi, CoreExecutorApi, OperationExecutorApi, addGroup } from "./api";
 export {
   checkForUpdate,
   resolveDistTags,

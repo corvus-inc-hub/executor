@@ -8,6 +8,7 @@ export {
   OAuthHandlers,
   PoliciesHandlers,
   ExecutionsHandlers,
+  OperationsHandlers,
 } from "./handlers";
 export {
   composePluginApi,

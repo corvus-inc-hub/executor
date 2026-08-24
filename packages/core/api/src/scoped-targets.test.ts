@@ -22,7 +22,7 @@ import {
 } from "@executor-js/sdk";
 import { makeTestConfig, memoryCredentialsPlugin } from "@executor-js/sdk/testing";
 
-import { ExecutorApi } from "./api";
+import { ExecutorApi, OperationExecutorApi } from "./api";
 import { observabilityMiddleware } from "./observability";
 import { CoreHandlers, ExecutionEngineService, ExecutorService } from "./server";
 
@@ -46,13 +46,13 @@ import { CoreHandlers, ExecutionEngineService, ExecutorService } from "./server"
 //   session scope" — v2 OAuth carries no scope segment; start/complete are stubbed
 //   in the SDK (milestone 2) and have no scope-matching gate to assert.
 
-const webHandlerFor = (executor: Executor) =>
+const webHandlerFor = (executor: Executor, api = OperationExecutorApi) =>
   Effect.acquireRelease(
     Effect.sync(() =>
       HttpRouter.toWebHandler(
-        HttpApiBuilder.layer(ExecutorApi).pipe(
+        HttpApiBuilder.layer(api).pipe(
           Layer.provide(CoreHandlers),
-          Layer.provide(observabilityMiddleware(ExecutorApi)),
+          Layer.provide(observabilityMiddleware(api)),
           Layer.provide(Layer.succeed(ExecutorService)(executor)),
           Layer.provide(
             Layer.succeed(ExecutionEngineService)({} as ExecutionEngineService["Service"]),
@@ -195,6 +195,25 @@ const vercelPlugin = definePlugin(() => ({
 }))();
 
 describe("core API owner-scoped writes (v2)", () => {
+  it.effect("does not mount the operation route when the default API is used", () =>
+    Effect.gen(function* () {
+      const executor = yield* createExecutor(
+        makeTestConfig({ plugins: [operationHttpPlugin] as const }),
+      );
+      const web = yield* webHandlerFor(executor, ExecutorApi);
+      const response = yield* Effect.promise(() =>
+        web.handler(
+          new Request("http://localhost/operations", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+          }),
+          handlerContextFor(executor),
+        ),
+      );
+      expect(response.status).toBe(404);
+    }),
+  );
+
   it.effect("HTTP operation carrier delegates to the same attested core envelope", () =>
     Effect.gen(function* () {
       const config = makeTestConfig({

@@ -18,7 +18,6 @@ export const CoreExecutorApi = HttpApi.make("executor")
   .add(ExecutionsApi)
   .add(OAuthApi)
   .add(PoliciesApi)
-  .add(OperationsApi)
   .annotateMerge(
     OpenApi.annotations({
       title: "Executor API",
@@ -26,10 +25,15 @@ export const CoreExecutorApi = HttpApi.make("executor")
     }),
   );
 
+/** Default API. It intentionally has no operation route. */
+export const ExecutorApi = CoreExecutorApi;
+
+/** Explicit opt-in API for a host that has configured operation definitions and
+ * a replay ledger. This is kept separate so generic production composition
+ * cannot advertise `execute_operation` accidentally. */
+export const OperationExecutorApi = CoreExecutorApi.add(OperationsApi);
+
 /**
  * Compose the core API with a plugin group.
  */
 export const addGroup = <G extends HttpApiGroup.Any>(group: G) => CoreExecutorApi.add(group);
-
-/** Default API with no plugin groups */
-export const ExecutorApi = CoreExecutorApi;

@@ -165,6 +165,13 @@ const makeElicitingEngine = (
 // ---------------------------------------------------------------------------
 
 describe("MCP host server — native elicitation mode", () => {
+  it("does not advertise execute_operation without an operation executor", async () => {
+    await withNativeClient(makeStubEngine({}), NO_CAPS, async (client) => {
+      const { tools } = await client.listTools();
+      expect(tools.map((tool) => tool.name)).not.toContain("execute_operation");
+    });
+  });
+
   it("routes execute_operation through the Executor and returns the attested envelope", async () => {
     const request: ExecuteOperationRequest = {
       schemaVersion: EXECUTE_OPERATION_SCHEMA_VERSION,
@@ -189,10 +196,17 @@ describe("MCP host server — native elicitation mode", () => {
       policy: { decision: "allow", source: "user" },
       approval: {
         decision: "not_required",
+        tenant: "stub-tenant",
         executionId: "execution-mcp-1",
         jobId: request.jobId,
+        operationKey: request.operationKey,
+        version: request.version,
+        descriptorSha256: request.descriptorSha256,
         requestSha256: request.requestSha256,
         target: ToolAddress.make("tools.github.org.main.listRepository"),
+        providerTransport: "http",
+        carrier: "mcp",
+        policy: { decision: "allow", source: "user" },
         sessionId: "approval:execution-mcp-1",
       },
       providerReconciliation: { status: "unavailable" },

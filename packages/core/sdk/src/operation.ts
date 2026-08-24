@@ -51,6 +51,34 @@ export const ExecuteOperationApprovalDecision = Schema.Literals([
 ]);
 export type ExecuteOperationApprovalDecision = typeof ExecuteOperationApprovalDecision.Type;
 
+/** Failure codes are a deliberately closed public vocabulary. Provider and
+ * plugin-native tags stay inside the Executor and are mapped to one of these
+ * stable projections before a result can cross a carrier. */
+export const ExecuteOperationFailureCode = Schema.Literals([
+  "operation_failed",
+  "provider_error",
+  "upstream_bad_request",
+  "upstream_unauthorized",
+  "upstream_forbidden",
+  "upstream_not_found",
+  "upstream_conflict",
+  "upstream_rate_limited",
+  "upstream_server_error",
+  "tool_not_found",
+  "tool_blocked",
+  "credential_missing",
+  "credential_invalid",
+  "approval_handler_required",
+  "approval_declined",
+  "approval_cancelled",
+  "output_schema_invalid",
+  "provider_receipt_mismatch",
+  "provider_receipt_unavailable",
+  "operation_cancelled",
+  "policy_blocked",
+]);
+export type ExecuteOperationFailureCode = typeof ExecuteOperationFailureCode.Type;
+
 export const ProviderReconciliationStatus = Schema.Literals([
   "matched",
   "mismatch",
@@ -109,15 +137,27 @@ export const ExecuteOperationPolicy = Schema.Struct({
 }).annotate({ identifier: "ExecutorOperationPolicyV2" });
 export type ExecuteOperationPolicy = typeof ExecuteOperationPolicy.Type;
 
+const OperationTimestamp = Schema.String.check(
+  Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/),
+  Schema.isMaxLength(24),
+).annotate({ identifier: "ExecutorOperationTimestamp" });
+
 export const ExecuteOperationApproval = Schema.Struct({
   decision: ExecuteOperationApprovalDecision,
+  tenant: Schema.NonEmptyString,
   executionId: Schema.NonEmptyString,
   jobId: Schema.NonEmptyString,
+  operationKey: OperationKey,
+  version: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+  descriptorSha256: Sha256,
   requestSha256: Sha256,
   target: ToolAddress,
+  providerTransport: ExecuteOperationProviderTransport,
+  carrier: ExecuteOperationCarrier,
+  policy: ExecuteOperationPolicy,
   subject: Schema.optional(Schema.NonEmptyString),
   sessionId: Schema.NonEmptyString,
-  decidedAt: Schema.optional(Schema.String),
+  decidedAt: Schema.optional(OperationTimestamp),
 }).annotate({ identifier: "ExecutorOperationApprovalV2" });
 export type ExecuteOperationApproval = typeof ExecuteOperationApproval.Type;
 
@@ -139,7 +179,7 @@ export const ProviderReceipt = Schema.Struct({
   status: Schema.optional(
     Schema.Int.check(Schema.isGreaterThanOrEqualTo(100), Schema.isLessThanOrEqualTo(599)),
   ),
-  observedAt: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(64)),
+  observedAt: OperationTimestamp,
 }).annotate({ identifier: "ExecutorOperationProviderReceiptV2" });
 export type ProviderReceipt = typeof ProviderReceipt.Type;
 
@@ -151,7 +191,7 @@ export type ProviderReconciliation = typeof ProviderReconciliation.Type;
 
 /** Public failure projection. Never expose raw provider messages/details. */
 export const ExecuteOperationFailure = Schema.Struct({
-  code: Schema.NonEmptyString,
+  code: ExecuteOperationFailureCode,
   status: Schema.optional(
     Schema.Int.check(Schema.isGreaterThanOrEqualTo(100), Schema.isLessThanOrEqualTo(599)),
   ),
@@ -174,8 +214,8 @@ export const ExecuteOperationResult = Schema.Struct({
   policy: ExecuteOperationPolicy,
   approval: ExecuteOperationApproval,
   providerReconciliation: ProviderReconciliation,
-  startedAt: Schema.String,
-  completedAt: Schema.String,
+  startedAt: OperationTimestamp,
+  completedAt: OperationTimestamp,
   durationMs: Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
   status: ExecuteOperationStatus,
   outputSha256: Schema.NullOr(Sha256),
@@ -220,6 +260,7 @@ export class OperationContractError extends Schema.TaggedErrorClass<OperationCon
       "accessor_property",
       "non_enumerable_property",
       "symbol_property",
+      "stale_reservation",
     ]),
   },
 ) {
@@ -294,6 +335,9 @@ export type ExecuteOperationReplayReservation =
   | { readonly status: "in_progress" }
   | { readonly status: "conflict"; readonly requestSha256: string };
 
+export const ExecuteOperationReplaySettleStatus = Schema.Literals(["settled", "stale"]);
+export type ExecuteOperationReplaySettleStatus = typeof ExecuteOperationReplaySettleStatus.Type;
+
 export interface ExecuteOperationReplayStore<E = never> {
   /**
    * Durable stores are required for cloud operation registries. The
@@ -318,7 +362,7 @@ export interface ExecuteOperationReplayStore<E = never> {
     readonly requestSha256: string;
     readonly reservationToken: string;
     readonly result: ExecuteOperationResult;
-  }) => Effect.Effect<void, E>;
+  }) => Effect.Effect<ExecuteOperationReplaySettleStatus, E>;
 }
 
 /**
@@ -327,13 +371,17 @@ export interface ExecuteOperationReplayStore<E = never> {
  * this identity is what a host persists when it pauses an operation.
  */
 export interface ExecuteOperationApprovalContext {
+  readonly tenant: string;
   readonly executionId: string;
   readonly jobId: string;
-  readonly requestSha256: string;
-  readonly descriptorSha256: string;
   readonly operationKey: string;
   readonly version: number;
+  readonly requestSha256: string;
+  readonly descriptorSha256: string;
   readonly target: ToolAddress;
+  readonly providerTransport: ExecuteOperationProviderTransport;
+  readonly carrier: ExecuteOperationCarrier;
+  readonly policy: ExecuteOperationPolicy;
   readonly subject?: string;
   readonly sessionId: string;
 }
@@ -359,7 +407,7 @@ export const makeInMemoryOperationReplayStore = (): ExecuteOperationReplayStore 
     durability: "process-local" as const,
     reserve: ({ tenant, jobId, requestSha256 }) =>
       Effect.sync(() => {
-        const key = `${tenant}:${jobId}`;
+        const key = JSON.stringify([tenant, jobId]);
         const existing = entries.get(key);
         if (!existing) {
           const reservationToken = crypto.randomUUID();
@@ -375,14 +423,16 @@ export const makeInMemoryOperationReplayStore = (): ExecuteOperationReplayStore 
       }),
     settle: ({ tenant, jobId, requestSha256, reservationToken, result }) =>
       Effect.sync(() => {
-        const key = `${tenant}:${jobId}`;
+        const key = JSON.stringify([tenant, jobId]);
         const existing = entries.get(key);
         if (
           existing?.requestSha256 === requestSha256 &&
           existing.reservationToken === reservationToken
         ) {
           entries.set(key, { requestSha256, reservationToken, result });
+          return "settled" as const;
         }
+        return "stale" as const;
       }),
   };
 };
@@ -403,12 +453,21 @@ const MAX_OPERATION_BYTES = 1_000_000;
  * primary credential boundary; this scanner is defense in depth and rejects
  * common aliases that should never cross a public operation boundary. */
 const SECRET_FIELD =
-  /access.?token|api.?key|authorization|auth.?header|credential|client.?secret|password|passwd|private.?key|refresh.?token|secret|github.?pat|personal.?access.?token|aws.?secret|aws.?session|token/i;
+  /access.?token|access.?key|admin.?key|api.?key|authorization|auth.?header|credential|client.?secret|password|passwd|private.?key|refresh.?token|secret|github.?pat|personal.?access.?token|aws.?access.?key.?id|aws.?secret|aws.?session|token/i;
 
 const isSecretField = (key: string): boolean => SECRET_FIELD.test(key.trim().replace(/[-_]/g, ""));
 
 const pathForKey = (path: string, key: string): string =>
   path === "$" ? `$.${key}` : `${path}.${key}`;
+
+const reflectContract = <A>(
+  field: string,
+  read: () => A,
+): Effect.Effect<A, OperationContractError> =>
+  Effect.try({
+    try: read,
+    catch: () => new OperationContractError({ field, reason: "invalid_value" }),
+  });
 
 const freezeDeep = (value: unknown): void => {
   if (typeof value !== "object" || value === null || Object.isFrozen(value)) return;
@@ -423,40 +482,47 @@ const freezeDeep = (value: unknown): void => {
 const ownEnumerableDataKeys = (
   value: object,
   path: string,
-): Effect.Effect<readonly string[], OperationContractError> => {
-  // Array `length` is an intrinsic non-enumerable property, not caller data.
-  // It is validated separately against the enumerable numeric indices below.
-  const names = Object.getOwnPropertyNames(value).filter(
-    (name) => !(Array.isArray(value) && name === "length"),
-  );
-  if (Object.getOwnPropertySymbols(value).length > 0) {
-    return Effect.fail(new OperationContractError({ field: path, reason: "symbol_property" }));
-  }
-  const keys: string[] = [];
-  for (const key of names) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor) {
-      return Effect.fail(
-        new OperationContractError({ field: pathForKey(path, key), reason: "invalid_value" }),
-      );
+): Effect.Effect<
+  readonly { readonly key: string; readonly descriptor: PropertyDescriptor }[],
+  OperationContractError
+> =>
+  Effect.gen(function* () {
+    // Array `length` is an intrinsic non-enumerable property, not caller data.
+    // It is validated separately against the enumerable numeric indices below.
+    const isArray = yield* reflectContract(path, () => Array.isArray(value));
+    const names = yield* reflectContract(path, () => Object.getOwnPropertyNames(value));
+    const symbols = yield* reflectContract(path, () => Object.getOwnPropertySymbols(value));
+    if (symbols.length > 0) {
+      return yield* new OperationContractError({ field: path, reason: "symbol_property" });
     }
-    if (!descriptor.enumerable) {
-      return Effect.fail(
-        new OperationContractError({
+    const entries: { key: string; descriptor: PropertyDescriptor }[] = [];
+    for (const key of names) {
+      if (isArray && key === "length") continue;
+      const descriptor = yield* reflectContract(pathForKey(path, key), () =>
+        Object.getOwnPropertyDescriptor(value, key),
+      );
+      if (!descriptor) {
+        return yield* new OperationContractError({
+          field: pathForKey(path, key),
+          reason: "invalid_value",
+        });
+      }
+      if (!descriptor.enumerable) {
+        return yield* new OperationContractError({
           field: pathForKey(path, key),
           reason: "non_enumerable_property",
-        }),
-      );
+        });
+      }
+      if (!("value" in descriptor)) {
+        return yield* new OperationContractError({
+          field: pathForKey(path, key),
+          reason: "accessor_property",
+        });
+      }
+      entries.push({ key, descriptor });
     }
-    if (!("value" in descriptor)) {
-      return Effect.fail(
-        new OperationContractError({ field: pathForKey(path, key), reason: "accessor_property" }),
-      );
-    }
-    keys.push(key);
-  }
-  return Effect.succeed(keys.sort());
-};
+    return entries.sort((left, right) => left.key.localeCompare(right.key));
+  });
 
 const toJsonValue = (
   value: unknown,
@@ -464,79 +530,89 @@ const toJsonValue = (
   stack: Set<object>,
   state: { nodes: number },
   depth: number,
-): Effect.Effect<JsonValue, OperationContractError | OperationSecretRejectedError> => {
-  state.nodes += 1;
-  if (state.nodes > MAX_OPERATION_NODES) {
-    return Effect.fail(new OperationContractError({ field: path, reason: "too_large" }));
-  }
-  if (depth > MAX_OPERATION_DEPTH) {
-    return Effect.fail(new OperationContractError({ field: path, reason: "too_deep" }));
-  }
-  if (value === null) return Effect.succeed(null);
-  if (typeof value === "string" || typeof value === "boolean") return Effect.succeed(value);
-  if (typeof value === "number") {
-    return Number.isFinite(value)
-      ? Effect.succeed(value)
-      : Effect.fail(new OperationContractError({ field: path, reason: "invalid_value" }));
-  }
-  if (typeof value !== "object") {
-    return Effect.fail(new OperationContractError({ field: path, reason: "invalid_value" }));
-  }
-  if (stack.has(value)) {
-    return Effect.fail(new OperationContractError({ field: path, reason: "cycle" }));
-  }
+): Effect.Effect<JsonValue, OperationContractError | OperationSecretRejectedError> =>
+  Effect.gen(function* () {
+    state.nodes += 1;
+    if (state.nodes > MAX_OPERATION_NODES) {
+      return yield* new OperationContractError({ field: path, reason: "too_large" });
+    }
+    if (depth > MAX_OPERATION_DEPTH) {
+      return yield* new OperationContractError({ field: path, reason: "too_deep" });
+    }
+    if (value === null) return null;
+    if (typeof value === "string" || typeof value === "boolean") return value;
+    if (typeof value === "number") {
+      return Number.isFinite(value)
+        ? value
+        : yield* new OperationContractError({ field: path, reason: "invalid_value" });
+    }
+    if (typeof value !== "object") {
+      return yield* new OperationContractError({ field: path, reason: "invalid_value" });
+    }
+    if (stack.has(value)) {
+      return yield* new OperationContractError({ field: path, reason: "cycle" });
+    }
 
-  const prototype = Object.getPrototypeOf(value);
-  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
-    return Effect.fail(new OperationContractError({ field: path, reason: "unsupported_object" }));
-  }
+    const checkedPrototype = yield* reflectContract(path, () => Object.getPrototypeOf(value));
+    const checkedIsArray = yield* reflectContract(path, () => Array.isArray(value));
+    if (!checkedIsArray && checkedPrototype !== Object.prototype && checkedPrototype !== null) {
+      return yield* new OperationContractError({ field: path, reason: "unsupported_object" });
+    }
 
-  stack.add(value);
-  const result = Array.isArray(value)
-    ? Effect.gen(function* () {
-        const keys = yield* ownEnumerableDataKeys(value, path);
-        const indexes = keys.filter((key) => /^\d+$/.test(key));
-        if (
-          keys.length !== value.length ||
-          indexes.length !== keys.length ||
-          indexes.some((key, i) => Number(key) !== i)
-        ) {
-          return yield* new OperationContractError({ field: path, reason: "invalid_value" });
-        }
-        const array: JsonValue[] = [];
-        for (let index = 0; index < value.length; index += 1) {
-          array.push(
-            yield* toJsonValue(value[index], `${path}[${index}]`, stack, state, depth + 1),
-          );
-        }
-        return array;
-      })
-    : Effect.gen(function* () {
-        const keys = yield* ownEnumerableDataKeys(value, path);
-        const object = Object.create(null) as Record<string, JsonValue>;
-        const record = value as Readonly<Record<string, unknown>>;
-        for (const key of keys) {
-          if (isSecretField(key)) {
-            return yield* new OperationSecretRejectedError({ field: pathForKey(path, key) });
+    stack.add(value);
+    const result = checkedIsArray
+      ? Effect.gen(function* () {
+          const entries = yield* ownEnumerableDataKeys(value, path);
+          const keys = entries.map(({ key }) => key);
+          const indexes = entries
+            .filter(({ key }) => /^\d+$/.test(key))
+            .sort((left, right) => Number(left.key) - Number(right.key));
+          const length = yield* reflectContract(path, () => Reflect.get(value, "length"));
+          if (
+            typeof length !== "number" ||
+            keys.length !== length ||
+            indexes.length !== keys.length ||
+            indexes.some(({ key }, i) => Number(key) !== i)
+          ) {
+            return yield* new OperationContractError({ field: path, reason: "invalid_value" });
           }
-          object[key] = yield* toJsonValue(
-            record[key],
-            pathForKey(path, key),
-            stack,
-            state,
-            depth + 1,
-          );
-        }
-        return object;
-      });
+          const array: JsonValue[] = [];
+          for (let index = 0; index < length; index += 1) {
+            const descriptor = indexes[index]?.descriptor;
+            if (!descriptor || !("value" in descriptor)) {
+              return yield* new OperationContractError({ field: path, reason: "invalid_value" });
+            }
+            array.push(
+              yield* toJsonValue(descriptor.value, `${path}[${index}]`, stack, state, depth + 1),
+            );
+          }
+          return array;
+        })
+      : Effect.gen(function* () {
+          const entries = yield* ownEnumerableDataKeys(value, path);
+          const object = Object.create(null) as Record<string, JsonValue>;
+          for (const { key, descriptor } of entries) {
+            if (isSecretField(key)) {
+              return yield* new OperationSecretRejectedError({ field: pathForKey(path, key) });
+            }
+            object[key] = yield* toJsonValue(
+              descriptor.value,
+              pathForKey(path, key),
+              stack,
+              state,
+              depth + 1,
+            );
+          }
+          return object;
+        });
 
-  return Effect.ensuring(
-    result as Effect.Effect<JsonValue, OperationContractError | OperationSecretRejectedError>,
-    Effect.sync(() => {
-      stack.delete(value);
-    }),
-  );
-};
+    return yield* Effect.ensuring(
+      result as Effect.Effect<JsonValue, OperationContractError | OperationSecretRejectedError>,
+      Effect.sync(() => {
+        stack.delete(value);
+      }),
+    );
+  });
 
 /**
  * Clone, freeze, and canonicalize a public JSON value. The recursion stack,
@@ -675,7 +751,15 @@ export const validateOperationSchema = (
       try: () => Promise.resolve(schema["~standard"].validate(snapshot.value)),
       catch: () => new OperationSchemaValidationError({ field }),
     });
-    if (!("value" in decoded)) return yield* new OperationSchemaValidationError({ field });
-    const checked = yield* canonicalizeOperationValue(decoded.value);
+    const decodedValue = yield* Effect.try({
+      try: () => {
+        if (typeof decoded !== "object" || decoded === null) return undefined;
+        const descriptor = Object.getOwnPropertyDescriptor(decoded, "value");
+        return descriptor && "value" in descriptor ? descriptor.value : undefined;
+      },
+      catch: () => new OperationContractError({ field, reason: "invalid_value" }),
+    });
+    if (decodedValue === undefined) return yield* new OperationSchemaValidationError({ field });
+    const checked = yield* canonicalizeOperationValue(decodedValue);
     return checked.value;
   });

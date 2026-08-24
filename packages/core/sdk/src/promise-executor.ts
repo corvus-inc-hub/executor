@@ -26,6 +26,12 @@ import type { FumaDb, FumaTables } from "./fuma-runtime";
 import { Subject, Tenant } from "./ids";
 import type { AnyPlugin } from "./plugin";
 import type { CredentialProvider } from "./provider";
+import type {
+  ExecuteOperationApprovalContext,
+  ExecuteOperationDefinition,
+  ExecuteOperationReplayStore,
+} from "./operation";
+import type { StorageFailure } from "./fuma-runtime";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -64,6 +70,12 @@ export type PromiseOnElicitation =
 export interface PromiseInvokeOptions {
   readonly onElicitation?: PromiseOnElicitation;
 }
+
+export type PromiseOperationApprovalDecision = "approved" | "declined" | "cancelled";
+
+export type PromiseOperationApprovalHandler = (
+  context: Unbrand<ExecuteOperationApprovalContext>,
+) => PromiseOperationApprovalDecision | Promise<PromiseOperationApprovalDecision>;
 
 type PromisifiedArg<T> = T extends EffectInvokeOptions | undefined
   ? PromiseInvokeOptions | undefined
@@ -127,6 +139,13 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
    * an options arg.
    */
   readonly onElicitation: PromiseOnElicitation;
+  /** Reviewed operation definitions. A replay store is required when this is
+   * configured; process-local storage is only accepted with the explicit
+   * local-development escape hatch. */
+  readonly operations?: readonly ExecuteOperationDefinition[];
+  readonly operationReplayStore?: ExecuteOperationReplayStore<StorageFailure>;
+  readonly allowProcessLocalOperationReplayStore?: boolean;
+  readonly operationApproval?: PromiseOperationApprovalHandler;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +232,21 @@ export const createExecutor = async <const TPlugins extends readonly AnyPlugin[]
     plugins,
     ...(config.providers ? { providers: config.providers } : {}),
     onElicitation: toEffectOnElicitation(config.onElicitation),
+    ...(config.operations ? { operations: config.operations } : {}),
+    ...(config.operationReplayStore ? { operationReplayStore: config.operationReplayStore } : {}),
+    ...(config.allowProcessLocalOperationReplayStore === true
+      ? { allowProcessLocalOperationReplayStore: true }
+      : {}),
+    ...(config.operationApproval
+      ? {
+          operationApproval: (context: ExecuteOperationApprovalContext) =>
+            Effect.promise(() =>
+              Promise.resolve(
+                config.operationApproval!(context as Unbrand<ExecuteOperationApprovalContext>),
+              ),
+            ),
+        }
+      : {}),
     ...(db ? { db } : {}),
   };
 
