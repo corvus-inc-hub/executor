@@ -4,7 +4,14 @@ import { Deferred, Effect, Fiber, Predicate, Result, Schema } from "effect";
 import { ToolResult } from "./tool-result";
 import type { ToolProviderEvidence } from "./tool-result";
 import { definePlugin, tool } from "./plugin";
-import { ToolAddress } from "./ids";
+import {
+  AuthTemplateSlug,
+  ConnectionAddress,
+  ConnectionName,
+  IntegrationSlug,
+  ProviderKey,
+  ToolAddress,
+} from "./ids";
 import {
   EXECUTE_OPERATION_SCHEMA_VERSION,
   ExecuteOperationRequestCodec,
@@ -16,6 +23,9 @@ import {
   hashExecuteOperationRequest,
   hashOperationValue,
   makeInMemoryOperationReplayStore,
+  type ExecuteOperationApprovalContext,
+  type ExecuteOperationBindingResolver,
+  type ExecuteOperationBindingResolverContext,
   type ExecuteOperationDefinition,
   type ExecuteOperationResult,
   type ExecuteOperationRequest,
@@ -200,6 +210,61 @@ const providerDefinition: ExecuteOperationDefinition = {
   ...definition(HTTP_TARGET, "http-echo"),
   providerTransport: "http",
 };
+
+const BOUND_TARGET = ToolAddress.make("attestation-bound.echo");
+const BOUND_BINDING_A = "a".repeat(64);
+const BOUND_BINDING_B = "b".repeat(64);
+
+const makeBinding = (bindingSha256: string, generation = "generation-a") => ({
+  bindingSha256,
+  connection: {
+    address: ConnectionAddress.make("tools.attestation.org.primary"),
+    owner: "org" as const,
+    integration: IntegrationSlug.make("attestation"),
+    name: ConnectionName.make("primary"),
+    credentialProvider: ProviderKey.make("memory"),
+    template: AuthTemplateSlug.make("none"),
+    generation,
+    catalogRevision: "catalog-a",
+    sourceTransport: "none" as const,
+  },
+});
+
+const boundDefinition = (
+  bindingResolver: ExecuteOperationBindingResolver,
+): ExecuteOperationDefinition => ({
+  ...definition(BOUND_TARGET, "bound-echo"),
+  bindingMode: "connection",
+  bindingKey: "executor.connection",
+  bindingVersion: 1,
+  bindingResolver,
+});
+
+const makeBoundOperationPlugin = (calls: { count: number }) =>
+  definePlugin(() => ({
+    id: "attestation-bound" as const,
+    storage: () => ({}),
+    staticIntegrations: () => [
+      {
+        id: "attestation-bound",
+        kind: "plugin" as const,
+        name: "Attestation bound",
+        tools: [
+          tool({
+            name: "echo",
+            description: "Execute a bound operation.",
+            inputSchema: INPUT,
+            outputSchema: OUTPUT,
+            execute: ({ value }) =>
+              Effect.sync(() => {
+                calls.count += 1;
+                return { value };
+              }),
+          }),
+        ],
+      },
+    ],
+  }))();
 
 describe("carrier-neutral operation attestation", () => {
   it.effect("keeps the exported canonical adapter fixture derived and codec-valid", () =>
@@ -1462,6 +1527,221 @@ describe("carrier-neutral operation attestation", () => {
       expect(request).not.toHaveProperty("target");
       const result = yield* executor.executeOperation(request, "http");
       expect(result.target).toBe(TARGET);
+    }),
+  );
+
+  it.effect("hashes the reviewed binding mode, key, and version into the descriptor", () =>
+    Effect.gen(function* () {
+      const first = yield* deriveOperationDescriptor({
+        ...definition(),
+        bindingMode: "connection",
+        bindingKey: "executor.connection",
+        bindingVersion: 1,
+      });
+      const second = yield* deriveOperationDescriptor({
+        ...definition(),
+        bindingMode: "connection",
+        bindingKey: "executor.connection",
+        bindingVersion: 2,
+      });
+      expect(first).toMatchObject({
+        bindingMode: "connection",
+        bindingKey: "executor.connection",
+        bindingVersion: 1,
+      });
+      expect(second.bindingVersion).toBe(2);
+      expect(second.descriptorSha256).not.toBe(first.descriptorSha256);
+    }),
+  );
+
+  it.effect("gives a binding resolver only frozen canonical host context", () =>
+    Effect.gen(function* () {
+      let observed: ExecuteOperationBindingResolverContext | undefined;
+      const calls = { count: 0 };
+      const operation = boundDefinition((context) =>
+        Effect.sync(() => {
+          observed = context;
+          return makeBinding(BOUND_BINDING_A);
+        }),
+      );
+      const executor = yield* makeTestExecutor({
+        plugins: [makeBoundOperationPlugin(calls)] as const,
+        operations: [operation],
+      });
+      const request = yield* makeRequest(operation, "job-binding-context", { value: "context" });
+      const result = yield* executor.executeOperation(request, "http");
+      expect(result.status).toBe("completed");
+      expect(calls.count).toBe(1);
+      expect(observed).toBeDefined();
+      if (!observed) return;
+      expect(Object.getPrototypeOf(observed)).toBe(null);
+      expect(Object.getPrototypeOf(observed.owner)).toBe(null);
+      expect(Object.isFrozen(observed)).toBe(true);
+      expect(Object.isFrozen(observed.owner)).toBe(true);
+      expect(Object.isFrozen(observed.request)).toBe(true);
+      expect(Object.isFrozen(observed.descriptor)).toBe(true);
+      expect(observed).not.toHaveProperty("tenant");
+      expect(observed).not.toHaveProperty("subject");
+      expect(observed).not.toHaveProperty("target");
+      expect(observed).not.toHaveProperty("transport");
+      expect(observed).not.toHaveProperty("cursor");
+      expect(observed.owner).toMatchObject({ tenant: "test-tenant", subject: "test-subject" });
+      expect(observed.request.input).toEqual({ value: "context" });
+      expect(observed.descriptor.target).toBe(BOUND_TARGET);
+      expect(Reflect.set(observed.owner, "tenant", "attacker")).toBe(false);
+    }),
+  );
+
+  it.effect("binds approval context to the resolved connection identity", () =>
+    Effect.gen(function* () {
+      let approvalContext: ExecuteOperationApprovalContext | undefined;
+      const operation = boundDefinition(() => Effect.succeed(makeBinding(BOUND_BINDING_A)));
+      const executor = yield* makeTestExecutor({
+        plugins: [makeBoundOperationPlugin({ count: 0 })] as const,
+        operations: [operation],
+        operationApproval: (context) =>
+          Effect.sync(() => {
+            approvalContext = context;
+            return "approved" as const;
+          }),
+      });
+      yield* executor.policies.create({
+        owner: "org",
+        pattern: String(BOUND_TARGET),
+        action: "require_approval",
+      });
+      const request = yield* makeRequest(operation, "job-binding-approval", { value: "approval" });
+      const result = yield* executor.executeOperation(request, "http");
+      expect(result.status).toBe("completed");
+      expect(approvalContext).toMatchObject({
+        bindingSha256: BOUND_BINDING_A,
+        connectionAddress: "tools.attestation.org.primary",
+      });
+    }),
+  );
+
+  it.effect("fails before reservation for an invalid resolved binding", () =>
+    Effect.gen(function* () {
+      let reserveCalls = 0;
+      const inner = makeInMemoryOperationReplayStore();
+      const replayStore = {
+        ...inner,
+        reserve: (input: Parameters<typeof inner.reserve>[0]) => {
+          reserveCalls += 1;
+          return inner.reserve(input);
+        },
+      };
+      const invalidBinding = {
+        ...makeBinding(BOUND_BINDING_A),
+        connection: {
+          ...makeBinding(BOUND_BINDING_A).connection,
+          address: ConnectionAddress.make("tools.attestation.user.primary"),
+        },
+      };
+      const operation = boundDefinition(() => Effect.succeed(invalidBinding));
+      const executor = yield* makeTestExecutor({
+        plugins: [makeBoundOperationPlugin({ count: 0 })] as const,
+        operations: [operation],
+        operationReplayStore: replayStore,
+      });
+      const request = yield* makeRequest(operation, "job-binding-invalid", { value: "invalid" });
+      const result = yield* Effect.result(executor.executeOperation(request, "http"));
+      expect(
+        Result.match(result, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "binding.connection.address",
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+      expect(reserveCalls).toBe(0);
+    }),
+  );
+
+  it.effect("fails closed after approval drift before credential/provider work", () =>
+    Effect.gen(function* () {
+      let resolverCalls = 0;
+      const calls = { count: 0 };
+      const operation = boundDefinition(() =>
+        Effect.sync(() => {
+          resolverCalls += 1;
+          return makeBinding(resolverCalls === 1 ? BOUND_BINDING_A : BOUND_BINDING_B);
+        }),
+      );
+      const executor = yield* makeTestExecutor({
+        plugins: [makeBoundOperationPlugin(calls)] as const,
+        operations: [operation],
+        operationApproval: () => Effect.succeed("approved" as const),
+      });
+      yield* executor.policies.create({
+        owner: "org",
+        pattern: String(BOUND_TARGET),
+        action: "require_approval",
+      });
+      const request = yield* makeRequest(operation, "job-binding-drift", { value: "drift" });
+      const result = yield* Effect.result(executor.executeOperation(request, "http"));
+      expect(
+        Result.match(result, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "binding.execution",
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+      expect(resolverCalls).toBe(2);
+      expect(calls.count).toBe(0);
+    }),
+  );
+
+  it.effect("re-resolves the binding before replay and rejects drift", () =>
+    Effect.gen(function* () {
+      let resolverCalls = 0;
+      const calls = { count: 0 };
+      const operation = boundDefinition(() =>
+        Effect.sync(() => {
+          resolverCalls += 1;
+          return makeBinding(resolverCalls <= 3 ? BOUND_BINDING_A : BOUND_BINDING_B);
+        }),
+      );
+      const executor = yield* makeTestExecutor({
+        plugins: [makeBoundOperationPlugin(calls)] as const,
+        operations: [operation],
+      });
+      const request = yield* makeRequest(operation, "job-binding-replay-drift", {
+        value: "replay",
+      });
+      const first = yield* executor.executeOperation(request, "http");
+      expect(first.status).toBe("completed");
+      const replay = yield* Effect.result(executor.executeOperation(request, "mcp"));
+      expect(
+        Result.match(replay, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "binding.replay",
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+      expect(resolverCalls).toBe(4);
+      expect(calls.count).toBe(1);
+    }),
+  );
+
+  it.effect("does not replay the same request/job across different binding lineages", () =>
+    Effect.gen(function* () {
+      let currentBinding = BOUND_BINDING_A;
+      const calls = { count: 0 };
+      const operation = boundDefinition(() => Effect.succeed(makeBinding(currentBinding)));
+      const executor = yield* makeTestExecutor({
+        plugins: [makeBoundOperationPlugin(calls)] as const,
+        operations: [operation],
+      });
+      const request = yield* makeRequest(operation, "job-binding-key", { value: "same" });
+      const first = yield* executor.executeOperation(request, "http");
+      expect(first.status).toBe("completed");
+      currentBinding = BOUND_BINDING_B;
+      const second = yield* executor.executeOperation(request, "mcp");
+      expect(second.status).toBe("completed");
+      expect(calls.count).toBe(2);
     }),
   );
 

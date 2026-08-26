@@ -1,7 +1,17 @@
 import { Effect, Schema } from "effect";
 
 import type { StaticToolSchema } from "./plugin";
-import { ToolAddress } from "./ids";
+import type { OwnerBinding } from "./plugin";
+import type { StorageFailure } from "./fuma-runtime";
+import {
+  AuthTemplateSlug,
+  ConnectionAddress,
+  ConnectionName,
+  IntegrationSlug,
+  Owner,
+  ProviderKey,
+  ToolAddress,
+} from "./ids";
 
 /**
  * Carrier-neutral operation contracts.
@@ -115,6 +125,17 @@ export interface ExecuteOperationDefinition {
   readonly inputSchema: StaticToolSchema;
   readonly outputSchema: StaticToolSchema;
   readonly providerTransport: ExecuteOperationProviderTransport;
+  /** Stable host-reviewed binding semantics. Function fields are deliberately
+   * excluded from the descriptor, so this tuple makes a resolver change
+   * visible to callers and stored requests. All three fields are required
+   * together when a binding resolver is configured. */
+  readonly bindingMode?: string;
+  readonly bindingKey?: string;
+  readonly bindingVersion?: number;
+  /** Host-owned resolver for the connection/resource lineage used by this
+   * operation. It receives only the executor's ambient owner and canonical
+   * request/input values, never caller-selected authority or transport. */
+  readonly bindingResolver?: ExecuteOperationBindingResolver;
   readonly description?: string;
 }
 
@@ -126,8 +147,53 @@ export interface ExecuteOperationDescriptor {
   readonly providerTransport: ExecuteOperationProviderTransport;
   readonly inputSchema: unknown;
   readonly outputSchema: unknown;
+  readonly bindingMode?: string;
+  readonly bindingKey?: string;
+  readonly bindingVersion?: number;
   readonly descriptorSha256: string;
 }
+
+/** The reviewed, stable implementation identity for a binding resolver. */
+export interface ExecuteOperationBindingDefinition {
+  readonly mode: string;
+  readonly key: string;
+  readonly version: number;
+}
+
+/** Non-secret connection identity returned by a host-owned binding resolver.
+ * Generation and catalog revision are opaque immutable lineage values; the
+ * Executor never interprets them or exposes credentials behind them. */
+export interface ExecuteOperationResolvedConnection {
+  readonly address: ConnectionAddress;
+  readonly owner: Owner;
+  readonly integration: IntegrationSlug;
+  readonly name: ConnectionName;
+  readonly credentialProvider: ProviderKey;
+  readonly template: AuthTemplateSlug;
+  readonly generation: string;
+  readonly catalogRevision: string;
+  readonly sourceTransport: ExecuteOperationProviderTransport;
+  readonly pluginId?: string;
+}
+
+export interface ExecuteOperationResolvedBinding {
+  readonly bindingSha256: string;
+  readonly connection: ExecuteOperationResolvedConnection;
+}
+
+/** The resolver receives only canonical values selected by the Executor. The
+ * owner is an ambient host binding and the descriptor is host-derived, so a
+ * request cannot inject tenant, subject, target, provider, or cursor state. */
+export interface ExecuteOperationBindingResolverContext {
+  readonly owner: Readonly<OwnerBinding>;
+  readonly request: Readonly<ExecuteOperationRequest>;
+  readonly descriptor: Readonly<ExecuteOperationDescriptor>;
+  readonly input: unknown;
+}
+
+export type ExecuteOperationBindingResolver = (
+  context: ExecuteOperationBindingResolverContext,
+) => Effect.Effect<ExecuteOperationResolvedBinding, OperationContractError | StorageFailure>;
 
 export const ExecuteOperationPolicy = Schema.Struct({
   decision: ExecuteOperationPolicyDecision,
@@ -155,6 +221,10 @@ export const ExecuteOperationApproval = Schema.Struct({
   providerTransport: ExecuteOperationProviderTransport,
   carrier: ExecuteOperationCarrier,
   policy: ExecuteOperationPolicy,
+  /** Present only for operations with a host-owned binding resolver. */
+  bindingSha256: Schema.optional(Sha256),
+  /** Non-secret connection address associated with the approval. */
+  connectionAddress: Schema.optional(ConnectionAddress),
   subject: Schema.optional(Schema.NonEmptyString),
   sessionId: Schema.NonEmptyString,
   decidedAt: Schema.optional(OperationTimestamp),
@@ -333,7 +403,11 @@ export type ExecuteOperationReplayReservation =
   | { readonly status: "reserved"; readonly reservationToken: string }
   | { readonly status: "replay"; readonly result: ExecuteOperationResult }
   | { readonly status: "in_progress" }
-  | { readonly status: "conflict"; readonly requestSha256: string };
+  | {
+      readonly status: "conflict";
+      readonly requestSha256: string;
+      readonly bindingSha256?: string;
+    };
 
 export const ExecuteOperationReplaySettleStatus = Schema.Literals(["settled", "stale"]);
 export type ExecuteOperationReplaySettleStatus = typeof ExecuteOperationReplaySettleStatus.Type;
@@ -357,12 +431,16 @@ export interface ExecuteOperationReplayStore<E = never> {
     readonly subject?: string;
     readonly jobId: string;
     readonly requestSha256: string;
+    /** Optional for byte-compatible unbound operations. Bound operations must
+     * include the resolver's immutable lineage hash in the replay identity. */
+    readonly bindingSha256?: string;
   }) => Effect.Effect<ExecuteOperationReplayReservation, E>;
   readonly settle: (input: {
     readonly tenant: string;
     readonly subject?: string;
     readonly jobId: string;
     readonly requestSha256: string;
+    readonly bindingSha256?: string;
     readonly reservationToken: string;
     readonly result: ExecuteOperationResult;
   }) => Effect.Effect<ExecuteOperationReplaySettleStatus, E>;
@@ -385,6 +463,10 @@ export interface ExecuteOperationApprovalContext {
   readonly providerTransport: ExecuteOperationProviderTransport;
   readonly carrier: ExecuteOperationCarrier;
   readonly policy: ExecuteOperationPolicy;
+  /** Present only for operations with a host-owned binding resolver. */
+  readonly bindingSha256?: string;
+  /** Non-secret connection address associated with the approval. */
+  readonly connectionAddress?: ConnectionAddress;
   readonly subject?: string;
   readonly sessionId: string;
 }
@@ -402,37 +484,45 @@ export type ExecuteOperationApprovalHandler = (
 export const makeInMemoryOperationReplayStore = (): ExecuteOperationReplayStore => {
   type Entry = {
     readonly requestSha256: string;
+    readonly bindingSha256?: string;
     readonly reservationToken: string;
     readonly result?: ExecuteOperationResult;
   };
   const entries = new Map<string, Entry>();
   return {
     durability: "process-local" as const,
-    reserve: ({ tenant, subject, jobId, requestSha256 }) =>
+    reserve: ({ tenant, subject, jobId, requestSha256, bindingSha256 }) =>
       Effect.sync(() => {
-        const key = JSON.stringify([tenant, subject ?? null, jobId]);
+        const key = JSON.stringify([tenant, subject ?? null, jobId, bindingSha256 ?? null]);
         const existing = entries.get(key);
         if (!existing) {
           const reservationToken = crypto.randomUUID();
-          entries.set(key, { requestSha256, reservationToken });
+          entries.set(key, { requestSha256, bindingSha256, reservationToken });
           return { status: "reserved" as const, reservationToken };
         }
         if (existing.requestSha256 !== requestSha256) {
-          return { status: "conflict" as const, requestSha256: existing.requestSha256 };
+          return {
+            status: "conflict" as const,
+            requestSha256: existing.requestSha256,
+            ...(existing.bindingSha256 !== undefined
+              ? { bindingSha256: existing.bindingSha256 }
+              : {}),
+          };
         }
         return existing.result
           ? { status: "replay" as const, result: existing.result }
           : { status: "in_progress" as const };
       }),
-    settle: ({ tenant, subject, jobId, requestSha256, reservationToken, result }) =>
+    settle: ({ tenant, subject, jobId, requestSha256, bindingSha256, reservationToken, result }) =>
       Effect.sync(() => {
-        const key = JSON.stringify([tenant, subject ?? null, jobId]);
+        const key = JSON.stringify([tenant, subject ?? null, jobId, bindingSha256 ?? null]);
         const existing = entries.get(key);
         if (
           existing?.requestSha256 === requestSha256 &&
+          existing.bindingSha256 === bindingSha256 &&
           existing.reservationToken === reservationToken
         ) {
-          entries.set(key, { requestSha256, reservationToken, result });
+          entries.set(key, { requestSha256, bindingSha256, reservationToken, result });
           return "settled" as const;
         }
         return "stale" as const;
@@ -657,7 +747,58 @@ const standardSchemaRoot = (schema: StaticToolSchema, side: "input" | "output"):
     : jsonSchema;
 };
 
-const descriptorPayload = (definition: ExecuteOperationDefinition): Record<string, unknown> => ({
+const OPERATION_BINDING_IDENTIFIER = /^[a-z][a-z0-9._-]*$/;
+const OPERATION_BINDING_IDENTIFIER_MAX_LENGTH = 128;
+
+const operationBindingFields = (
+  definition: ExecuteOperationDefinition,
+): {
+  readonly mode: unknown;
+  readonly key: unknown;
+  readonly version: unknown;
+} => ({
+  mode: definition.bindingMode,
+  key: definition.bindingKey,
+  version: definition.bindingVersion,
+});
+
+const hasOperationBindingField = (definition: ExecuteOperationDefinition): boolean => {
+  const fields = operationBindingFields(definition);
+  return fields.mode !== undefined || fields.key !== undefined || fields.version !== undefined;
+};
+
+const validateOperationBindingDefinition = (
+  definition: ExecuteOperationDefinition,
+): Effect.Effect<ExecuteOperationBindingDefinition | undefined, OperationContractError> =>
+  Effect.gen(function* () {
+    if (!hasOperationBindingField(definition)) return undefined;
+    const fields = operationBindingFields(definition);
+    if (
+      typeof fields.mode !== "string" ||
+      typeof fields.key !== "string" ||
+      typeof fields.version !== "number" ||
+      fields.mode.length === 0 ||
+      fields.key.length === 0 ||
+      fields.mode.length > OPERATION_BINDING_IDENTIFIER_MAX_LENGTH ||
+      fields.key.length > OPERATION_BINDING_IDENTIFIER_MAX_LENGTH ||
+      !OPERATION_BINDING_IDENTIFIER.test(fields.mode) ||
+      !OPERATION_BINDING_IDENTIFIER.test(fields.key) ||
+      !Number.isInteger(fields.version) ||
+      fields.version < 1
+    ) {
+      return yield* new OperationContractError({ field: "binding", reason: "invalid_value" });
+    }
+    return {
+      mode: fields.mode,
+      key: fields.key,
+      version: fields.version,
+    };
+  });
+
+const descriptorPayload = (
+  definition: ExecuteOperationDefinition,
+  binding?: ExecuteOperationBindingDefinition,
+): Record<string, unknown> => ({
   schemaVersion: EXECUTE_OPERATION_SCHEMA_VERSION,
   operationKey: definition.operationKey,
   version: definition.version,
@@ -665,6 +806,13 @@ const descriptorPayload = (definition: ExecuteOperationDefinition): Record<strin
   providerTransport: definition.providerTransport,
   inputSchema: standardSchemaRoot(definition.inputSchema, "input"),
   outputSchema: standardSchemaRoot(definition.outputSchema, "output"),
+  ...(binding
+    ? {
+        bindingMode: binding.mode,
+        bindingKey: binding.key,
+        bindingVersion: binding.version,
+      }
+    : {}),
 });
 
 const hashCanonicalJson = (
@@ -694,7 +842,9 @@ export const deriveOperationDescriptor = (
     if (!Number.isInteger(definition.version) || definition.version < 1) {
       return yield* new OperationContractError({ field: "version", reason: "invalid_value" });
     }
-    const canonical = yield* canonicalOperationJson(descriptorPayload(definition));
+    const binding = yield* validateOperationBindingDefinition(definition);
+    const payload = descriptorPayload(definition, binding);
+    const canonical = yield* canonicalOperationJson(payload);
     const descriptorSha256 = yield* hashCanonicalJson(canonical, "descriptorSha256");
     return {
       schemaVersion: EXECUTE_OPERATION_SCHEMA_VERSION,
@@ -702,8 +852,15 @@ export const deriveOperationDescriptor = (
       version: definition.version,
       target: definition.target,
       providerTransport: definition.providerTransport,
-      inputSchema: descriptorPayload(definition).inputSchema,
-      outputSchema: descriptorPayload(definition).outputSchema,
+      inputSchema: payload.inputSchema,
+      outputSchema: payload.outputSchema,
+      ...(binding
+        ? {
+            bindingMode: binding.mode,
+            bindingKey: binding.key,
+            bindingVersion: binding.version,
+          }
+        : {}),
       descriptorSha256,
     };
   });
