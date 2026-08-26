@@ -27,6 +27,7 @@ import {
   type ExecuteOperationBindingResolver,
   type ExecuteOperationBindingResolverContext,
   type ExecuteOperationDefinition,
+  type ExecuteOperationReplayReservation,
   type ExecuteOperationResult,
   type ExecuteOperationRequest,
 } from "./operation";
@@ -210,6 +211,8 @@ const providerDefinition: ExecuteOperationDefinition = {
   ...definition(HTTP_TARGET, "http-echo"),
   providerTransport: "http",
 };
+
+class BindingResolverError extends Error {}
 
 const BOUND_TARGET = ToolAddress.make("attestation-bound.echo");
 const BOUND_BINDING_A = "a".repeat(64);
@@ -517,6 +520,36 @@ describe("carrier-neutral operation attestation", () => {
     }),
   );
 
+  it.effect("rejects an unbound replay after its effective policy changes", () =>
+    Effect.gen(function* () {
+      const operation = definition(TARGET, "unbound-policy-replay");
+      const executor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+      });
+      const request = yield* makeRequest(operation, "job-unbound-policy-replay", {
+        value: "policy",
+      });
+      const first = yield* executor.executeOperation(request, "http");
+      expect(first.status).toBe("completed");
+      yield* executor.policies.create({
+        owner: "org",
+        pattern: String(operation.target),
+        action: "block",
+      });
+      const replay = yield* Effect.result(executor.executeOperation(request, "mcp"));
+      expect(
+        Result.match(replay, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "binding.replay.policy" &&
+            failure.reason === "invalid_value",
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+    }),
+  );
+
   it.effect("uses a collision-free tenant/job replay key", () =>
     Effect.gen(function* () {
       const store = makeInMemoryOperationReplayStore();
@@ -773,6 +806,76 @@ describe("carrier-neutral operation attestation", () => {
           onFailure: (failure) =>
             Predicate.isTagged(failure, "OperationContractError") &&
             failure.field === "result.binding",
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect("rejects accessor and proxy replay results before reading nested fields", () =>
+    Effect.gen(function* () {
+      const operation = definition(ToolAddress.make("attestation-replay-trap.echo"), "replay-trap");
+      const executor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+      });
+      const request = yield* makeRequest(operation, "job-replay-accessor", { value: "trap" });
+      const first = yield* executor.executeOperation(request, "http");
+      let getterCalls = 0;
+      const accessorResult = Object.defineProperty({ ...first }, "policy", {
+        enumerable: true,
+        get: () => {
+          getterCalls += 1;
+          return first.policy;
+        },
+      });
+      const accessorReservation = (
+        result: ExecuteOperationResult,
+      ): ExecuteOperationReplayReservation => ({
+        status: "replay",
+        result,
+      });
+      const accessorStore = {
+        ...makeInMemoryOperationReplayStore(),
+        reserve: () => Effect.succeed(accessorReservation(accessorResult)),
+      };
+      const accessorExecutor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+        operationReplayStore: accessorStore,
+      });
+      const accessorReplay = yield* Effect.result(
+        accessorExecutor.executeOperation(request, "mcp"),
+      );
+      expect(getterCalls).toBe(0);
+      expect(
+        Result.match(accessorReplay, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "result" &&
+            failure.reason === "invalid_value",
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+
+      const revoked = Proxy.revocable({ ...first }, {});
+      revoked.revoke();
+      const proxyStore = {
+        ...makeInMemoryOperationReplayStore(),
+        reserve: () => Effect.succeed(accessorReservation(revoked.proxy)),
+      };
+      const proxyExecutor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+        operationReplayStore: proxyStore,
+      });
+      const proxyReplay = yield* Effect.result(proxyExecutor.executeOperation(request, "mcp"));
+      expect(
+        Result.match(proxyReplay, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "result" &&
+            failure.reason === "invalid_value",
           onSuccess: () => false,
         }),
       ).toBe(true);
@@ -1259,6 +1362,42 @@ describe("carrier-neutral operation attestation", () => {
     }),
   );
 
+  it.effect("freezes approval context and its nested policy at runtime", () =>
+    Effect.gen(function* () {
+      let approvalContext: ExecuteOperationApprovalContext | undefined;
+      let contextMutation = true;
+      let policyMutation = true;
+      const operation = definition(TARGET, "frozen");
+      const executor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+        operationApproval: (context) =>
+          Effect.sync(() => {
+            approvalContext = context;
+            contextMutation = Reflect.set(context, "tenant", "attacker");
+            policyMutation = Reflect.set(context.policy, "pattern", "attacker");
+            return "approved" as const;
+          }),
+      });
+      yield* executor.policies.create({
+        owner: "org",
+        pattern: String(operation.target),
+        action: "require_approval",
+      });
+      const request = yield* makeRequest(operation, "job-frozen-approval", { value: "frozen" });
+      const result = yield* executor.executeOperation(request, "http");
+      expect(result.status).toBe("completed");
+      expect(approvalContext).toBeDefined();
+      if (!approvalContext) return;
+      expect(Object.isFrozen(approvalContext)).toBe(true);
+      expect(Object.isFrozen(approvalContext.policy)).toBe(true);
+      expect(contextMutation).toBe(false);
+      expect(policyMutation).toBe(false);
+      expect(approvalContext.tenant).toBe("test-tenant");
+      expect(approvalContext.policy.pattern).toBe(String(operation.target));
+    }),
+  );
+
   it.effect("never invokes a provider after a bound approval decline or cancel", () =>
     Effect.gen(function* () {
       for (const [index, decision] of (["declined", "cancelled"] as const).entries()) {
@@ -1589,6 +1728,46 @@ describe("carrier-neutral operation attestation", () => {
       expect(observed.request.input).toEqual({ value: "context" });
       expect(observed.descriptor.target).toBe(BOUND_TARGET);
       expect(Reflect.set(observed.owner, "tenant", "attacker")).toBe(false);
+    }),
+  );
+
+  it.effect("redacts every binding resolver failure to a fixed contract error", () =>
+    Effect.gen(function* () {
+      const sentinel = "https://provider.invalid/?token=binding-resolver-sentinel";
+      const resolvers: readonly ExecuteOperationBindingResolver[] = [
+        () => Effect.die(new BindingResolverError(sentinel)),
+        () =>
+          Effect.fail(
+            new StorageError({
+              message: sentinel,
+              cause: { url: sentinel, token: "binding-resolver-token" },
+            }),
+          ),
+      ];
+
+      for (const [index, bindingResolver] of resolvers.entries()) {
+        const operation = boundDefinition(bindingResolver);
+        const executor = yield* makeTestExecutor({
+          plugins: [makeBoundOperationPlugin({ count: 0 })] as const,
+          operations: [operation],
+        });
+        const request = yield* makeRequest(operation, `job-binding-resolver-${index}`, {
+          value: "resolver",
+        });
+        const result = yield* Effect.result(executor.executeOperation(request, "http"));
+        expect(
+          Result.match(result, {
+            onFailure: (failure) =>
+              Predicate.isTagged(failure, "OperationContractError") &&
+              failure.field === "binding.resolver" &&
+              failure.reason === "invalid_value" &&
+              failure.message ===
+                "Invalid Executor operation contract (binding.resolver: invalid_value)." &&
+              !JSON.stringify(failure).includes(sentinel),
+            onSuccess: () => false,
+          }),
+        ).toBe(true);
+      }
     }),
   );
 

@@ -4845,10 +4845,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       readonly request: ExecuteOperationRequest;
       readonly descriptor: ExecuteOperationDescriptor;
       readonly validatedInput: unknown;
-    }): Effect.Effect<
-      ExecuteOperationResolvedBinding | undefined,
-      ExecuteOperationError | StorageFailure
-    > => {
+    }): Effect.Effect<ExecuteOperationResolvedBinding | undefined, OperationContractError> => {
       const resolver = input.definition.bindingResolver;
       if (!resolver) return Effect.succeed(undefined);
       const resolverContext: ExecuteOperationBindingResolverContext = Object.freeze(
@@ -4882,29 +4879,28 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: host resolver sync throws become typed operation failures
         try {
           result = resolver(resolverContext);
+          if (!isBindingEffect(result)) {
+            return Effect.fail(
+              new OperationContractError({ field: "binding.resolver", reason: "invalid_value" }),
+            );
+          }
+          return result.pipe(
+            // A resolver is an untrusted host seam. Do not let its typed
+            // StorageFailure, arbitrary failure, or defect cross the direct SDK
+            // operation boundary. Binding validation below still reports its
+            // own safe field-level contract errors.
+            Effect.catchCause(() =>
+              Effect.fail(
+                new OperationContractError({ field: "binding.resolver", reason: "invalid_value" }),
+              ),
+            ),
+            Effect.flatMap((binding) => validateOperationBinding(binding)),
+          );
         } catch {
           return Effect.fail(
             new OperationContractError({ field: "binding.resolver", reason: "invalid_value" }),
           );
         }
-        if (!isBindingEffect(result)) {
-          return Effect.fail(
-            new OperationContractError({ field: "binding.resolver", reason: "invalid_value" }),
-          );
-        }
-        return result.pipe(
-          Effect.flatMap((binding) => validateOperationBinding(binding)),
-          Effect.catchCause((cause) =>
-            Cause.hasDies(cause)
-              ? Effect.fail(
-                  new OperationContractError({
-                    field: "binding.resolver",
-                    reason: "invalid_value",
-                  }),
-                )
-              : Effect.failCause(cause),
-          ),
-        );
       });
     };
 
@@ -5412,6 +5408,20 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             ),
         );
         if (reservation.status === "replay") {
+          // Treat the stored result as an untrusted carrier. Canonicalize and
+          // validate it before reading any nested field, so corrupt adapter
+          // values, accessors, and proxies cannot escape through replay
+          // checks or diagnostics.
+          const replayResult = yield* validateAndRebindOperationResult({
+            raw: reservation.result,
+            request: sanitizedRequest,
+            descriptor,
+            definition,
+            tenant,
+            subject,
+            carrier,
+            ...(binding ? { binding } : {}),
+          });
           if (binding) {
             const currentBinding = yield* resolveOperationBinding({
               definition,
@@ -5425,24 +5435,29 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 reason: "invalid_value",
               });
             }
-            const currentPolicy = yield* operationTargetPolicy(descriptor.target);
-            if (!samePolicy(operationPolicy(currentPolicy), reservation.result.policy)) {
-              return yield* new OperationContractError({
-                field: "binding.replay.policy",
-                reason: "invalid_value",
-              });
-            }
           }
-          return yield* validateAndRebindOperationResult({
-            raw: reservation.result,
-            request: sanitizedRequest,
-            descriptor,
-            definition,
-            tenant,
-            subject,
-            carrier,
-            ...(binding ? { binding } : {}),
-          });
+          // Re-read policy for every replay. Cancellation is a terminal
+          // no-provider result used to release a reservation after
+          // interruption, including when policy lookup was the interrupted
+          // step, so a lookup failure or changed policy cannot strand it.
+          const currentPolicy = yield* operationTargetPolicy(descriptor.target).pipe(
+            Effect.catchCause((cause) =>
+              replayResult.status === "cancelled"
+                ? Effect.succeed(undefined)
+                : Effect.failCause(cause),
+            ),
+          );
+          if (
+            replayResult.status !== "cancelled" &&
+            currentPolicy !== undefined &&
+            !samePolicy(operationPolicy(currentPolicy), replayResult.policy)
+          ) {
+            return yield* new OperationContractError({
+              field: "binding.replay.policy",
+              reason: "invalid_value",
+            });
+          }
+          return replayResult;
         }
         if (reservation.status === "conflict") {
           return yield* new OperationRequestHashMismatchError({
@@ -5458,7 +5473,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         }
         const reservationToken = reservation.reservationToken;
         const policy = yield* operationTargetPolicy(descriptor.target);
-        const approvalContext: ExecuteOperationApprovalContext = {
+        const approvalContext: ExecuteOperationApprovalContext = Object.freeze({
           tenant,
           executionId,
           jobId: sanitizedRequest.jobId,
@@ -5469,7 +5484,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           target: descriptor.target,
           providerTransport: definition.providerTransport,
           carrier,
-          policy: operationPolicy(policy),
+          policy: Object.freeze(operationPolicy(policy)),
           ...(binding
             ? {
                 bindingSha256: binding.bindingSha256,
@@ -5478,7 +5493,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             : {}),
           ...(subject !== null ? { subject } : {}),
           sessionId: approvalSessionId,
-        };
+        });
         cancellationResultFactory = () =>
           baseResult({
             policy,
