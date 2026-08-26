@@ -5326,9 +5326,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
       return Effect.gen(function* () {
         if (!operationReplayStore) {
-          return yield* new StorageError({
-            message: "Executor operation replay storage is not configured.",
-            cause: undefined,
+          return yield* new OperationContractError({
+            field: "reservation",
+            reason: "invalid_value",
           });
         }
         if (!isExecuteOperationCarrier(carrier)) {
@@ -5511,6 +5511,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 };
                 return Effect.void;
               }),
+              Effect.mapError(
+                () => new OperationContractError({ field: "reservation", reason: "invalid_value" }),
+              ),
             ),
         );
         if (reservation.status === "replay") {
@@ -5547,6 +5550,13 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           // interruption, including when policy lookup was the interrupted
           // step, so a lookup failure or changed policy cannot strand it.
           const currentPolicy = yield* operationTargetPolicy(descriptor.target).pipe(
+            Effect.mapError(
+              () =>
+                new OperationContractError({
+                  field: "binding.replay.policy",
+                  reason: "invalid_value",
+                }),
+            ),
             Effect.catchCause((cause) =>
               replayResult.status === "cancelled"
                 ? Effect.succeed(undefined)
@@ -5578,7 +5588,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           });
         }
         const reservationToken = reservation.reservationToken;
-        const policy = yield* operationTargetPolicy(descriptor.target);
+        const policy = yield* operationTargetPolicy(descriptor.target).pipe(
+          Effect.mapError(
+            () => new OperationContractError({ field: "policy", reason: "invalid_value" }),
+          ),
+        );
         const approvalContext: ExecuteOperationApprovalContext = Object.freeze({
           tenant,
           executionId,
@@ -5678,24 +5692,34 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             }
           }
         }
-        if (result === undefined && binding) {
+        if (result === undefined) {
           // Approval is bound to the first immutable snapshot, but the
           // connection and effective policy are live authority. Re-read both
           // immediately before invocation so a revocation or policy edit can
           // never reach credential resolution or a provider call.
-          const currentBinding = yield* resolveOperationBinding({
-            definition,
-            request: sanitizedRequest,
-            descriptor,
-            validatedInput,
-          });
-          if (!currentBinding || !sameOperationBinding(binding, currentBinding)) {
-            return yield* new OperationContractError({
-              field: "binding.execution",
-              reason: "invalid_value",
+          if (binding) {
+            const currentBinding = yield* resolveOperationBinding({
+              definition,
+              request: sanitizedRequest,
+              descriptor,
+              validatedInput,
             });
+            if (!currentBinding || !sameOperationBinding(binding, currentBinding)) {
+              return yield* new OperationContractError({
+                field: "binding.execution",
+                reason: "invalid_value",
+              });
+            }
           }
-          const currentPolicy = yield* operationTargetPolicy(descriptor.target);
+          const currentPolicy = yield* operationTargetPolicy(descriptor.target).pipe(
+            Effect.mapError(
+              () =>
+                new OperationContractError({
+                  field: "binding.execution.policy",
+                  reason: "invalid_value",
+                }),
+            ),
+          );
           if (!samePolicy(operationPolicy(currentPolicy), operationPolicy(policy))) {
             return yield* new OperationContractError({
               field: "binding.execution.policy",
@@ -5860,15 +5884,21 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           carrier,
           ...operationBindingValidationFields(binding),
         });
-        const settleStatus = yield* operationReplayStore.settle({
-          tenant,
-          subject: subject ?? undefined,
-          jobId: sanitizedRequest.jobId,
-          requestSha256: sanitizedRequest.requestSha256,
-          ...operationBindingHashFields(binding?.bindingSha256),
-          reservationToken,
-          result: validatedResult,
-        });
+        const settleStatus = yield* operationReplayStore
+          .settle({
+            tenant,
+            subject: subject ?? undefined,
+            jobId: sanitizedRequest.jobId,
+            requestSha256: sanitizedRequest.requestSha256,
+            ...operationBindingHashFields(binding?.bindingSha256),
+            reservationToken,
+            result: validatedResult,
+          })
+          .pipe(
+            Effect.mapError(
+              () => new OperationContractError({ field: "reservation", reason: "invalid_value" }),
+            ),
+          );
         if (settleStatus !== "settled") {
           return yield* new OperationContractError({
             field: "reservation",

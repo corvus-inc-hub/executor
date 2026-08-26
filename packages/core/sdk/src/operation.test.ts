@@ -638,6 +638,140 @@ describe("carrier-neutral operation attestation", () => {
     }),
   );
 
+  it.effect("maps policy storage failures to a fixed operation contract error", () =>
+    Effect.gen(function* () {
+      const sentinel = "https://provider.invalid/?token=policy-storage-sentinel";
+      const policyStoragePlugin = definePlugin(() => ({
+        id: "attestation-policy-storage" as const,
+        storage: () => ({}),
+        toolPolicyProvider: () => ({
+          list: () =>
+            Effect.fail(
+              new StorageError({
+                message: sentinel,
+                cause: { url: sentinel, token: "policy-storage-token" },
+              }),
+            ),
+        }),
+        staticIntegrations: () => [
+          {
+            id: "attestation-policy-storage",
+            kind: "plugin" as const,
+            name: "Policy storage failure",
+            tools: [
+              tool({
+                name: "echo",
+                description: "Policy storage failure target.",
+                inputSchema: INPUT,
+                outputSchema: OUTPUT,
+                execute: ({ value }) => Effect.succeed({ value }),
+              }),
+            ],
+          },
+        ],
+      }))();
+      const operation = definition(
+        ToolAddress.make("attestation-policy-storage.echo"),
+        "policy-storage",
+      );
+      const executor = yield* makeTestExecutor({
+        plugins: [policyStoragePlugin] as const,
+        operations: [operation],
+      });
+      const request = yield* makeRequest(operation, "job-policy-storage", { value: "policy" });
+      const result = yield* Effect.result(executor.executeOperation(request, "http"));
+      expect(
+        Result.match(result, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "policy" &&
+            failure.reason === "invalid_value" &&
+            failure.message === "Invalid Executor operation contract (policy: invalid_value)." &&
+            !failure.message.includes(sentinel),
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect("maps replay reservation storage failures to a fixed operation contract error", () =>
+    Effect.gen(function* () {
+      const sentinel = "https://provider.invalid/?token=reserve-storage-sentinel";
+      const inner = makeInMemoryOperationReplayStore();
+      const replayStore = {
+        ...inner,
+        reserve: (input: Parameters<typeof inner.reserve>[0]) =>
+          Effect.fail(
+            new StorageError({
+              message: sentinel,
+              cause: { url: sentinel, token: "reserve-storage-token", input },
+            }),
+          ),
+      };
+      const operation = definition();
+      const executor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+        operationReplayStore: replayStore,
+      });
+      const request = yield* makeRequest(operation, "job-reserve-storage", { value: "reserve" });
+      const result = yield* Effect.result(executor.executeOperation(request, "http"));
+      expect(
+        Result.match(result, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "reservation" &&
+            failure.reason === "invalid_value" &&
+            failure.message ===
+              "Invalid Executor operation contract (reservation: invalid_value)." &&
+            !failure.message.includes(sentinel),
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect("maps settlement storage failures to a fixed operation contract error", () =>
+    Effect.gen(function* () {
+      const sentinel = "https://provider.invalid/?token=settle-storage-sentinel";
+      const inner = makeInMemoryOperationReplayStore();
+      let settleCalls = 0;
+      const replayStore = {
+        ...inner,
+        settle: (input: Parameters<typeof inner.settle>[0]) => {
+          settleCalls += 1;
+          return Effect.fail(
+            new StorageError({
+              message: sentinel,
+              cause: { url: sentinel, token: "settle-storage-token", input },
+            }),
+          );
+        },
+      };
+      const operation = definition();
+      const executor = yield* makeTestExecutor({
+        plugins: [operationPlugin] as const,
+        operations: [operation],
+        operationReplayStore: replayStore,
+      });
+      const request = yield* makeRequest(operation, "job-settle-storage", { value: "settle" });
+      const result = yield* Effect.result(executor.executeOperation(request, "http"));
+      expect(
+        Result.match(result, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "reservation" &&
+            failure.reason === "invalid_value" &&
+            failure.message ===
+              "Invalid Executor operation contract (reservation: invalid_value)." &&
+            !failure.message.includes(sentinel),
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+      expect(settleCalls).toBeGreaterThan(0);
+    }),
+  );
+
   it.effect("settles a reservation after an approval-handler defect so retry is not stuck", () =>
     Effect.gen(function* () {
       const operation = definition();
@@ -1395,6 +1529,86 @@ describe("carrier-neutral operation attestation", () => {
       expect(policyMutation).toBe(false);
       expect(approvalContext.tenant).toBe("test-tenant");
       expect(approvalContext.policy.pattern).toBe(String(operation.target));
+    }),
+  );
+
+  it.effect("revalidates unbound policy after approval before provider work", () =>
+    Effect.gen(function* () {
+      let deny = false;
+      let providerCalls = 0;
+      let credentialCalls = 0;
+      const policyFlipPlugin = definePlugin(() => ({
+        id: "attestation-unbound-policy-flip" as const,
+        storage: () => ({}),
+        credentialProviders: [
+          {
+            key: ProviderKey.make("memory"),
+            writable: true,
+            get: () =>
+              Effect.sync(() => {
+                credentialCalls += 1;
+                return "credential";
+              }),
+          },
+        ],
+        toolPolicyProvider: () => ({
+          list: () =>
+            Effect.succeed([
+              {
+                id: "unbound-policy-flip",
+                pattern: "attestation-unbound-policy-flip.echo",
+                action: deny ? ("block" as const) : ("require_approval" as const),
+                position: "a",
+              },
+            ]),
+        }),
+        staticIntegrations: () => [
+          {
+            id: "attestation-unbound-policy-flip",
+            kind: "plugin" as const,
+            name: "Unbound policy flip",
+            tools: [
+              tool({
+                name: "echo",
+                description: "Unbound policy flip target.",
+                inputSchema: INPUT,
+                outputSchema: OUTPUT,
+                execute: ({ value }) =>
+                  Effect.sync(() => {
+                    providerCalls += 1;
+                    return { value };
+                  }),
+              }),
+            ],
+          },
+        ],
+      }))();
+      const operation = definition(
+        ToolAddress.make("attestation-unbound-policy-flip.echo"),
+        "unbound-policy-flip",
+      );
+      const executor = yield* makeTestExecutor({
+        plugins: [policyFlipPlugin] as const,
+        operations: [operation],
+        operationApproval: () =>
+          Effect.sync(() => {
+            deny = true;
+            return "approved" as const;
+          }),
+      });
+      const request = yield* makeRequest(operation, "job-unbound-policy-flip", { value: "flip" });
+      const result = yield* Effect.result(executor.executeOperation(request, "http"));
+      expect(
+        Result.match(result, {
+          onFailure: (failure) =>
+            Predicate.isTagged(failure, "OperationContractError") &&
+            failure.field === "binding.execution.policy" &&
+            failure.reason === "invalid_value",
+          onSuccess: () => false,
+        }),
+      ).toBe(true);
+      expect(providerCalls).toBe(0);
+      expect(credentialCalls).toBe(0);
     }),
   );
 
