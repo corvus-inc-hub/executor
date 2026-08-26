@@ -161,6 +161,7 @@ import {
   ExecuteOperationCarrier,
   ExecuteOperationApprovalDecision,
   ExecuteOperationFailureCode,
+  ExecuteOperationProviderTransport,
   OperationContractError,
   OperationDescriptorMismatchError,
   OperationRequestHashMismatchError,
@@ -174,11 +175,13 @@ import {
   type ExecuteOperationApproval,
   type ExecuteOperationApprovalContext,
   type ExecuteOperationApprovalHandler,
+  type ExecuteOperationBindingResolverContext,
   type ExecuteOperationDefinition,
   type ExecuteOperationDescriptor,
   type ExecuteOperationError,
   type ExecuteOperationFailure,
   type ExecuteOperationRequest,
+  type ExecuteOperationResolvedBinding,
   type ExecuteOperationReplayStore,
   type ExecuteOperationResult,
   type ExecuteOperationStatus,
@@ -192,6 +195,101 @@ const MAX_APPROVAL_ARGUMENT_PREVIEW_CHARS = 4_000;
 const isExecuteOperationCarrier = Schema.is(ExecuteOperationCarrier);
 const isExecuteOperationApprovalDecision = Schema.is(ExecuteOperationApprovalDecision);
 const isExecuteOperationFailureCode = Schema.is(ExecuteOperationFailureCode);
+
+type BindingResolverValue = Schema.Schema.Type<typeof Schema.Unknown>;
+
+type OperationBindingDataKey =
+  | "bindingSha256"
+  | "connection"
+  | "address"
+  | "owner"
+  | "integration"
+  | "name"
+  | "credentialProvider"
+  | "template"
+  | "generation"
+  | "catalogRevision"
+  | "sourceTransport"
+  | "pluginId";
+
+const OperationBindingDataKeySchema = Schema.Literals([
+  "bindingSha256",
+  "connection",
+  "address",
+  "owner",
+  "integration",
+  "name",
+  "credentialProvider",
+  "template",
+  "generation",
+  "catalogRevision",
+  "sourceTransport",
+  "pluginId",
+]);
+const isOperationBindingDataKey = Schema.is(OperationBindingDataKeySchema);
+
+interface OperationBindingDataRecord {
+  bindingSha256?: BindingResolverValue;
+  connection?: BindingResolverValue;
+  address?: BindingResolverValue;
+  owner?: BindingResolverValue;
+  integration?: BindingResolverValue;
+  name?: BindingResolverValue;
+  credentialProvider?: BindingResolverValue;
+  template?: BindingResolverValue;
+  generation?: BindingResolverValue;
+  catalogRevision?: BindingResolverValue;
+  sourceTransport?: BindingResolverValue;
+  pluginId?: BindingResolverValue;
+}
+
+interface OperationBindingHashFields {
+  readonly bindingSha256?: string;
+}
+
+interface OperationBindingApprovalFields {
+  readonly bindingSha256?: string;
+  readonly connectionAddress?: ConnectionAddress;
+}
+
+interface OperationBindingValidationFields {
+  readonly binding?: ExecuteOperationResolvedBinding;
+}
+
+const operationBindingHashFields = (
+  bindingSha256: string | undefined,
+): OperationBindingHashFields => {
+  if (bindingSha256 === undefined) return {};
+  return { bindingSha256 };
+};
+
+const operationBindingApprovalFields = (
+  binding: ExecuteOperationResolvedBinding | undefined,
+): OperationBindingApprovalFields => {
+  if (binding === undefined) return {};
+  return {
+    bindingSha256: binding.bindingSha256,
+    connectionAddress: binding.connection.address,
+  };
+};
+
+const operationBindingValidationFields = (
+  binding: ExecuteOperationResolvedBinding | undefined,
+): OperationBindingValidationFields => {
+  if (binding === undefined) return {};
+  return { binding };
+};
+
+const OperationBindingSha256 = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)).annotate({
+  identifier: "ExecutorOperationBindingSha256",
+});
+const OperationBindingText = Schema.NonEmptyString.check(Schema.isMaxLength(512)).annotate({
+  identifier: "ExecutorOperationBindingText",
+});
+
+const operationBindingDataKey = (name: string): OperationBindingDataKey | undefined => {
+  return isOperationBindingDataKey(name) ? name : undefined;
+};
 
 // ---------------------------------------------------------------------------
 // Elicitation handler — resolved once at `createExecutor({ onElicitation })`
@@ -1504,6 +1602,25 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       if (!definition.inputSchema || !definition.outputSchema) {
         return yield* new StorageError({
           message: `Executor operation ${registryKey} must declare input and output schemas.`,
+          cause: undefined,
+        });
+      }
+      const bindingFields = [
+        definition.bindingMode,
+        definition.bindingKey,
+        definition.bindingVersion,
+      ];
+      const hasBindingFields = bindingFields.some((field) => field !== undefined);
+      const completeBindingFields = bindingFields.every((field) => field !== undefined);
+      const hasBindingResolver = definition.bindingResolver !== undefined;
+      if (
+        (hasBindingFields && !completeBindingFields) ||
+        (hasBindingResolver && !completeBindingFields) ||
+        (completeBindingFields && !hasBindingResolver) ||
+        (hasBindingResolver && !Predicate.isFunction(definition.bindingResolver))
+      ) {
+        return yield* new StorageError({
+          message: `Executor operation ${registryKey} has an invalid binding resolver contract.`,
           cause: undefined,
         });
       }
@@ -4654,6 +4771,266 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       left.pattern === right.pattern &&
       left.policyId === right.policyId;
 
+    const readBindingDataRecord = (
+      value: BindingResolverValue | undefined,
+      field: string,
+      allowedKeys: ReadonlySet<string>,
+    ): Effect.Effect<OperationBindingDataRecord, OperationContractError> =>
+      Effect.gen(function* () {
+        if (!Predicate.isObject(value) || Array.isArray(value)) {
+          return yield* new OperationContractError({ field, reason: "invalid_value" });
+        }
+        const prototype = yield* Effect.try({
+          try: () => Object.getPrototypeOf(value),
+          catch: () => new OperationContractError({ field, reason: "invalid_value" }),
+        });
+        if (prototype !== Object.prototype && prototype !== null) {
+          return yield* new OperationContractError({ field, reason: "unsupported_object" });
+        }
+        const names = yield* Effect.try({
+          try: () => Object.getOwnPropertyNames(value),
+          catch: () => new OperationContractError({ field, reason: "invalid_value" }),
+        });
+        const symbols = yield* Effect.try({
+          try: () => Object.getOwnPropertySymbols(value),
+          catch: () => new OperationContractError({ field, reason: "invalid_value" }),
+        });
+        if (symbols.length > 0 || names.some((name) => !allowedKeys.has(name))) {
+          return yield* new OperationContractError({ field, reason: "invalid_value" });
+        }
+        const result: OperationBindingDataRecord = {};
+        for (const name of names) {
+          const key = operationBindingDataKey(name);
+          if (key === undefined) {
+            return yield* new OperationContractError({ field, reason: "invalid_value" });
+          }
+          const descriptor = yield* Effect.try({
+            try: () => Object.getOwnPropertyDescriptor(value, name),
+            catch: () =>
+              new OperationContractError({ field: `${field}.${name}`, reason: "invalid_value" }),
+          });
+          if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+            return yield* new OperationContractError({
+              field: `${field}.${name}`,
+              reason: "invalid_value",
+            });
+          }
+          result[key] = descriptor.value;
+        }
+        return result;
+      });
+
+    const decodeBindingField = <S extends Schema.Decoder<unknown, never>>(
+      schema: S,
+      value: BindingResolverValue | undefined,
+      field: string,
+    ): Effect.Effect<S["Type"], OperationContractError> =>
+      Schema.decodeUnknownEffect(schema)(value).pipe(
+        Effect.mapError(() => new OperationContractError({ field, reason: "invalid_value" })),
+      );
+
+    const validateOperationBinding = (
+      raw: BindingResolverValue,
+    ): Effect.Effect<ExecuteOperationResolvedBinding, OperationContractError> =>
+      Effect.gen(function* () {
+        const top = yield* readBindingDataRecord(
+          raw,
+          "binding",
+          new Set(["bindingSha256", "connection"]),
+        );
+        const rawBindingSha256 = yield* decodeBindingField(
+          OperationBindingSha256,
+          top.bindingSha256,
+          "binding.bindingSha256",
+        );
+        const connection = yield* readBindingDataRecord(
+          top.connection,
+          "binding.connection",
+          new Set([
+            "address",
+            "owner",
+            "integration",
+            "name",
+            "credentialProvider",
+            "template",
+            "generation",
+            "catalogRevision",
+            "sourceTransport",
+            "pluginId",
+          ]),
+        );
+        const address = yield* decodeBindingField(
+          OperationBindingText,
+          connection.address,
+          "binding.connection.address",
+        );
+        const integration = yield* decodeBindingField(
+          OperationBindingText,
+          connection.integration,
+          "binding.connection.integration",
+        );
+        const name = yield* decodeBindingField(
+          OperationBindingText,
+          connection.name,
+          "binding.connection.name",
+        );
+        const credentialProvider = yield* decodeBindingField(
+          OperationBindingText,
+          connection.credentialProvider,
+          "binding.connection.credentialProvider",
+        );
+        const template = yield* decodeBindingField(
+          OperationBindingText,
+          connection.template,
+          "binding.connection.template",
+        );
+        const generation = yield* decodeBindingField(
+          OperationBindingText,
+          connection.generation,
+          "binding.connection.generation",
+        );
+        const catalogRevision = yield* decodeBindingField(
+          OperationBindingText,
+          connection.catalogRevision,
+          "binding.connection.catalogRevision",
+        );
+        const rawOwner = yield* decodeBindingField(
+          Owner,
+          connection.owner,
+          "binding.connection.owner",
+        );
+        const rawSourceTransport = yield* decodeBindingField(
+          ExecuteOperationProviderTransport,
+          connection.sourceTransport,
+          "binding.connection.sourceTransport",
+        );
+        if (rawOwner === "user" && subject === null) {
+          return yield* new OperationContractError({
+            field: "binding.connection.owner",
+            reason: "invalid_value",
+          });
+        }
+        const expectedAddress = `tools.${integration}.${rawOwner}.${name}`;
+        if (address !== expectedAddress) {
+          return yield* new OperationContractError({
+            field: "binding.connection.address",
+            reason: "invalid_value",
+          });
+        }
+        let pluginId: string | undefined;
+        if (connection.pluginId !== undefined) {
+          pluginId = yield* decodeBindingField(
+            OperationBindingText,
+            connection.pluginId,
+            "binding.connection.pluginId",
+          );
+        }
+        const connectionBase = {
+          address: ConnectionAddress.make(address),
+          owner: rawOwner,
+          integration: IntegrationSlug.make(integration),
+          name: ConnectionName.make(name),
+          credentialProvider: ProviderKey.make(credentialProvider),
+          template: AuthTemplateSlug.make(template),
+          generation,
+          catalogRevision,
+          sourceTransport: rawSourceTransport,
+        };
+        const frozenConnection =
+          pluginId === undefined
+            ? Object.freeze(Object.setPrototypeOf(connectionBase, null))
+            : Object.freeze(Object.setPrototypeOf({ ...connectionBase, pluginId }, null));
+        return Object.freeze(
+          Object.setPrototypeOf(
+            {
+              bindingSha256: rawBindingSha256,
+              connection: frozenConnection,
+            },
+            null,
+          ),
+        );
+      });
+
+    const resolveOperationBinding = (input: {
+      readonly definition: ExecuteOperationDefinition;
+      readonly request: ExecuteOperationRequest;
+      readonly descriptor: ExecuteOperationDescriptor;
+      readonly validatedInput: unknown;
+    }): Effect.Effect<ExecuteOperationResolvedBinding | undefined, OperationContractError> => {
+      const resolver = input.definition.bindingResolver;
+      if (!resolver) return Effect.succeed(undefined);
+      const resolverContext: ExecuteOperationBindingResolverContext = Object.freeze(
+        Object.setPrototypeOf(
+          {
+            owner: Object.freeze(
+              Object.setPrototypeOf(
+                {
+                  tenant: Tenant.make(tenant),
+                  subject: subject === null ? null : Subject.make(subject),
+                },
+                null,
+              ),
+            ),
+            request: input.request,
+            descriptor: Object.freeze(input.descriptor),
+            input: input.validatedInput,
+          },
+          null,
+        ),
+      );
+      const isBindingEffect = (
+        value: BindingResolverValue,
+      ): value is Effect.Effect<
+        ExecuteOperationResolvedBinding,
+        OperationContractError | StorageFailure,
+        never
+      > => Effect.isEffect(value);
+      return Effect.suspend(() => {
+        let result: BindingResolverValue;
+        // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: host resolver sync throws become typed operation failures
+        try {
+          result = resolver(resolverContext);
+          if (!isBindingEffect(result)) {
+            return Effect.fail(
+              new OperationContractError({ field: "binding.resolver", reason: "invalid_value" }),
+            );
+          }
+          return result.pipe(
+            // A resolver is an untrusted host seam. Do not let its typed
+            // StorageFailure, arbitrary failure, or defect cross the direct SDK
+            // operation boundary. Binding validation below still reports its
+            // own safe field-level contract errors.
+            Effect.catchCause(() =>
+              Effect.fail(
+                new OperationContractError({ field: "binding.resolver", reason: "invalid_value" }),
+              ),
+            ),
+            Effect.flatMap((binding) => validateOperationBinding(binding)),
+          );
+        } catch {
+          return Effect.fail(
+            new OperationContractError({ field: "binding.resolver", reason: "invalid_value" }),
+          );
+        }
+      });
+    };
+
+    const sameOperationBinding = (
+      left: ExecuteOperationResolvedBinding,
+      right: ExecuteOperationResolvedBinding,
+    ): boolean =>
+      left.bindingSha256 === right.bindingSha256 &&
+      left.connection.address === right.connection.address &&
+      left.connection.owner === right.connection.owner &&
+      left.connection.integration === right.connection.integration &&
+      left.connection.name === right.connection.name &&
+      left.connection.credentialProvider === right.connection.credentialProvider &&
+      left.connection.template === right.connection.template &&
+      left.connection.generation === right.connection.generation &&
+      left.connection.catalogRevision === right.connection.catalogRevision &&
+      left.connection.sourceTransport === right.connection.sourceTransport &&
+      left.connection.pluginId === right.connection.pluginId;
+
     /** Validate a result read from a replay store as if it crossed an
      * untrusted carrier. The store is host-owned, but this check is what keeps
      * a corrupt or stale adapter from changing the reviewed target, tenant,
@@ -4667,6 +5044,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       readonly tenant: string;
       readonly subject: string | null;
       readonly carrier: ExecuteOperationCarrier;
+      readonly binding?: ExecuteOperationResolvedBinding;
     }): Effect.Effect<ExecuteOperationResult, OperationContractError> =>
       Effect.gen(function* () {
         const snapshot = yield* canonicalizeOperationValue(input.raw).pipe(
@@ -4708,7 +5086,13 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           decoded.approval.carrier !== decoded.carrier ||
           decoded.approval.sessionId !== `approval:${decoded.executionId}` ||
           decoded.approval.decidedAt === undefined ||
-          !samePolicy(decoded.approval.policy, decoded.policy)
+          !samePolicy(decoded.approval.policy, decoded.policy) ||
+          (input.binding !== undefined &&
+            (decoded.approval.bindingSha256 !== input.binding.bindingSha256 ||
+              decoded.approval.connectionAddress !== input.binding.connection.address)) ||
+          (input.binding === undefined &&
+            (decoded.approval.bindingSha256 !== undefined ||
+              decoded.approval.connectionAddress !== undefined))
         ) {
           return yield* failResult("result.approval");
         }
@@ -4928,11 +5312,13 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         readonly subject: string | null;
         readonly jobId: string;
         readonly requestSha256: string;
+        readonly bindingSha256?: string;
         readonly reservationToken: string;
         readonly request: ExecuteOperationRequest;
         readonly descriptor: ExecuteOperationDescriptor;
         readonly definition: ExecuteOperationDefinition;
         readonly carrier: ExecuteOperationCarrier;
+        readonly binding?: ExecuteOperationResolvedBinding;
       };
       let reservationBinding: ReservationBinding | undefined;
       let cancellationResultFactory: (() => ExecuteOperationResult) | undefined;
@@ -4940,9 +5326,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
       return Effect.gen(function* () {
         if (!operationReplayStore) {
-          return yield* new StorageError({
-            message: "Executor operation replay storage is not configured.",
-            cause: undefined,
+          return yield* new OperationContractError({
+            field: "reservation",
+            reason: "invalid_value",
           });
         }
         if (!isExecuteOperationCarrier(carrier)) {
@@ -4969,10 +5355,10 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // Freeze a strict clone before any schema hook or policy code can see
         // the request. The exact clone is also the one passed to invocation.
         const inputSnapshot = yield* canonicalizeOperationValue(decodedRequest.input);
-        const sanitizedRequest: ExecuteOperationRequest = {
+        const sanitizedRequest: ExecuteOperationRequest = Object.freeze({
           ...decodedRequest,
           input: inputSnapshot.value,
-        };
+        });
         const actualRequestSha256 = yield* hashExecuteOperationRequest(sanitizedRequest);
         if (actualRequestSha256 !== sanitizedRequest.requestSha256) {
           return yield* new OperationRequestHashMismatchError({
@@ -5002,6 +5388,15 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           inputSnapshot.value,
           "input",
         );
+        // A bound operation resolves its immutable connection lineage before
+        // touching replay state. The resolver sees only frozen, canonical
+        // values derived by this host, never caller-selected authority.
+        const binding = yield* resolveOperationBinding({
+          definition,
+          request: sanitizedRequest,
+          descriptor,
+          validatedInput,
+        });
         const executionId = crypto.randomUUID();
         const startedAt = new Date().toISOString();
         const approvalSessionId = `approval:${executionId}`;
@@ -5022,6 +5417,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           providerTransport: definition.providerTransport,
           carrier,
           policy: operationPolicy(policy),
+          ...operationBindingApprovalFields(binding),
           ...(subject !== null ? { subject: Subject.make(subject) } : {}),
           sessionId: approvalSessionId,
           ...(decidedAt !== undefined ? { decidedAt } : {}),
@@ -5095,6 +5491,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               subject: subject ?? undefined,
               jobId: sanitizedRequest.jobId,
               requestSha256: sanitizedRequest.requestSha256,
+              ...operationBindingHashFields(binding?.bindingSha256),
             })
             .pipe(
               Effect.tap((candidate) => {
@@ -5104,18 +5501,27 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                   subject,
                   jobId: sanitizedRequest.jobId,
                   requestSha256: sanitizedRequest.requestSha256,
+                  ...operationBindingHashFields(binding?.bindingSha256),
                   reservationToken: candidate.reservationToken,
                   request: sanitizedRequest,
                   descriptor,
                   definition,
                   carrier,
+                  binding,
                 };
                 return Effect.void;
               }),
+              Effect.mapError(
+                () => new OperationContractError({ field: "reservation", reason: "invalid_value" }),
+              ),
             ),
         );
         if (reservation.status === "replay") {
-          return yield* validateAndRebindOperationResult({
+          // Treat the stored result as an untrusted carrier. Canonicalize and
+          // validate it before reading any nested field, so corrupt adapter
+          // values, accessors, and proxies cannot escape through replay
+          // checks or diagnostics.
+          const replayResult = yield* validateAndRebindOperationResult({
             raw: reservation.result,
             request: sanitizedRequest,
             descriptor,
@@ -5123,7 +5529,51 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             tenant,
             subject,
             carrier,
+            ...operationBindingValidationFields(binding),
           });
+          if (binding) {
+            const currentBinding = yield* resolveOperationBinding({
+              definition,
+              request: sanitizedRequest,
+              descriptor,
+              validatedInput,
+            });
+            if (!currentBinding || !sameOperationBinding(binding, currentBinding)) {
+              return yield* new OperationContractError({
+                field: "binding.replay",
+                reason: "invalid_value",
+              });
+            }
+          }
+          // Re-read policy for every replay. Cancellation is a terminal
+          // no-provider result used to release a reservation after
+          // interruption, including when policy lookup was the interrupted
+          // step, so a lookup failure or changed policy cannot strand it.
+          const currentPolicy = yield* operationTargetPolicy(descriptor.target).pipe(
+            Effect.mapError(
+              () =>
+                new OperationContractError({
+                  field: "binding.replay.policy",
+                  reason: "invalid_value",
+                }),
+            ),
+            Effect.catchCause((cause) =>
+              replayResult.status === "cancelled"
+                ? Effect.succeed(undefined)
+                : Effect.failCause(cause),
+            ),
+          );
+          if (
+            replayResult.status !== "cancelled" &&
+            currentPolicy !== undefined &&
+            !samePolicy(operationPolicy(currentPolicy), replayResult.policy)
+          ) {
+            return yield* new OperationContractError({
+              field: "binding.replay.policy",
+              reason: "invalid_value",
+            });
+          }
+          return replayResult;
         }
         if (reservation.status === "conflict") {
           return yield* new OperationRequestHashMismatchError({
@@ -5138,8 +5588,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           });
         }
         const reservationToken = reservation.reservationToken;
-        const policy = yield* operationTargetPolicy(descriptor.target);
-        const approvalContext: ExecuteOperationApprovalContext = {
+        const policy = yield* operationTargetPolicy(descriptor.target).pipe(
+          Effect.mapError(
+            () => new OperationContractError({ field: "policy", reason: "invalid_value" }),
+          ),
+        );
+        const approvalContext: ExecuteOperationApprovalContext = Object.freeze({
           tenant,
           executionId,
           jobId: sanitizedRequest.jobId,
@@ -5150,10 +5604,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           target: descriptor.target,
           providerTransport: definition.providerTransport,
           carrier,
-          policy: operationPolicy(policy),
+          policy: Object.freeze(operationPolicy(policy)),
+          ...operationBindingApprovalFields(binding),
           ...(subject !== null ? { subject } : {}),
           sessionId: approvalSessionId,
-        };
+        });
         cancellationResultFactory = () =>
           baseResult({
             policy,
@@ -5235,6 +5690,41 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 approvalSatisfied = true;
               }
             }
+          }
+        }
+        if (result === undefined) {
+          // Approval is bound to the first immutable snapshot, but the
+          // connection and effective policy are live authority. Re-read both
+          // immediately before invocation so a revocation or policy edit can
+          // never reach credential resolution or a provider call.
+          if (binding) {
+            const currentBinding = yield* resolveOperationBinding({
+              definition,
+              request: sanitizedRequest,
+              descriptor,
+              validatedInput,
+            });
+            if (!currentBinding || !sameOperationBinding(binding, currentBinding)) {
+              return yield* new OperationContractError({
+                field: "binding.execution",
+                reason: "invalid_value",
+              });
+            }
+          }
+          const currentPolicy = yield* operationTargetPolicy(descriptor.target).pipe(
+            Effect.mapError(
+              () =>
+                new OperationContractError({
+                  field: "binding.execution.policy",
+                  reason: "invalid_value",
+                }),
+            ),
+          );
+          if (!samePolicy(operationPolicy(currentPolicy), operationPolicy(policy))) {
+            return yield* new OperationContractError({
+              field: "binding.execution.policy",
+              reason: "invalid_value",
+            });
           }
         }
         if (result === undefined) {
@@ -5392,15 +5882,23 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           tenant,
           subject,
           carrier,
+          ...operationBindingValidationFields(binding),
         });
-        const settleStatus = yield* operationReplayStore.settle({
-          tenant,
-          subject: subject ?? undefined,
-          jobId: sanitizedRequest.jobId,
-          requestSha256: sanitizedRequest.requestSha256,
-          reservationToken,
-          result: validatedResult,
-        });
+        const settleStatus = yield* operationReplayStore
+          .settle({
+            tenant,
+            subject: subject ?? undefined,
+            jobId: sanitizedRequest.jobId,
+            requestSha256: sanitizedRequest.requestSha256,
+            ...operationBindingHashFields(binding?.bindingSha256),
+            reservationToken,
+            result: validatedResult,
+          })
+          .pipe(
+            Effect.mapError(
+              () => new OperationContractError({ field: "reservation", reason: "invalid_value" }),
+            ),
+          );
         if (settleStatus !== "settled") {
           return yield* new OperationContractError({
             field: "reservation",
@@ -5435,6 +5933,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               tenant: binding.tenant,
               subject: binding.subject,
               carrier: binding.carrier,
+              ...operationBindingValidationFields(binding.binding),
             }).pipe(
               Effect.flatMap((result) =>
                 store
@@ -5443,6 +5942,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                     subject: binding.subject ?? undefined,
                     jobId: binding.jobId,
                     requestSha256: binding.requestSha256,
+                    ...operationBindingHashFields(binding.bindingSha256),
                     reservationToken: binding.reservationToken,
                     result,
                   })
