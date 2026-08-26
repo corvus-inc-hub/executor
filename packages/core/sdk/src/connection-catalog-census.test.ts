@@ -14,7 +14,9 @@ import {
   type ConnectionCatalogCensusDescriptorInput,
   type ConnectionCatalogCensusInput,
   type ConnectionCatalogCensusSource,
+  canonicalizeConnectionCatalogValue,
   finalizeConnectionCatalogCensus,
+  hashConnectionCatalogValue,
   validateConnectionCatalogCensusInput,
 } from "./connection-catalog-census";
 
@@ -249,6 +251,48 @@ describe("connection catalog census finalizer", () => {
           onSuccess: () => false,
         }),
       ).toBe(true);
+    }),
+  );
+
+  it.effect("uses locale-independent code-unit order for keys and descriptors", () =>
+    Effect.gen(function* () {
+      const unicodeValue = {
+        ["\uE000"]: "private-use",
+        ["😀"]: "emoji",
+        é: "accent",
+        a: "lower",
+        Z: "upper",
+      };
+      const snapshot = yield* canonicalizeConnectionCatalogValue(unicodeValue);
+      expect(snapshot.canonical).toBe(
+        JSON.stringify({
+          Z: "upper",
+          a: "lower",
+          é: "accent",
+          ["😀"]: "emoji",
+          ["\uE000"]: "private-use",
+        }),
+      );
+      expect(yield* hashConnectionCatalogValue(unicodeValue)).toBe(
+        "e2c8aad223a95bcdf1ca77793a5695d7bf8c04bdbfa9969784b46bf0085dfaf8",
+      );
+
+      const result = yield* finalizeConnectionCatalogCensus({
+        request: REQUEST,
+        source: source({
+          pages: [
+            pageForBinding(binding, null, null, [
+              descriptorNamed("\uE000"),
+              descriptorNamed("😀"),
+              descriptorNamed("é"),
+              descriptorNamed("Z"),
+              descriptorNamed("a"),
+            ]),
+          ],
+        }),
+        observedAt,
+      });
+      expect(result.descriptors.map(({ name }) => name)).toEqual(["Z", "a", "é", "😀", "\uE000"]);
     }),
   );
 
@@ -917,16 +961,32 @@ describe("connection catalog census finalizer", () => {
     }),
   );
 
-  it.effect("rejects invalid timestamps", () =>
+  it.effect("rejects invalid timestamps and impossible UTC calendar dates", () =>
     Effect.gen(function* () {
-      const result = yield* Effect.result(
-        finalizeConnectionCatalogCensus({
-          request: REQUEST,
-          source: source(),
-          observedAt: "not-a-timestamp",
-        }),
-      );
-      expectFailureReason(result, "invalid_timestamp");
+      for (const observedAtValue of [
+        "not-a-timestamp",
+        "2026-02-31T00:00:00.000Z",
+        "2026-04-31T00:00:00.000Z",
+        "2026-01-00T00:00:00.000Z",
+        "2026-12-32T00:00:00.000Z",
+        "2026-01-01T24:00:00.000Z",
+      ]) {
+        const result = yield* Effect.result(
+          finalizeConnectionCatalogCensus({
+            request: REQUEST,
+            source: source(),
+            observedAt: observedAtValue,
+          }),
+        );
+        expectFailureReason(result, "invalid_timestamp");
+      }
+
+      const leapDay = yield* finalizeConnectionCatalogCensus({
+        request: REQUEST,
+        source: source(),
+        observedAt: "2024-02-29T23:59:59.999Z",
+      });
+      expect(leapDay.observedAt).toBe("2024-02-29T23:59:59.999Z");
     }),
   );
 
@@ -1356,6 +1416,66 @@ describe("connection catalog census finalizer", () => {
       expect(JSON.stringify(requestValidation)).not.toContain(pat);
       expect(JSON.stringify(descriptorValidation)).not.toContain(pat);
       expect(JSON.stringify(resultValidation)).not.toContain(pat);
+    }),
+  );
+
+  it.effect("sanitizes Effect and Standard Schema errors at nested and hash paths", () =>
+    Effect.gen(function* () {
+      const finalized = yield* finalizeConnectionCatalogCensus({
+        request: REQUEST,
+        source: source(),
+        observedAt,
+      });
+      const sentinel = `ghp_${"A".repeat(36)}`;
+      const malformedRequest = { ...REQUEST, schemaVersion: sentinel };
+      const malformedDescriptor = {
+        ...finalized.descriptors[0],
+        descriptionSha256: sentinel,
+      };
+      const nestedExtraResult = {
+        ...finalized,
+        descriptors: [{ ...finalized.descriptors[0], [sentinel]: sentinel }],
+      };
+      const malformedResult = { ...finalized, bindingSha256: sentinel };
+
+      const requestEffect = Schema.decodeUnknownResult(ConnectionCatalogCensusRequest)(
+        malformedRequest,
+      );
+      const descriptorEffect = Schema.decodeUnknownResult(ConnectionCatalogCensusDescriptor)(
+        malformedDescriptor,
+      );
+      const nestedExtraEffect = Schema.decodeUnknownResult(ConnectionCatalogCensusResult)(
+        nestedExtraResult,
+      );
+      const resultEffect = Schema.decodeUnknownResult(ConnectionCatalogCensusResult)(
+        malformedResult,
+      );
+      for (const result of [requestEffect, descriptorEffect, nestedExtraEffect, resultEffect]) {
+        expect(JSON.stringify(result)).not.toContain(sentinel);
+      }
+
+      const requestStandard = yield* Effect.promise(() =>
+        Promise.resolve(ConnectionCatalogCensusRequest["~standard"].validate(malformedRequest)),
+      );
+      const descriptorStandard = yield* Effect.promise(() =>
+        Promise.resolve(
+          ConnectionCatalogCensusDescriptor["~standard"].validate(malformedDescriptor),
+        ),
+      );
+      const nestedExtraStandard = yield* Effect.promise(() =>
+        Promise.resolve(ConnectionCatalogCensusResult["~standard"].validate(nestedExtraResult)),
+      );
+      const resultStandard = yield* Effect.promise(() =>
+        Promise.resolve(ConnectionCatalogCensusResult["~standard"].validate(malformedResult)),
+      );
+      for (const result of [
+        requestStandard,
+        descriptorStandard,
+        nestedExtraStandard,
+        resultStandard,
+      ]) {
+        expect(JSON.stringify(result)).not.toContain(sentinel);
+      }
     }),
   );
 });

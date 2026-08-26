@@ -1,4 +1,4 @@
-import { Effect, Predicate, Schema } from "effect";
+import { Effect, Match, Option, Predicate, Schema, SchemaIssue } from "effect";
 
 /** Fixed, server-owned operation identity. */
 export const CONNECTION_CATALOG_CENSUS_OPERATION_KEY =
@@ -32,10 +32,49 @@ const CensusSha256 = Schema.String.check(
   Schema.isMaxLength(64),
 ).annotate({ identifier: "ConnectionCatalogCensusSha256" });
 
+const RFC3339_UTC_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{3}))?Z$/;
+
+const isValidUtcTimestamp = (value: string): boolean => {
+  const match = RFC3339_UTC_TIMESTAMP.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day) ||
+    !Number.isInteger(hour) ||
+    !Number.isInteger(minute) ||
+    !Number.isInteger(second) ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return false;
+  }
+  const daysInMonth =
+    month === 2
+      ? year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+        ? 29
+        : 28
+      : [4, 6, 9, 11].includes(month)
+        ? 30
+        : 31;
+  return day <= daysInMonth;
+};
+
 const CensusTimestamp = Schema.String.check(
-  Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/),
+  Schema.isPattern(RFC3339_UTC_TIMESTAMP),
   Schema.isMaxLength(24),
-  Schema.makeFilter((value) => (Number.isNaN(Date.parse(value)) ? "invalid timestamp" : undefined)),
+  Schema.makeFilter((value) => (isValidUtcTimestamp(value) ? undefined : "invalid timestamp")),
 ).annotate({ identifier: "ConnectionCatalogCensusTimestamp" });
 
 const CensusPageCount = Schema.Int.check(
@@ -47,6 +86,101 @@ const CensusToolCount = Schema.Int.check(
   Schema.isGreaterThanOrEqualTo(0),
   Schema.isLessThanOrEqualTo(CONNECTION_CATALOG_CENSUS_MAX_DESCRIPTORS),
 );
+
+const SAFE_SCHEMA_PATH_KEYS = new Set([
+  "schemaVersion",
+  "connectionAddress",
+  "expectedIntegration",
+  "expectedCredentialProvider",
+  "refresh",
+  "address",
+  "owner",
+  "integration",
+  "name",
+  "credentialProvider",
+  "bindingSha256",
+  "sourceTransport",
+  "complete",
+  "observedAt",
+  "sourcePageCount",
+  "sourceTerminalCursor",
+  "toolCount",
+  "descriptors",
+  "descriptorHashes",
+  "catalogSha256",
+  "descriptionSha256",
+  "annotationsSha256",
+  "inputSchemaSha256",
+  "outputSchemaSha256",
+  "definitionsSha256",
+  "descriptorSha256",
+]);
+
+const sanitizeSchemaPath = (path: ReadonlyArray<PropertyKey>): readonly PropertyKey[] =>
+  path.map((segment) => {
+    if (
+      Predicate.isNumber(segment) &&
+      Number.isSafeInteger(segment) &&
+      segment >= 0 &&
+      segment <= CONNECTION_CATALOG_CENSUS_MAX_DESCRIPTORS
+    ) {
+      return segment;
+    }
+    return Predicate.isString(segment) && SAFE_SCHEMA_PATH_KEYS.has(segment)
+      ? segment
+      : "<unknown>";
+  });
+
+type SafeSchemaIssueDetail = Readonly<{
+  path: readonly PropertyKey[];
+  reason: string;
+}>;
+
+const collectSafeSchemaIssueDetails = (
+  issue: SchemaIssue.Issue,
+  path: readonly PropertyKey[] = [],
+): readonly SafeSchemaIssueDetail[] =>
+  Match.value(issue).pipe(
+    Match.tag("Pointer", (current) =>
+      collectSafeSchemaIssueDetails(current.issue, [...path, ...current.path]),
+    ),
+    Match.tag("Filter", (current) => collectSafeSchemaIssueDetails(current.issue, path)),
+    Match.tag("Encoding", (current) => collectSafeSchemaIssueDetails(current.issue, path)),
+    Match.tag("Composite", (current) =>
+      current.issues.flatMap((child) => collectSafeSchemaIssueDetails(child, path)),
+    ),
+    Match.tag("AnyOf", (current) =>
+      current.issues.length === 0
+        ? [{ path: sanitizeSchemaPath(path), reason: "invalid_union" }]
+        : current.issues.flatMap((child) => collectSafeSchemaIssueDetails(child, path)),
+    ),
+    Match.tag("InvalidType", () => [{ path: sanitizeSchemaPath(path), reason: "invalid_type" }]),
+    Match.tag("InvalidValue", () => [{ path: sanitizeSchemaPath(path), reason: "invalid_value" }]),
+    Match.tag("MissingKey", () => [{ path: sanitizeSchemaPath(path), reason: "missing_field" }]),
+    Match.tag("UnexpectedKey", () => [
+      { path: sanitizeSchemaPath(path), reason: "unexpected_field" },
+    ]),
+    Match.tag("Forbidden", () => [{ path: sanitizeSchemaPath(path), reason: "forbidden" }]),
+    Match.tag("OneOf", () => [{ path: sanitizeSchemaPath(path), reason: "ambiguous_value" }]),
+    Match.exhaustive,
+  );
+
+const safeSchemaIssue = (error: Schema.SchemaError): SchemaIssue.Issue => {
+  const details = collectSafeSchemaIssueDetails(error.issue);
+  const safeIssues = details.map(
+    ({ path, reason }) =>
+      new SchemaIssue.Pointer(
+        path,
+        new SchemaIssue.InvalidValue(Option.none(), { message: reason }),
+      ),
+  );
+  const [first, ...rest] = safeIssues;
+  if (!first) {
+    return new SchemaIssue.InvalidValue(Option.none(), { message: "invalid_schema" });
+  }
+  if (rest.length === 0) return first;
+  return new SchemaIssue.Composite(Schema.Unknown.ast, Option.none(), [first, ...rest]);
+};
 
 const strictStandardSchema = <S extends Schema.Decoder<unknown, never>>(
   base: S,
@@ -64,19 +198,23 @@ const strictStandardSchema = <S extends Schema.Decoder<unknown, never>>(
         : "Unexpected fields";
     }),
   );
-  const strictValidator = Schema.toStandardSchemaV1(Schema.decodeTo(base)(exactObject), {
+  const strictBase = Schema.decodeTo(base)(exactObject);
+  const safeSchema = Schema.declareConstructor<S["Type"], unknown>()(
+    [],
+    () => (input, _self, options) =>
+      Schema.decodeUnknownEffect(strictBase)(input, {
+        ...options,
+        onExcessProperty: "error",
+      }).pipe(
+        Effect.map((value) => Option.some(value)),
+        Effect.mapError(safeSchemaIssue),
+      ),
+  );
+  return Schema.toStandardSchemaV1(safeSchema, {
     parseOptions: { onExcessProperty: "error" },
-  })["~standard"];
-  const schema = Schema.toStandardSchemaV1(base, {
-    parseOptions: { onExcessProperty: "error" },
+    leafHook: ({ _tag }) => (_tag === "InvalidValue" ? "invalid_value" : "invalid_schema"),
+    checkHook: () => "invalid_schema",
   });
-  Object.defineProperty(schema, "~standard", {
-    configurable: true,
-    enumerable: true,
-    value: strictValidator,
-    writable: true,
-  });
-  return schema;
 };
 
 /** Caller request. Authority and execution-target fields are intentionally absent. */
@@ -298,6 +436,17 @@ const isSensitiveKey = (key: string): boolean =>
 
 type OwnEntry = readonly [string, PropertyDescriptor];
 
+/** Compare UTF-16 code units directly so hashes do not depend on locale data. */
+const compareDeterministicStrings = (left: string, right: string): number => {
+  const length = Math.min(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftCodeUnit = left.charCodeAt(index);
+    const rightCodeUnit = right.charCodeAt(index);
+    if (leftCodeUnit !== rightCodeUnit) return leftCodeUnit - rightCodeUnit;
+  }
+  return left.length - right.length;
+};
+
 const ownDataEntries = <Value extends object>(
   value: Value,
   path: string,
@@ -313,7 +462,7 @@ const ownDataEntries = <Value extends object>(
         if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return undefined;
         entries.push([name, descriptor]);
       }
-      return entries.sort((left, right) => left[0].localeCompare(right[0]));
+      return entries.sort((left, right) => compareDeterministicStrings(left[0], right[0]));
     },
     catch: () =>
       new ConnectionCatalogCensusError({ reason: "canonicalization_failure", field: path }),
@@ -665,9 +814,7 @@ const validConnectionAddress = (value: string): boolean => {
   );
 };
 
-const validTimestamp = (value: string): boolean =>
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value) &&
-  !Number.isNaN(Date.parse(value));
+const validTimestamp = isValidUtcTimestamp;
 
 const exactInputKeys = new Set([
   "schemaVersion",
@@ -1131,7 +1278,7 @@ export const finalizeConnectionCatalogCensus = (input: {
     }
     const sourcePageCount = reportedPageCount ?? pagesValue.length;
     const sortedDescriptors = [...descriptors].sort((left, right) =>
-      left.address.localeCompare(right.address),
+      compareDeterministicStrings(left.address, right.address),
     );
     const descriptorHashes = sortedDescriptors.map((descriptor) => descriptor.descriptorSha256);
     const bindingSha256 = yield* hashConnectionCatalogBinding(binding);
