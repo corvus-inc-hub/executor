@@ -72,6 +72,20 @@ export interface OwnerBinding {
   readonly subject: Subject | null;
 }
 
+/**
+ * Capabilities available to a reviewed operation target.
+ *
+ * This is deliberately not a PluginCtx. Operation code already receives the
+ * resolved credential, tool row, and reviewed arguments as separate inputs;
+ * it must not inherit plugin storage, catalog mutation, credential/provider
+ * access, nested execution, transactions, or the mutable owner object used by
+ * generic lifecycle hooks.
+ */
+export interface OperationPluginCtx {
+  readonly owner: Readonly<OwnerBinding>;
+  readonly httpClientLayer: Layer.Layer<HttpClient.HttpClient>;
+}
+
 // ---------------------------------------------------------------------------
 // StorageDeps — backing passed to a plugin's `storage` factory. Plugins see
 // host-owned storage facades only. The (tenant, owner, subject) partition is
@@ -523,6 +537,18 @@ export interface ValidateToolArgsInput<TStore = unknown> {
   readonly args: unknown;
 }
 
+/**
+ * Read-only context exposed while deriving policy annotations. The runtime
+ * supplies a read-only storage facade, and deliberately omits pluginStorage,
+ * HTTP, integrations, policies, connections, providers, OAuth, transactions,
+ * and nested execution. Annotation resolution therefore cannot mutate the
+ * catalog or materialize credentials before the Executor has bound approval.
+ */
+export type PolicyAnnotationPluginCtx<TStore = unknown> = {
+  readonly owner: OwnerBinding;
+  readonly storage: Readonly<TStore>;
+};
+
 /** Called when the executor removes / refreshes a connection owned by this
  *  plugin's integration — plugin-side cleanup or re-resolution only; the
  *  executor handles the core tool rows. */
@@ -698,7 +724,7 @@ export interface PluginSpec<
 
   /** Bulk resolve annotations for a set of tool rows under one connection. */
   readonly resolveAnnotations?: (input: {
-    readonly ctx: PluginCtx<TStore>;
+    readonly ctx: PolicyAnnotationPluginCtx<TStore>;
     readonly integration: IntegrationSlug;
     readonly connection: ConnectionName;
     readonly toolRows: readonly ToolInvocationRow[];

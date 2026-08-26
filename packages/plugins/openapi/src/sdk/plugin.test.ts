@@ -718,7 +718,7 @@ describe("OpenAPI Plugin", () => {
         const result = yield* executor.execute(conn.address("items.listItems"), {});
         const diagnostics = typeCheckOutputTypeScript(
           {
-            outputTypeScript: `{ ok: true; data: ${schema?.outputTypeScript ?? "unknown"}; http?: { status: number; headers: { [k: string]: string; } } } | { ok: false; error: ToolError }`,
+            outputTypeScript: `{ ok: true; data: ${schema?.outputTypeScript ?? "unknown"}; http?: { status: number; headers: { [k: string]: string; } }; provider?: { transport: "http" | "graphql" | "mcp" | "unknown"; requestId?: string; providerRequestSha256?: string; responseSha256?: string; status?: number; observedAt: string } } | { ok: false; error: ToolError; provider?: { transport: "http" | "graphql" | "mcp" | "unknown"; requestId?: string; providerRequestSha256?: string; responseSha256?: string; status?: number; observedAt: string } }`,
             typeScriptDefinitions: {
               ...(schema?.typeScriptDefinitions ?? {}),
               ToolError: TOOL_ERROR_TYPESCRIPT,
@@ -738,6 +738,14 @@ describe("OpenAPI Plugin", () => {
         );
 
         expect(diagnostics).toEqual([]);
+        expect(result).toMatchObject({
+          ok: true,
+          provider: { transport: "http", status: 200 },
+        });
+        expect(
+          typeof (result as { readonly provider?: { readonly responseSha256?: unknown } }).provider
+            ?.responseSha256,
+        ).toBe("string");
       }),
     ),
   );

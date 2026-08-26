@@ -1,6 +1,13 @@
 import { Context, Effect, Layer } from "effect";
 import { withQueryContext } from "@executor-js/fumadb/query";
 import { collectTables, createExecutor, type Executor, type ExecutorConfig } from "./executor";
+import {
+  makeInMemoryOperationReplayStore,
+  type ExecuteOperationDefinition,
+  type ExecuteOperationApprovalHandler,
+  type ExecuteOperationReplayStore,
+} from "./operation";
+import type { StorageFailure } from "./fuma-runtime";
 import type { FumaDb } from "./fuma-runtime";
 import { ProviderItemId, ProviderKey, Subject, Tenant } from "./ids";
 import { definePlugin, type AnyPlugin } from "./plugin";
@@ -122,6 +129,11 @@ export type TestConfigOptions<TPlugins extends readonly AnyPlugin[] = readonly [
    *  no OAuth callback (exercises the fail-loud redirect path). */
   readonly redirectUri?: string | null;
   readonly oauthCallbackStateOrgSlug?: string;
+  readonly operations?: readonly ExecuteOperationDefinition[];
+  /** Tests use an explicit in-memory ledger; pass null to verify the
+   * production fail-closed startup guard. */
+  readonly operationReplayStore?: ExecuteOperationReplayStore<StorageFailure> | null;
+  readonly operationApproval?: ExecuteOperationApprovalHandler;
 };
 
 export const makeTestConfig = <const TPlugins extends readonly AnyPlugin[] = readonly []>(
@@ -156,6 +168,13 @@ export const makeTestConfig = <const TPlugins extends readonly AnyPlugin[] = rea
     db,
     plugins: options?.plugins,
     coreTools: options?.coreTools,
+    operations: options?.operations,
+    operationReplayStore:
+      options?.operationReplayStore === null
+        ? undefined
+        : (options?.operationReplayStore ?? makeInMemoryOperationReplayStore()),
+    allowProcessLocalOperationReplayStore: true,
+    operationApproval: options?.operationApproval,
     testDb,
     // Tests default to auto-accepting elicitation prompts.
     onElicitation: "accept-all",

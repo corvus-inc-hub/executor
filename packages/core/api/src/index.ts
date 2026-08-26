@@ -1,4 +1,4 @@
-export { ExecutorApi, CoreExecutorApi, addGroup } from "./api";
+export { ExecutorApi, CoreExecutorApi, OperationExecutorApi, addGroup } from "./api";
 export {
   checkForUpdate,
   resolveDistTags,
@@ -34,6 +34,7 @@ export {
   type RunOAuthCallbackInput,
 } from "./oauth-popup";
 export { PoliciesApi } from "./policies/api";
+export { OperationsApi } from "./operations/api";
 export {
   AccountApi,
   AccountHttpApi,

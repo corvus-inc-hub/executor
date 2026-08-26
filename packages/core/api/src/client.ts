@@ -1,4 +1,5 @@
-export { ExecutorApi, CoreExecutorApi } from "./api";
+export { ExecutorApi, CoreExecutorApi, OperationExecutorApi } from "./api";
+export { OperationsApi } from "./operations/api";
 export { ToolsApi } from "./tools/api";
 export { IntegrationsApi } from "./integrations/api";
 export { ConnectionsApi } from "./connections/api";

@@ -278,10 +278,20 @@ const memoryProvider = (): CredentialProvider => {
 const VERCEL = IntegrationSlug.make("vercel");
 const GITHUB = IntegrationSlug.make("github");
 const TEMPLATE = AuthTemplateSlug.make("apiKey");
+const annotationProbe = {
+  readonlyKeys: [] as string[],
+  writeExposed: false,
+  writeCalled: false,
+};
 
 const policyTestPlugin = definePlugin(() => ({
   id: "ptest" as const,
-  storage: () => ({}),
+  storage: () => ({
+    read: () => "safe",
+    write: () => {
+      annotationProbe.writeCalled = true;
+    },
+  }),
   credentialProviders: [memoryProvider()],
   resolveTools: ({ integration }) => {
     const tools =
@@ -297,7 +307,10 @@ const policyTestPlugin = definePlugin(() => ({
         : [{ name: ToolName.make("list"), description: "list repos" }];
     return Effect.succeed({ tools });
   },
-  resolveAnnotations: ({ toolRows }) => {
+  resolveAnnotations: ({ ctx, toolRows }) => {
+    annotationProbe.readonlyKeys = Object.keys(ctx);
+    annotationProbe.writeExposed = ctx.storage.write !== undefined;
+    ctx.storage.write?.();
     const out: Record<string, { requiresApproval?: boolean }> = {};
     for (const row of toolRows) {
       out[row.name] = {
@@ -633,6 +646,23 @@ describe("active tool-policy provider", () => {
 });
 
 describe("approve / require_approval interaction with annotations", () => {
+  it.effect("resolves annotations through a read-only, side-effect-free context", () =>
+    Effect.gen(function* () {
+      annotationProbe.readonlyKeys = [];
+      annotationProbe.writeExposed = false;
+      annotationProbe.writeCalled = false;
+      const executor = yield* setupExecutor();
+      yield* executor.execute(
+        addr(VERCEL, "delete"),
+        {},
+        { onElicitation: recordingHandler({ count: 0 }) },
+      );
+      expect(annotationProbe.readonlyKeys).toEqual(["owner", "storage"]);
+      expect(annotationProbe.writeExposed).toBe(false);
+      expect(annotationProbe.writeCalled).toBe(false);
+    }),
+  );
+
   it.effect("approve skips the elicitation prompt even when plugin requires approval", () =>
     Effect.gen(function* () {
       const executor = yield* setupExecutor();

@@ -1,4 +1,4 @@
-import { Effect, Inspectable, Layer, Option, Predicate, Schema } from "effect";
+import { Cause, Effect, Inspectable, Layer, Option, Predicate, Schema } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 import { fumadb } from "@executor-js/fumadb";
 import { memoryAdapter } from "@executor-js/fumadb/adapters/memory";
@@ -114,6 +114,7 @@ import type {
   IntegrationPresetCatalogEntry,
   IntegrationRecord,
   OwnerBinding,
+  OperationPluginCtx,
   PluginCtx,
   PluginExtensions,
   ResolveToolsResult,
@@ -123,6 +124,7 @@ import type {
   ToolPolicyProvider,
   ToolPolicyProviderRule,
   ToolInvocationCredential,
+  PolicyAnnotationPluginCtx,
 } from "./plugin";
 import {
   pluginStorageId,
@@ -150,11 +152,46 @@ import {
   type OAuthEndpointUrlPolicy,
 } from "./oauth-helpers";
 import { connectionIdentifier } from "./connection-name-identifier";
-import { annotateToolResultOutcome } from "./tool-result";
+import {
+  annotateToolResultOutcome,
+  ToolProviderEvidenceSchema,
+  type ToolProviderEvidence,
+} from "./tool-result";
+import {
+  ExecuteOperationCarrier,
+  ExecuteOperationApprovalDecision,
+  ExecuteOperationFailureCode,
+  OperationContractError,
+  OperationDescriptorMismatchError,
+  OperationRequestHashMismatchError,
+  ExecuteOperationRequestCodec,
+  ExecuteOperationResultCodec,
+  canonicalizeOperationValue,
+  deriveOperationDescriptor,
+  hashExecuteOperationRequest,
+  hashOperationValue,
+  validateOperationSchema,
+  type ExecuteOperationApproval,
+  type ExecuteOperationApprovalContext,
+  type ExecuteOperationApprovalHandler,
+  type ExecuteOperationDefinition,
+  type ExecuteOperationDescriptor,
+  type ExecuteOperationError,
+  type ExecuteOperationFailure,
+  type ExecuteOperationRequest,
+  type ExecuteOperationReplayStore,
+  type ExecuteOperationResult,
+  type ExecuteOperationStatus,
+  type ExecuteOperationFailureCode as ExecuteOperationFailureCodeType,
+  type ProviderReceipt,
+} from "./operation";
 
 const PLUGIN_STORAGE_DELETE_KEY_BATCH_SIZE = 90;
 const PLUGIN_STORAGE_CREATE_ROW_BATCH_SIZE = 90;
 const MAX_APPROVAL_ARGUMENT_PREVIEW_CHARS = 4_000;
+const isExecuteOperationCarrier = Schema.is(ExecuteOperationCarrier);
+const isExecuteOperationApprovalDecision = Schema.is(ExecuteOperationApprovalDecision);
+const isExecuteOperationFailureCode = Schema.is(ExecuteOperationFailureCode);
 
 // ---------------------------------------------------------------------------
 // Elicitation handler — resolved once at `createExecutor({ onElicitation })`
@@ -373,6 +410,17 @@ export type Executor<TPlugins extends readonly AnyPlugin[] = readonly []> = {
     options?: InvokeOptions,
   ) => Effect.Effect<unknown, ExecuteError>;
 
+  /** True only when reviewed operation definitions and a replay ledger were
+   * configured at startup. Hosts must omit operation routes/tools otherwise. */
+  readonly operationExecutionAvailable: boolean;
+
+  /** Execute a reviewed operation by registry key. The carrier is supplied by
+   * a trusted adapter, never accepted as caller input. */
+  readonly executeOperation: (
+    request: ExecuteOperationRequest,
+    carrier: ExecuteOperationCarrier,
+  ) => Effect.Effect<ExecuteOperationResult, ExecuteOperationError | ExecuteError | StorageFailure>;
+
   readonly close: () => Effect.Effect<void, StorageFailure>;
 } & PluginExtensions<TPlugins>;
 
@@ -437,6 +485,30 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
     readonly orgSlug?: string;
     readonly includeProviders?: boolean;
   };
+  /** Host-owned, versioned operation registry. Callers select only an
+   * operation key/version; target, provider transport, and schemas come from
+   * these reviewed definitions. */
+  readonly operations?: readonly ExecuteOperationDefinition[];
+  /**
+   * Host-owned replay/reservation ledger for carrier-neutral operations. It is
+   * required whenever an operation registry is configured; the executor
+   * refuses to start without it and never falls back to a process-local
+   * ledger. Tests and explicitly local-only callers may use the exported
+   * in-memory helper.
+   */
+  readonly operationReplayStore?: ExecuteOperationReplayStore<StorageFailure>;
+  /**
+   * Test/local-only escape hatch for the exported in-memory replay helper.
+   * Cloud/server hosts must leave this unset and inject a durable store.
+   */
+  readonly allowProcessLocalOperationReplayStore?: boolean;
+  /**
+   * Explicit approval/grant adapter for operations whose resolved policy is
+   * `require_approval`. It receives the complete execution binding and must
+   * return a persisted grant decision; generic `onElicitation` is never used
+   * as an implicit operation approval.
+   */
+  readonly operationApproval?: ExecuteOperationApprovalHandler;
   /**
    * How long a connection's persisted tool catalog stays fresh when its plugin
    * lists a live remote catalog (`plugin.remoteToolCatalog`, e.g. MCP servers,
@@ -1277,6 +1349,47 @@ const EXECUTOR_INTEGRATION: StaticIntegrationDecl = {
 const isReadonlyRecord = (value: unknown): value is Readonly<Record<PropertyKey, unknown>> =>
   typeof value === "object" && value !== null;
 
+const POLICY_MUTATING_STORAGE_METHOD =
+  /^(?:put|append|remove|delete|set|update|create|write|clear|insert|upsert|replace|mark)/i;
+const POLICY_READING_STORAGE_METHOD =
+  /^(?:get|list|find|read|has|exists|query|count|keys|values|entries|tojson)/i;
+
+/** Build the deliberately narrow storage view used by policy annotation
+ * resolvers. A type-level `Readonly<T>` is not enough because storage methods
+ * can still mutate through their closures, so the runtime facade hides common
+ * mutators and rejects all proxy writes. */
+const makePolicyReadonlyStorage = <T>(storage: T): Readonly<T> => {
+  if (typeof storage !== "object" || storage === null) return storage;
+  const target = storage as object;
+  return new Proxy(target, {
+    get: (current, property) => {
+      if (typeof property === "string" && POLICY_MUTATING_STORAGE_METHOD.test(property)) {
+        return undefined;
+      }
+      let owner: object | null = current;
+      let value: unknown;
+      while (owner !== null) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(owner, property);
+        if (descriptor) {
+          if (!("value" in descriptor)) return undefined;
+          value = descriptor.value;
+          break;
+        }
+        owner = Reflect.getPrototypeOf(owner);
+      }
+      if (value === undefined && owner === null) return undefined;
+      if (typeof value !== "function") return value;
+      if (typeof property === "string" && !POLICY_READING_STORAGE_METHOD.test(property)) {
+        return undefined;
+      }
+      return value.bind(current);
+    },
+    set: () => false,
+    defineProperty: () => false,
+    deleteProperty: () => false,
+  }) as Readonly<T>;
+};
+
 type StandardJsonSchemaSide = "input" | "output";
 type StandardJsonSchemaFns = {
   readonly input?: (options: { readonly target: "draft-07" }) => unknown;
@@ -1379,6 +1492,42 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const staticTools = new Map<string, StaticTools>();
     const runtimes = new Map<string, PluginRuntime>();
     let activeToolPolicyProvider: ToolPolicyProvider | null = null;
+    const operationRegistry = new Map<string, ExecuteOperationDefinition>();
+    for (const definition of config.operations ?? []) {
+      const registryKey = `${definition.operationKey}@${definition.version}`;
+      if (operationRegistry.has(registryKey)) {
+        return yield* new StorageError({
+          message: `Duplicate Executor operation definition: ${registryKey}`,
+          cause: undefined,
+        });
+      }
+      if (!definition.inputSchema || !definition.outputSchema) {
+        return yield* new StorageError({
+          message: `Executor operation ${registryKey} must declare input and output schemas.`,
+          cause: undefined,
+        });
+      }
+      operationRegistry.set(registryKey, definition);
+    }
+    if (
+      (config.operations?.length ?? 0) > 0 &&
+      (config.operationReplayStore === undefined ||
+        (config.operationReplayStore.durability !== "durable" &&
+          config.allowProcessLocalOperationReplayStore !== true))
+    ) {
+      return yield* new StorageError({
+        message:
+          "Executor operation registry requires a durable operationReplayStore; refusing to start with a process-local replay ledger.",
+        cause: undefined,
+      });
+    }
+    // There is no implicit process-local ledger. Hosts that expose operation
+    // definitions must inject a durable store; the startup guard above makes
+    // that requirement explicit, while this check also protects a future
+    // dynamically-populated registry.
+    const operationReplayStore = config.operationReplayStore;
+    const operationExecutionAvailable =
+      operationRegistry.size > 0 && operationReplayStore !== undefined;
     // Credential providers keyed by `provider.key`, in registration order.
     const credentialProviders = new Map<string, CredentialProvider>();
     const credentialProviderOrder: string[] = [];
@@ -3553,9 +3702,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       args: unknown,
       policy: EffectivePolicy,
       handler: ElicitationHandler,
-    ) =>
+    ): Effect.Effect<"not_required" | "approved", ElicitationDeclinedError> =>
       Effect.gen(function* () {
-        if (!approvalRequired(annotations, policy)) return;
+        if (!approvalRequired(annotations, policy)) return "not_required" as const;
         const policyForcesApproval = policy.action === "require_approval";
         const message = annotations?.approvalDescription
           ? annotations.approvalDescription
@@ -3573,6 +3722,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             action: response.action,
           });
         }
+        return "approved" as const;
       });
 
     // ------------------------------------------------------------------
@@ -3618,11 +3768,190 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         select: TOOL_INVOCATION_COLUMNS,
       });
 
-    const execute = (
+    type InternalOperationContext = {
+      readonly executionId: string;
+      readonly jobId: string;
+      readonly requestSha256: string;
+      readonly approvalSatisfied: boolean;
+    };
+
+    type InternalInvocationResult = {
+      readonly value: unknown;
+      readonly policy: EffectivePolicy;
+      readonly approval: "not_required" | "approved";
+      readonly provider?: unknown;
+    };
+
+    type SafeToolResultProjection =
+      | { readonly ok: true; readonly data: unknown; readonly provider?: unknown }
+      | { readonly ok: false; readonly error: unknown; readonly provider?: unknown }
+      | { readonly ok: "invalid" };
+
+    type DataPropertyResult =
+      | { readonly ok: true; readonly present: boolean; readonly value: unknown }
+      | { readonly ok: false };
+
+    const dataProperty = (value: object, key: string): unknown | undefined => {
+      // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: hostile Proxy reflection may throw; absence is the safe projection
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        return descriptor && "value" in descriptor ? descriptor.value : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+
+    const strictDataProperty = (value: object, key: string): DataPropertyResult => {
+      // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: hostile Proxy reflection may throw; invalid projection is typed below
+      try {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        return {
+          ok: true,
+          present: descriptor !== undefined && "value" in descriptor,
+          value: descriptor && "value" in descriptor ? descriptor.value : undefined,
+        };
+      } catch {
+        return { ok: false };
+      }
+    };
+
+    /**
+     * Read the ToolResult discriminator without invoking plugin-owned getters.
+     * Operation output canonicalization performs the full strict clone later;
+     * this projection only decides whether the value is a success/failure
+     * wrapper and extracts data through own data descriptors.
+     */
+    const safeToolResultProjection = (value: unknown): SafeToolResultProjection | undefined => {
+      if (typeof value !== "object" || value === null) return undefined;
+      let isArray = false;
+      // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: hostile Proxy reflection may throw; invalid projection is typed below
+      try {
+        isArray = Array.isArray(value);
+      } catch {
+        return { ok: "invalid" };
+      }
+      if (isArray) return undefined;
+      const ok = strictDataProperty(value, "ok");
+      if (!ok.ok) return { ok: "invalid" };
+      if (ok.value === true) {
+        const dataDescriptor = strictDataProperty(value, "data");
+        if (!dataDescriptor.ok || !dataDescriptor.present) return { ok: "invalid" };
+        return {
+          ok: true,
+          data: dataDescriptor.value,
+          provider: dataProperty(value, "provider"),
+        };
+      }
+      if (ok.value === false) {
+        const errorDescriptor = strictDataProperty(value, "error");
+        if (!errorDescriptor.ok || !errorDescriptor.present) return { ok: "invalid" };
+        return {
+          ok: false,
+          error: errorDescriptor.value,
+          provider: dataProperty(value, "provider"),
+        };
+      }
+      return undefined;
+    };
+
+    const providerEvidenceFromValue = (value: unknown): unknown => {
+      const projection = safeToolResultProjection(value);
+      return projection && projection.ok !== "invalid" ? projection.provider : undefined;
+    };
+
+    /** Operation spans never receive a plugin-controlled error code. The
+     * generic invoke surface retains its historical annotation, while the
+     * attested path records only the stable failure bucket. */
+    const annotateInvocationOutcome = (
+      value: unknown,
+      isOperation: boolean,
+    ): Effect.Effect<void> => {
+      if (!isOperation) return annotateToolResultOutcome(value);
+      const projection = safeToolResultProjection(value);
+      return projection?.ok === false || projection?.ok === "invalid"
+        ? Effect.annotateCurrentSpan({
+            "executor.tool.outcome": "fail",
+            "executor.tool.error_code": "operation_failed",
+          })
+        : Effect.annotateCurrentSpan({ "executor.tool.outcome": "ok" });
+    };
+
+    const policyAnnotationContext = (
+      ctx: PluginCtx<unknown>,
+    ): PolicyAnnotationPluginCtx<unknown> => ({
+      owner: Object.freeze({ ...ctx.owner }),
+      storage: makePolicyReadonlyStorage(ctx.storage),
+    });
+
+    const resolveAnnotationsWithReadonlyContext = (input: {
+      readonly runtime: PluginRuntime;
+      readonly integration: IntegrationSlug;
+      readonly connection: ConnectionName;
+      readonly toolRows: readonly ToolInvocationRow[];
+    }): Effect.Effect<Record<string, ToolAnnotations>, StorageFailure> =>
+      Effect.try({
+        try: () =>
+          input.runtime.plugin.resolveAnnotations?.({
+            ctx: policyAnnotationContext(input.runtime.ctx),
+            integration: input.integration,
+            connection: input.connection,
+            toolRows: input.toolRows,
+          }),
+        catch: (cause) =>
+          pluginStorageFailure(input.runtime.plugin.id, "resolveAnnotations", cause),
+      }).pipe(
+        Effect.flatMap((resolved) => {
+          if (resolved === undefined) return Effect.succeed({});
+          if (!Effect.isEffect(resolved)) {
+            return Effect.fail(
+              pluginStorageFailure(input.runtime.plugin.id, "resolveAnnotations", resolved),
+            );
+          }
+          return Effect.catchCause(resolved, (cause) =>
+            Effect.fail(pluginStorageFailure(input.runtime.plugin.id, "resolveAnnotations", cause)),
+          );
+        }),
+        Effect.mapError((cause) =>
+          isStorageFailure(cause)
+            ? cause
+            : pluginStorageFailure(input.runtime.plugin.id, "resolveAnnotations", cause),
+        ),
+      );
+
+    // Operation handlers receive credentials and a reviewed target from core;
+    // they do not receive the executor's ambient PluginCtx. Copy and freeze
+    // the owner so a handler cannot redirect the authorization partition by
+    // mutating the generic executor binding.
+    const operationPluginContext = (ctx: PluginCtx<unknown>): OperationPluginCtx => {
+      const owner = Object.freeze(
+        Object.setPrototypeOf(
+          {
+            tenant: Tenant.make(String(ctx.owner.tenant)),
+            subject: ctx.owner.subject === null ? null : Subject.make(String(ctx.owner.subject)),
+          },
+          null,
+        ),
+      );
+      return Object.freeze(
+        Object.setPrototypeOf(
+          {
+            owner,
+            httpClientLayer: ctx.httpClientLayer,
+          },
+          null,
+        ),
+      );
+    };
+
+    const executeInternal = (
       address: ToolAddress,
       args: unknown,
       options?: InvokeOptions,
-    ): Effect.Effect<unknown, ExecuteError> => {
+      internal?: {
+        readonly policy?: EffectivePolicy;
+        readonly operation?: InternalOperationContext;
+      },
+    ): Effect.Effect<InternalInvocationResult, ExecuteError> => {
       const handler = pickHandler(options);
       return Effect.gen(function* () {
         // oxlint-disable executor/no-instanceof-error, executor/no-unknown-error-message, executor/no-manual-tag-check -- boundary: normalize arbitrary unknown plugin failures into a human-readable message for ToolInvocationError/telemetry
@@ -3638,6 +3967,18 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           }
           return String(cause);
         };
+        const sanitizeInvocationCause = (
+          cause: unknown,
+        ): Readonly<Record<string, string | number | boolean>> => {
+          if (typeof cause !== "object" || cause === null) return {};
+          const status = dataProperty(cause, "status");
+          return typeof status === "number" &&
+            Number.isInteger(status) &&
+            status >= 100 &&
+            status <= 599
+            ? { status }
+            : {};
+        };
         // oxlint-enable executor/no-instanceof-error, executor/no-unknown-error-message, executor/no-manual-tag-check
         const wrapInvocationError = <A, E>(
           effect: Effect.Effect<A, E>,
@@ -3647,37 +3988,98 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               (cause) =>
                 new ToolInvocationError({
                   address,
-                  message: formatInvocationCauseMessage(cause),
-                  cause,
+                  // Operation receipts are public and replayable; neither
+                  // their span failure nor their typed cause may retain a
+                  // provider message/token. Generic execution keeps its
+                  // historical diagnostic cause for local callers.
+                  message: internal?.operation
+                    ? "Operation invocation failed."
+                    : formatInvocationCauseMessage(cause),
+                  cause: internal?.operation ? sanitizeInvocationCause(cause) : cause,
                 }),
             ),
           );
+        const invokeOperationHandler = (
+          handler: (...args: never[]) => unknown,
+          input: unknown,
+        ): Effect.Effect<unknown, ToolInvocationError> => {
+          const failure = () =>
+            new ToolInvocationError({
+              address,
+              message: "Operation invocation failed.",
+              cause: {},
+            });
+          const isOperationEffect = (
+            value: unknown,
+          ): value is Effect.Effect<unknown, unknown, never> => Effect.isEffect(value);
+          return Effect.suspend((): Effect.Effect<unknown, ToolInvocationError> => {
+            let result: unknown;
+            // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: plugin sync throws become opaque typed operation failures
+            try {
+              // Operation handlers are plugin code. Invoke them through an
+              // untyped boundary so the runtime's narrow OperationPluginCtx
+              // cannot be widened back to the ambient PluginCtx by the public
+              // generic hook signature. Reflect.apply also prevents a plugin
+              // from receiving an executor-owned `this` value.
+              result = Reflect.apply(handler, undefined, [input]);
+            } catch {
+              return Effect.fail(failure());
+            }
+            if (!isOperationEffect(result)) return Effect.fail(failure());
+            return result.pipe(Effect.mapError(() => failure()));
+          });
+        };
 
         // Static path — O(1) map lookup for plugin-contributed static tools
         // (core-tools, plugin executor namespaces). Addressed by their fqid,
         // not the 5-segment dynamic form.
         const staticEntry = staticTools.get(String(address));
         if (staticEntry) {
-          const policyRules = yield* listActivePolicyRuleSet();
-          const policy = yield* resolvePolicyFromRuleSet(
-            String(address),
-            policyRules,
-            staticEntry.tool.annotations?.requiresApproval,
-          );
+          const policy =
+            internal?.policy ??
+            (yield* listActivePolicyRuleSet().pipe(
+              Effect.flatMap((policyRules) =>
+                resolvePolicyFromRuleSet(
+                  String(address),
+                  policyRules,
+                  staticEntry.tool.annotations?.requiresApproval,
+                ),
+              ),
+            ));
           if (policy.action === "block") {
             return yield* new ToolBlockedError({
               address,
               pattern: policy.pattern ?? "*",
             });
           }
-          yield* enforceApproval(staticEntry.tool.annotations, address, args, policy, handler);
-          return yield* wrapInvocationError(
-            staticEntry.tool.handler({
-              ctx: staticEntry.ctx,
-              args,
-              elicit: buildElicit(address, args, handler),
-            }),
-          );
+          const approval = internal?.operation?.approvalSatisfied
+            ? ("approved" as const)
+            : yield* enforceApproval(
+                internal?.operation ? undefined : staticEntry.tool.annotations,
+                address,
+                args,
+                policy,
+                handler,
+              );
+          const value = yield* internal?.operation
+            ? invokeOperationHandler(staticEntry.tool.handler, {
+                ctx: operationPluginContext(staticEntry.ctx),
+                args,
+                elicit: buildElicit(address, args, handler),
+              })
+            : wrapInvocationError(
+                staticEntry.tool.handler({
+                  ctx: staticEntry.ctx,
+                  args,
+                  elicit: buildElicit(address, args, handler),
+                }),
+              );
+          return {
+            value,
+            policy,
+            approval,
+            provider: providerEvidenceFromValue(value),
+          };
         }
 
         const parsed = parseToolAddress(String(address));
@@ -3710,13 +4112,18 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
         // Resolve policy (owner-ranked).
         const toolForPolicy = rowToTool(row);
-        const policyRules = yield* listActivePolicyRuleSet();
         const annotations = decodeJsonColumn(row.annotations) as ToolAnnotations | undefined;
-        const policy = yield* resolvePolicyFromRuleSet(
-          normalizedPolicyId(toolForPolicy),
-          policyRules,
-          annotations?.requiresApproval,
-        );
+        const policy =
+          internal?.policy ??
+          (yield* listActivePolicyRuleSet().pipe(
+            Effect.flatMap((policyRules) =>
+              resolvePolicyFromRuleSet(
+                normalizedPolicyId(toolForPolicy),
+                policyRules,
+                annotations?.requiresApproval,
+              ),
+            ),
+          ));
         if (policy.action === "block") {
           return yield* new ToolBlockedError({
             address,
@@ -3754,15 +4161,17 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
         // Resolve annotations + enforce approval.
         let resolvedAnnotations = annotations;
-        if (policy.action !== "approve" && runtime.plugin.resolveAnnotations) {
-          const map = yield* runtime.plugin
-            .resolveAnnotations({
-              ctx: runtime.ctx,
-              integration: parsed.integration,
-              connection: parsed.connection,
-              toolRows: [row],
-            })
-            .pipe(wrapInvocationError);
+        if (
+          !internal?.operation &&
+          policy.action !== "approve" &&
+          runtime.plugin.resolveAnnotations
+        ) {
+          const map = yield* resolveAnnotationsWithReadonlyContext({
+            runtime,
+            integration: parsed.integration,
+            connection: parsed.connection,
+            toolRows: [row],
+          }).pipe(wrapInvocationError);
           resolvedAnnotations = map[String(parsed.tool)] ?? annotations;
         }
         // When this call is about to pause for approval, validate args
@@ -3770,12 +4179,24 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // body) must be rejected here, not after the user grants an approval
         // that then goes to waste. Non-pausing calls skip this — invokeTool
         // raises the identical failure moments later without the extra pass.
-        if (approvalRequired(resolvedAnnotations, policy) && runtime.plugin.validateToolArgs) {
+        if (
+          !internal?.operation &&
+          approvalRequired(resolvedAnnotations, policy) &&
+          runtime.plugin.validateToolArgs
+        ) {
           yield* runtime.plugin
             .validateToolArgs({ ctx: runtime.ctx, toolRow: row, args })
             .pipe(wrapInvocationError);
         }
-        yield* enforceApproval(resolvedAnnotations, address, args, policy, handler);
+        const approval = internal?.operation?.approvalSatisfied
+          ? ("approved" as const)
+          : yield* enforceApproval(
+              internal?.operation ? undefined : resolvedAnnotations,
+              address,
+              args,
+              policy,
+              handler,
+            );
 
         // Resolve every named credential input (`variable → value`); `value` is
         // the primary `token` for single-input + OAuth callers.
@@ -3793,23 +4214,51 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           ...(grantedScopes ? { grantedScopes } : {}),
         };
 
-        return yield* wrapInvocationError(
-          runtime.plugin.invokeTool({
-            ctx: runtime.ctx,
-            toolRow: row,
-            credential,
-            args,
-            elicit: buildElicit(address, args, handler),
-            invokeOptions: options,
-          }),
-        );
+        const value = yield* internal?.operation
+          ? invokeOperationHandler(runtime.plugin.invokeTool, {
+              ctx: operationPluginContext(runtime.ctx),
+              toolRow: row,
+              credential,
+              args,
+              elicit: buildElicit(address, args, handler),
+              invokeOptions: options,
+            })
+          : wrapInvocationError(
+              runtime.plugin.invokeTool({
+                ctx: runtime.ctx,
+                toolRow: row,
+                credential,
+                args,
+                elicit: buildElicit(address, args, handler),
+                invokeOptions: options,
+              }),
+            );
+        return {
+          value,
+          policy,
+          approval,
+          provider: providerEvidenceFromValue(value),
+        };
       }).pipe(
+        Effect.catchCause((cause) =>
+          internal?.operation && Cause.hasDies(cause)
+            ? Effect.fail(
+                new ToolInvocationError({
+                  address,
+                  message: "Operation invocation failed.",
+                  cause: {},
+                }),
+              )
+            : Effect.failCause(cause),
+        ),
         // Expected tool failures (`ToolResult.fail`) resolve through the
         // success channel, so the tracer alone would record them as healthy
         // spans. Stamp the outcome + error code so telemetry can distinguish
         // "tool ran fine" from "user hit an upstream error / auth wall"
         // without parsing response bodies.
-        Effect.tap(annotateToolResultOutcome),
+        Effect.tap((result) =>
+          annotateInvocationOutcome(result.value, internal?.operation !== undefined),
+        ),
         Effect.withSpan("executor.tool.execute", {
           attributes: {
             "mcp.tool.name": String(address),
@@ -3819,6 +4268,17 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         }),
       );
     };
+
+    // Public generic execution deliberately retains its historical return
+    // shape. The attested operation path uses the richer private result above
+    // so it can carry the exact policy/approval/provider facts without
+    // exposing a caller-supplied policy or invocation seam.
+    const execute = (
+      address: ToolAddress,
+      args: unknown,
+      options?: InvokeOptions,
+    ): Effect.Effect<unknown, ExecuteError> =>
+      executeInternal(address, args, options).pipe(Effect.map(({ value }) => value));
 
     // ------------------------------------------------------------------
     // OAuth service seam.
@@ -4030,6 +4490,982 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     }
 
     // ------------------------------------------------------------------
+    // Carrier-neutral operation execution.
+    //
+    // This is intentionally kept inside createExecutor. There is no public
+    // "run with this policy/invoker" seam: the registry target, policy
+    // snapshot, approval context, credential resolution, and provider receipt
+    // all stay under Executor control.
+    // ------------------------------------------------------------------
+
+    const operationPolicy = (policy: EffectivePolicy) => ({
+      decision:
+        policy.action === "approve"
+          ? ("allow" as const)
+          : policy.action === "require_approval"
+            ? ("require_approval" as const)
+            : ("deny" as const),
+      source: policy.source,
+      ...(policy.pattern !== undefined ? { pattern: policy.pattern } : {}),
+      ...(policy.policyId !== undefined ? { policyId: policy.policyId } : {}),
+    });
+
+    const safeFailureCode = (cause: unknown): ExecuteOperationFailureCodeType => {
+      const raw =
+        typeof cause === "string"
+          ? cause
+          : typeof cause === "object" && cause !== null
+            ? dataProperty(cause, "code")
+            : undefined;
+      return typeof raw === "string" && isExecuteOperationFailureCode(raw)
+        ? raw
+        : "operation_failed";
+    };
+
+    const safeStatus = (cause: unknown): number | undefined => {
+      if (typeof cause !== "object" || cause === null) return undefined;
+      const status = dataProperty(cause, "status");
+      return typeof status === "number" &&
+        Number.isInteger(status) &&
+        status >= 100 &&
+        status <= 599
+        ? status
+        : undefined;
+    };
+
+    const safeToolError = (
+      error: unknown,
+    ): {
+      readonly code?: string;
+      readonly status?: number;
+      readonly retryable?: boolean;
+    } => {
+      if (typeof error !== "object" || error === null) return {};
+      const code = dataProperty(error, "code");
+      const status = dataProperty(error, "status");
+      const retryable = dataProperty(error, "retryable");
+      return {
+        ...(typeof code === "string" ? { code } : {}),
+        ...(typeof status === "number" ? { status } : {}),
+        ...(typeof retryable === "boolean" ? { retryable } : {}),
+      };
+    };
+
+    const sanitizeProviderEvidence = (
+      evidence: unknown,
+    ): Effect.Effect<ToolProviderEvidence | undefined> => {
+      if (!evidence) return Effect.succeed(undefined);
+      const operationTimestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
+      const secretLikeMetadata =
+        /(?:bearer|basic)\s+|(?:api[-_ ]?key|authorization|auth[-_ ]?header|password|passwd|secret|credential|client[-_ ]?secret|private[-_ ]?key|refresh[-_ ]?token|access[-_ ]?token|access[-_ ]?key|admin[-_ ]?key|aws[_-]?access[_-]?key[_-]?id|aws[_-]?secret|aws[_-]?session|token)\s*[:=]|(?:sk-|gh[pousr]_|github_pat_|xox[bpras]-|AKIA|ASIA|eyJ)|-----BEGIN/i;
+      return canonicalizeOperationValue(evidence).pipe(
+        Effect.flatMap((snapshot) =>
+          Schema.decodeUnknownEffect(ToolProviderEvidenceSchema)(snapshot.value),
+        ),
+        Effect.match({
+          // Provider metadata is advisory. Invalid or secret-shaped metadata
+          // must never cross the operation boundary; classify it as missing
+          // evidence instead of leaking a parse error or raw value.
+          onFailure: () => undefined,
+          onSuccess: (validated) =>
+            !operationTimestamp.test(validated.observedAt) ||
+            secretLikeMetadata.test(JSON.stringify(validated))
+              ? undefined
+              : validated,
+        }),
+      );
+    };
+
+    const providerReceiptFromEvidence = (
+      evidence: ToolProviderEvidence | undefined,
+      operationRequestSha256: string,
+    ): ProviderReceipt | undefined => {
+      if (!evidence) return undefined;
+      return {
+        transport: evidence.transport,
+        operationRequestSha256,
+        ...(evidence.requestId !== undefined ? { requestId: evidence.requestId } : {}),
+        ...(evidence.providerRequestSha256 !== undefined
+          ? { providerRequestSha256: evidence.providerRequestSha256 }
+          : {}),
+        ...(evidence.responseSha256 !== undefined
+          ? { responseSha256: evidence.responseSha256 }
+          : {}),
+        ...(evidence.status !== undefined ? { status: evidence.status } : {}),
+        observedAt: evidence.observedAt,
+      };
+    };
+
+    const reconcileProvider = (input: {
+      readonly expectedTransport: ExecuteOperationDefinition["providerTransport"];
+      readonly evidence?: ToolProviderEvidence;
+      readonly requestSha256: string;
+      readonly outputSha256?: string;
+    }): {
+      readonly status: "matched" | "mismatch" | "unavailable" | "not_attempted";
+      readonly receipt?: ProviderReceipt;
+    } => {
+      const receipt = providerReceiptFromEvidence(input.evidence, input.requestSha256);
+      if (input.expectedTransport === "none") {
+        return input.evidence ? { status: "mismatch", receipt } : { status: "not_attempted" };
+      }
+      if (!input.evidence) return { status: "unavailable" };
+      if (input.evidence.transport !== input.expectedTransport) {
+        return { status: "mismatch", receipt };
+      }
+      if (
+        input.outputSha256 !== undefined &&
+        input.evidence.responseSha256 !== undefined &&
+        input.evidence.responseSha256 !== input.outputSha256
+      ) {
+        return { status: "mismatch", receipt };
+      }
+      if (input.evidence.status !== undefined && input.evidence.status >= 400) {
+        return { status: "mismatch", receipt };
+      }
+      // A receipt with an informational or redirect status is not successful
+      // terminal evidence. Keep it as advisory/unavailable rather than
+      // allowing a 1xx/3xx response to attest completion.
+      if (
+        input.evidence.status !== undefined &&
+        (input.evidence.status < 200 || input.evidence.status >= 300)
+      ) {
+        return { status: "unavailable", receipt };
+      }
+      // A successful attestation requires an HTTP status and the canonical
+      // sanitized response hash. The operation request hash in the public
+      // receipt is stamped above by Executor, never accepted from a plugin.
+      if (
+        input.evidence.status === undefined ||
+        input.outputSha256 === undefined ||
+        input.evidence.responseSha256 === undefined
+      ) {
+        return { status: "unavailable", receipt };
+      }
+      return { status: "matched", receipt };
+    };
+
+    const samePolicy = (
+      left: ExecuteOperationResult["policy"],
+      right: ExecuteOperationResult["policy"],
+    ): boolean =>
+      left.decision === right.decision &&
+      left.source === right.source &&
+      left.pattern === right.pattern &&
+      left.policyId === right.policyId;
+
+    /** Validate a result read from a replay store as if it crossed an
+     * untrusted carrier. The store is host-owned, but this check is what keeps
+     * a corrupt or stale adapter from changing the reviewed target, tenant,
+     * policy, hashes, or provider semantics on replay. Carrier is rebound to
+     * the current trusted adapter after the immutable fields pass. */
+    const validateAndRebindOperationResult = (input: {
+      readonly raw: unknown;
+      readonly request: ExecuteOperationRequest;
+      readonly descriptor: ExecuteOperationDescriptor;
+      readonly definition: ExecuteOperationDefinition;
+      readonly tenant: string;
+      readonly subject: string | null;
+      readonly carrier: ExecuteOperationCarrier;
+    }): Effect.Effect<ExecuteOperationResult, OperationContractError> =>
+      Effect.gen(function* () {
+        const snapshot = yield* canonicalizeOperationValue(input.raw).pipe(
+          Effect.mapError(
+            () => new OperationContractError({ field: "result", reason: "invalid_value" }),
+          ),
+        );
+        const decoded = yield* ExecuteOperationResultCodec.decode(snapshot.value).pipe(
+          Effect.mapError(
+            () => new OperationContractError({ field: "result", reason: "invalid_value" }),
+          ),
+        );
+        const failResult = (field: string) =>
+          new OperationContractError({ field, reason: "invalid_value" });
+        if (
+          decoded.schemaVersion !== input.request.schemaVersion ||
+          decoded.operationKey !== input.request.operationKey ||
+          decoded.version !== input.request.version ||
+          decoded.jobId !== input.request.jobId ||
+          decoded.descriptorSha256 !== input.request.descriptorSha256 ||
+          decoded.requestSha256 !== input.request.requestSha256 ||
+          String(decoded.target) !== String(input.descriptor.target) ||
+          decoded.providerTransport !== input.definition.providerTransport
+        ) {
+          return yield* failResult("result.binding");
+        }
+
+        if (
+          decoded.approval.tenant !== input.tenant ||
+          decoded.approval.subject !== (input.subject ?? undefined) ||
+          decoded.approval.executionId !== decoded.executionId ||
+          decoded.approval.jobId !== decoded.jobId ||
+          decoded.approval.operationKey !== decoded.operationKey ||
+          decoded.approval.version !== decoded.version ||
+          decoded.approval.descriptorSha256 !== decoded.descriptorSha256 ||
+          decoded.approval.requestSha256 !== decoded.requestSha256 ||
+          String(decoded.approval.target) !== String(decoded.target) ||
+          decoded.approval.providerTransport !== decoded.providerTransport ||
+          decoded.approval.carrier !== decoded.carrier ||
+          decoded.approval.sessionId !== `approval:${decoded.executionId}` ||
+          decoded.approval.decidedAt === undefined ||
+          !samePolicy(decoded.approval.policy, decoded.policy)
+        ) {
+          return yield* failResult("result.approval");
+        }
+
+        const outputPresent = Object.prototype.hasOwnProperty.call(decoded, "output");
+        let outputSha256: string | null = decoded.outputSha256;
+        let sanitizedOutput: unknown;
+        if (outputPresent) {
+          sanitizedOutput = yield* validateOperationSchema(
+            input.definition.outputSchema,
+            decoded.output,
+            "output",
+          ).pipe(Effect.mapError(() => failResult("result.output")));
+          const calculated = yield* hashOperationValue(sanitizedOutput).pipe(
+            Effect.mapError(() => failResult("result.output")),
+          );
+          if (decoded.outputSha256 !== calculated) {
+            return yield* failResult("result.outputSha256");
+          }
+          outputSha256 = calculated;
+        } else if (decoded.outputSha256 !== null) {
+          return yield* failResult("result.outputSha256");
+        }
+
+        if (decoded.status === "completed" && !outputPresent) {
+          return yield* failResult("result.output");
+        }
+        if (decoded.status === "completed" && decoded.failure !== undefined) {
+          return yield* failResult("result.failure");
+        }
+        if (decoded.status !== "completed" && decoded.failure === undefined) {
+          return yield* failResult("result.failure");
+        }
+        if (decoded.status !== "completed" && outputPresent) {
+          return yield* failResult("result.output");
+        }
+
+        // The approval adapter is an authorization boundary, not a free-form
+        // annotation. Enumerate every terminal combination that this
+        // executor can produce. In particular, a corrupt adapter cannot turn
+        // an allow/not-required run into an approved or declined result, and
+        // control-plane failures cannot be replayed as ordinary tool errors.
+        const decision = decoded.approval.decision;
+        const policyDecision = decoded.policy.decision;
+        const failureCode = decoded.failure?.code;
+        const operationalFailure =
+          failureCode === "operation_failed" ||
+          failureCode === "provider_error" ||
+          failureCode === "upstream_bad_request" ||
+          failureCode === "upstream_unauthorized" ||
+          failureCode === "upstream_forbidden" ||
+          failureCode === "upstream_not_found" ||
+          failureCode === "upstream_conflict" ||
+          failureCode === "upstream_rate_limited" ||
+          failureCode === "upstream_server_error" ||
+          failureCode === "tool_not_found" ||
+          failureCode === "tool_blocked" ||
+          failureCode === "credential_missing" ||
+          failureCode === "credential_invalid" ||
+          failureCode === "output_schema_invalid" ||
+          failureCode === "provider_receipt_mismatch" ||
+          failureCode === "provider_receipt_unavailable";
+        const validTerminalState =
+          decoded.status === "completed"
+            ? (policyDecision === "allow" && decision === "not_required") ||
+              (policyDecision === "require_approval" && decision === "approved")
+            : decoded.status === "failed"
+              ? ((policyDecision === "allow" && decision === "not_required") ||
+                  (policyDecision === "require_approval" && decision === "approved")) &&
+                operationalFailure
+              : decoded.status === "blocked"
+                ? (policyDecision === "deny" &&
+                    decision === "not_required" &&
+                    failureCode === "policy_blocked") ||
+                  (policyDecision === "require_approval" &&
+                    decision === "declined" &&
+                    (failureCode === "approval_handler_required" ||
+                      failureCode === "approval_declined"))
+                : decoded.status === "cancelled" &&
+                  decision === "cancelled" &&
+                  (failureCode === "operation_cancelled" || failureCode === "approval_cancelled");
+        if (!validTerminalState) {
+          return yield* failResult("result.state");
+        }
+
+        const reconciliation = decoded.providerReconciliation;
+        const receipt = reconciliation.receipt;
+        let sanitizedReceipt: ProviderReceipt | undefined;
+        if (receipt) {
+          const safeProvider = yield* sanitizeProviderEvidence({
+            transport: receipt.transport,
+            ...(receipt.requestId !== undefined ? { requestId: receipt.requestId } : {}),
+            ...(receipt.providerRequestSha256 !== undefined
+              ? { providerRequestSha256: receipt.providerRequestSha256 }
+              : {}),
+            ...(receipt.responseSha256 !== undefined
+              ? { responseSha256: receipt.responseSha256 }
+              : {}),
+            ...(receipt.status !== undefined ? { status: receipt.status } : {}),
+            observedAt: receipt.observedAt,
+          });
+          if (!safeProvider) {
+            return yield* failResult("result.providerReconciliation.receipt");
+          }
+          sanitizedReceipt = {
+            ...safeProvider,
+            operationRequestSha256: receipt.operationRequestSha256,
+          };
+          if (receipt.operationRequestSha256 !== input.request.requestSha256) {
+            return yield* failResult("result.providerReconciliation.receipt");
+          }
+          if (
+            reconciliation.status === "matched" &&
+            receipt.transport !== input.definition.providerTransport
+          ) {
+            return yield* failResult("result.providerReconciliation.receipt.transport");
+          }
+          if (
+            receipt.responseSha256 !== undefined &&
+            outputSha256 !== null &&
+            receipt.responseSha256 !== outputSha256
+          ) {
+            return yield* failResult("result.providerReconciliation.receipt.responseSha256");
+          }
+        }
+        if (reconciliation.status === "not_attempted" && receipt !== undefined) {
+          return yield* failResult("result.providerReconciliation");
+        }
+        if (reconciliation.status === "matched") {
+          if (
+            input.definition.providerTransport === "none" ||
+            receipt === undefined ||
+            outputSha256 === null ||
+            receipt.responseSha256 !== outputSha256 ||
+            receipt.status === undefined ||
+            receipt.status < 200 ||
+            receipt.status >= 300
+          ) {
+            return yield* failResult("result.providerReconciliation");
+          }
+        }
+        if (
+          decoded.status === "completed" &&
+          (input.definition.providerTransport === "none"
+            ? reconciliation.status !== "not_attempted"
+            : reconciliation.status !== "matched")
+        ) {
+          return yield* failResult("result.providerReconciliation");
+        }
+
+        return {
+          ...decoded,
+          ...(outputPresent ? { output: sanitizedOutput, outputSha256 } : {}),
+          providerReconciliation: sanitizedReceipt
+            ? { ...reconciliation, receipt: sanitizedReceipt }
+            : reconciliation,
+          carrier: input.carrier,
+          approval: { ...decoded.approval, carrier: input.carrier },
+        };
+      });
+
+    const operationTargetPolicy = (
+      target: ToolAddress,
+    ): Effect.Effect<EffectivePolicy, StorageFailure> =>
+      Effect.gen(function* () {
+        const staticEntry = staticTools.get(String(target));
+        if (staticEntry) {
+          const tool = staticToolToTool(staticEntry);
+          const rules = yield* listActivePolicyRuleSet();
+          return yield* resolvePolicyFromRuleSet(
+            normalizedPolicyId(tool),
+            rules,
+            tool.annotations?.requiresApproval,
+          );
+        }
+        const parsed = parseToolAddress(String(target));
+        const rules = yield* listActivePolicyRuleSet();
+        if (!parsed) {
+          return yield* resolvePolicyFromRuleSet(String(target), rules);
+        }
+        const row = yield* core.findFirst("tool", {
+          where: (b: AnyCb) =>
+            b.and(
+              byOwner(parsed.owner)(b),
+              b("integration", "=", String(parsed.integration)),
+              b("connection", "=", String(parsed.connection)),
+              b("name", "=", String(parsed.tool)),
+            ),
+          select: TOOL_INVOCATION_COLUMNS,
+        });
+        let annotations = row
+          ? (decodeJsonColumn(row.annotations) as ToolAnnotations | undefined)
+          : undefined;
+        const runtime = row ? runtimes.get(row.plugin_id) : undefined;
+        if (row && runtime?.plugin.resolveAnnotations) {
+          const resolved = yield* resolveAnnotationsWithReadonlyContext({
+            runtime,
+            integration: parsed.integration,
+            connection: parsed.connection,
+            toolRows: [row],
+          });
+          annotations = resolved[String(parsed.tool)] ?? annotations;
+        }
+        const toolId = `${parsed.integration}.${parsed.owner}.${parsed.connection}.${parsed.tool}`;
+        return yield* resolvePolicyFromRuleSet(toolId, rules, annotations?.requiresApproval);
+      });
+
+    const executeOperation = (
+      request: ExecuteOperationRequest,
+      carrier: ExecuteOperationCarrier,
+    ): Effect.Effect<
+      ExecuteOperationResult,
+      ExecuteOperationError | ExecuteError | StorageFailure
+    > => {
+      type ReservationBinding = {
+        readonly tenant: string;
+        readonly subject: string | null;
+        readonly jobId: string;
+        readonly requestSha256: string;
+        readonly reservationToken: string;
+        readonly request: ExecuteOperationRequest;
+        readonly descriptor: ExecuteOperationDescriptor;
+        readonly definition: ExecuteOperationDefinition;
+        readonly carrier: ExecuteOperationCarrier;
+      };
+      let reservationBinding: ReservationBinding | undefined;
+      let cancellationResultFactory: (() => ExecuteOperationResult) | undefined;
+      let reservationSettled = false;
+
+      return Effect.gen(function* () {
+        if (!operationReplayStore) {
+          return yield* new StorageError({
+            message: "Executor operation replay storage is not configured.",
+            cause: undefined,
+          });
+        }
+        if (!isExecuteOperationCarrier(carrier)) {
+          return yield* new OperationContractError({
+            field: "carrier",
+            reason: "unsupported_carrier",
+          });
+        }
+        // Canonicalize the entire carrier value before the schema decoder reads
+        // any field. This turns proxy/accessor traps into typed contract
+        // failures instead of allowing Schema to invoke a caller-owned getter.
+        const requestSnapshot = yield* canonicalizeOperationValue(request).pipe(
+          Effect.mapError(
+            () => new OperationContractError({ field: "request", reason: "invalid_request" }),
+          ),
+        );
+        const decodedRequest = yield* ExecuteOperationRequestCodec.decode(
+          requestSnapshot.value,
+        ).pipe(
+          Effect.mapError(
+            () => new OperationContractError({ field: "request", reason: "invalid_request" }),
+          ),
+        );
+        // Freeze a strict clone before any schema hook or policy code can see
+        // the request. The exact clone is also the one passed to invocation.
+        const inputSnapshot = yield* canonicalizeOperationValue(decodedRequest.input);
+        const sanitizedRequest: ExecuteOperationRequest = {
+          ...decodedRequest,
+          input: inputSnapshot.value,
+        };
+        const actualRequestSha256 = yield* hashExecuteOperationRequest(sanitizedRequest);
+        if (actualRequestSha256 !== sanitizedRequest.requestSha256) {
+          return yield* new OperationRequestHashMismatchError({
+            expected: sanitizedRequest.requestSha256,
+            actual: actualRequestSha256,
+          });
+        }
+
+        const definition = operationRegistry.get(
+          `${sanitizedRequest.operationKey}@${sanitizedRequest.version}`,
+        );
+        if (!definition) {
+          return yield* new OperationContractError({
+            field: "operationKey",
+            reason: "unsupported_operation",
+          });
+        }
+        const descriptor = yield* deriveOperationDescriptor(definition);
+        if (descriptor.descriptorSha256 !== sanitizedRequest.descriptorSha256) {
+          return yield* new OperationDescriptorMismatchError({
+            expected: descriptor.descriptorSha256,
+            actual: sanitizedRequest.descriptorSha256,
+          });
+        }
+        const validatedInput = yield* validateOperationSchema(
+          definition.inputSchema,
+          inputSnapshot.value,
+          "input",
+        );
+        const executionId = crypto.randomUUID();
+        const startedAt = new Date().toISOString();
+        const approvalSessionId = `approval:${executionId}`;
+        const baseApproval = (
+          policy: EffectivePolicy,
+          decision: ExecuteOperationApproval["decision"],
+          decidedAt?: string,
+        ): ExecuteOperationApproval => ({
+          decision,
+          tenant,
+          executionId,
+          jobId: sanitizedRequest.jobId,
+          operationKey: sanitizedRequest.operationKey,
+          version: sanitizedRequest.version,
+          descriptorSha256: sanitizedRequest.descriptorSha256,
+          requestSha256: sanitizedRequest.requestSha256,
+          target: descriptor.target,
+          providerTransport: definition.providerTransport,
+          carrier,
+          policy: operationPolicy(policy),
+          ...(subject !== null ? { subject: Subject.make(subject) } : {}),
+          sessionId: approvalSessionId,
+          ...(decidedAt !== undefined ? { decidedAt } : {}),
+        });
+        const baseResult = (input: {
+          readonly policy: EffectivePolicy;
+          readonly approval: ExecuteOperationApproval;
+          readonly providerReconciliation: {
+            readonly status: "matched" | "mismatch" | "unavailable" | "not_attempted";
+            readonly receipt?: ProviderReceipt;
+          };
+          readonly status: ExecuteOperationStatus;
+          readonly outputSha256?: string;
+          readonly output?: unknown;
+          readonly failure?: ExecuteOperationFailure;
+        }): ExecuteOperationResult => {
+          const completedAt = new Date().toISOString();
+          return {
+            schemaVersion: "executor.operation.v2",
+            operationKey: sanitizedRequest.operationKey,
+            version: sanitizedRequest.version,
+            jobId: sanitizedRequest.jobId,
+            descriptorSha256: sanitizedRequest.descriptorSha256,
+            requestSha256: sanitizedRequest.requestSha256,
+            carrier,
+            target: descriptor.target,
+            providerTransport: definition.providerTransport,
+            executionId,
+            policy: operationPolicy(input.policy),
+            approval: input.approval,
+            providerReconciliation: input.providerReconciliation,
+            startedAt,
+            completedAt,
+            durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)),
+            status: input.status,
+            outputSha256: input.outputSha256 ?? null,
+            ...(input.output !== undefined ? { output: input.output } : {}),
+            ...(input.failure !== undefined ? { failure: input.failure } : {}),
+          };
+        };
+
+        // Install the conservative terminal result before reserve. The
+        // reserve effect may commit in a durable adapter immediately before
+        // the fiber is interrupted, so acquisition and local ownership are
+        // one uninterruptible scope rather than a racy yield followed by an
+        // assignment.
+        const pendingCancellationPolicy: EffectivePolicy = {
+          action: "block",
+          source: "plugin-default",
+        };
+        cancellationResultFactory = () =>
+          baseResult({
+            policy: pendingCancellationPolicy,
+            approval: baseApproval(
+              pendingCancellationPolicy,
+              "cancelled",
+              new Date().toISOString(),
+            ),
+            providerReconciliation:
+              definition.providerTransport === "none"
+                ? { status: "not_attempted" }
+                : { status: "unavailable" },
+            status: "cancelled",
+            failure: { code: "operation_cancelled", retryable: false },
+          });
+
+        const reservation = yield* Effect.uninterruptible(
+          operationReplayStore
+            .reserve({
+              tenant,
+              subject: subject ?? undefined,
+              jobId: sanitizedRequest.jobId,
+              requestSha256: sanitizedRequest.requestSha256,
+            })
+            .pipe(
+              Effect.tap((candidate) => {
+                if (candidate.status !== "reserved") return Effect.void;
+                reservationBinding = {
+                  tenant,
+                  subject,
+                  jobId: sanitizedRequest.jobId,
+                  requestSha256: sanitizedRequest.requestSha256,
+                  reservationToken: candidate.reservationToken,
+                  request: sanitizedRequest,
+                  descriptor,
+                  definition,
+                  carrier,
+                };
+                return Effect.void;
+              }),
+            ),
+        );
+        if (reservation.status === "replay") {
+          return yield* validateAndRebindOperationResult({
+            raw: reservation.result,
+            request: sanitizedRequest,
+            descriptor,
+            definition,
+            tenant,
+            subject,
+            carrier,
+          });
+        }
+        if (reservation.status === "conflict") {
+          return yield* new OperationRequestHashMismatchError({
+            expected: reservation.requestSha256,
+            actual: sanitizedRequest.requestSha256,
+          });
+        }
+        if (reservation.status === "in_progress") {
+          return yield* new OperationContractError({
+            field: "jobId",
+            reason: "replay_in_progress",
+          });
+        }
+        const reservationToken = reservation.reservationToken;
+        const policy = yield* operationTargetPolicy(descriptor.target);
+        const approvalContext: ExecuteOperationApprovalContext = {
+          tenant,
+          executionId,
+          jobId: sanitizedRequest.jobId,
+          operationKey: sanitizedRequest.operationKey,
+          version: sanitizedRequest.version,
+          requestSha256: sanitizedRequest.requestSha256,
+          descriptorSha256: sanitizedRequest.descriptorSha256,
+          target: descriptor.target,
+          providerTransport: definition.providerTransport,
+          carrier,
+          policy: operationPolicy(policy),
+          ...(subject !== null ? { subject } : {}),
+          sessionId: approvalSessionId,
+        };
+        cancellationResultFactory = () =>
+          baseResult({
+            policy,
+            approval: baseApproval(policy, "cancelled", new Date().toISOString()),
+            providerReconciliation:
+              definition.providerTransport === "none"
+                ? { status: "not_attempted" }
+                : { status: "unavailable" },
+            status: "cancelled",
+            failure: { code: "operation_cancelled", retryable: false },
+          });
+        let result: ExecuteOperationResult | undefined;
+        let approvalSatisfied = false;
+        if (policy.action === "block") {
+          result = baseResult({
+            policy,
+            approval: baseApproval(policy, "not_required", new Date().toISOString()),
+            providerReconciliation: { status: "not_attempted" },
+            status: "blocked",
+            failure: { code: "policy_blocked", retryable: false },
+          });
+        } else {
+          if (policy.action === "require_approval") {
+            // Generic elicitation (including the test/local `accept-all`
+            // sentinel) is not an operation grant. A host must bind the
+            // complete execution identity through an explicit adapter, or we
+            // fail closed before credential resolution/provider invocation.
+            if (!config.operationApproval) {
+              result = baseResult({
+                policy,
+                approval: baseApproval(policy, "declined", new Date().toISOString()),
+                providerReconciliation: { status: "not_attempted" },
+                status: "blocked",
+                failure: { code: "approval_handler_required", retryable: false },
+              });
+            } else {
+              const approvalEffect = yield* Effect.try({
+                try: () => config.operationApproval!(approvalContext),
+                catch: () =>
+                  new OperationContractError({
+                    field: "approval.handler",
+                    reason: "invalid_value",
+                  }),
+              });
+              if (!Effect.isEffect(approvalEffect)) {
+                return yield* new OperationContractError({
+                  field: "approval.handler",
+                  reason: "invalid_value",
+                });
+              }
+              const decision = yield* approvalEffect.pipe(
+                Effect.catchCause(() =>
+                  Effect.fail(
+                    new OperationContractError({
+                      field: "approval.handler",
+                      reason: "invalid_value",
+                    }),
+                  ),
+                ),
+              );
+              if (!isExecuteOperationApprovalDecision(decision)) {
+                return yield* new OperationContractError({
+                  field: "approval.decision",
+                  reason: "invalid_value",
+                });
+              }
+              if (decision !== "approved") {
+                result = baseResult({
+                  policy,
+                  approval: baseApproval(policy, decision, new Date().toISOString()),
+                  providerReconciliation: { status: "not_attempted" },
+                  status: decision === "cancelled" ? "cancelled" : "blocked",
+                  failure: {
+                    code: decision === "cancelled" ? "approval_cancelled" : "approval_declined",
+                    retryable: false,
+                  },
+                });
+              } else {
+                approvalSatisfied = true;
+              }
+            }
+          }
+        }
+        if (result === undefined) {
+          const internalContext: InternalOperationContext = {
+            executionId,
+            jobId: sanitizedRequest.jobId,
+            requestSha256: sanitizedRequest.requestSha256,
+            approvalSatisfied,
+          };
+          const invocation = yield* executeInternal(descriptor.target, validatedInput, undefined, {
+            policy,
+            operation: internalContext,
+          }).pipe(
+            Effect.match({
+              onFailure: (error) => ({ failed: true as const, error }),
+              onSuccess: (value) => ({ failed: false as const, value }),
+            }),
+          );
+          if (invocation.failed) {
+            const error = invocation.error;
+            const errorStatus = safeStatus(error);
+            const errorTag =
+              typeof error === "object" && error !== null ? dataProperty(error, "_tag") : undefined;
+            const declined = errorTag === "ElicitationDeclinedError";
+            const blocked = errorTag === "ToolBlockedError";
+            const action =
+              typeof error === "object" && error !== null
+                ? dataProperty(error, "action")
+                : undefined;
+            const declinedAction =
+              declined && (action === "decline" || action === "cancel") ? action : undefined;
+            // Elicitation inside an already-reviewed operation is a
+            // plugin/runtime interaction, not a second authorization grant.
+            // Keep the bound policy decision intact so a plugin decline cannot
+            // manufacture an impossible allow+declined or approved+failed
+            // receipt. A cancel is an operation cancellation; a plain decline
+            // is an ordinary opaque operation failure.
+            const approvalDecision =
+              policy.action === "require_approval" ? "approved" : "not_required";
+            result = baseResult({
+              policy,
+              approval: baseApproval(policy, approvalDecision, new Date().toISOString()),
+              providerReconciliation: { status: "unavailable" },
+              status: declined && declinedAction === "cancel" ? "cancelled" : "failed",
+              failure: {
+                code:
+                  declined && declinedAction === "cancel"
+                    ? "operation_cancelled"
+                    : safeFailureCode(error),
+                ...(errorStatus !== undefined ? { status: errorStatus } : {}),
+                retryable: !blocked && !declined,
+              },
+            });
+          } else {
+            const value = invocation.value.value;
+            const providerEvidence = yield* sanitizeProviderEvidence(invocation.value.provider);
+            const providerReconciliation = reconcileProvider({
+              expectedTransport: definition.providerTransport,
+              evidence: providerEvidence,
+              requestSha256: sanitizedRequest.requestSha256,
+            });
+            const toolResult = safeToolResultProjection(value);
+            if (toolResult?.ok === "invalid") {
+              return yield* new OperationContractError({
+                field: "output",
+                reason: "invalid_value",
+              });
+            }
+            if (toolResult?.ok === false) {
+              const error = safeToolError(toolResult.error);
+              const errorStatus = safeStatus(error);
+              result = baseResult({
+                policy,
+                approval: baseApproval(policy, invocation.value.approval, new Date().toISOString()),
+                providerReconciliation,
+                status: "failed",
+                failure: {
+                  code: safeFailureCode(error.code ?? "operation_failed"),
+                  ...(errorStatus !== undefined ? { status: errorStatus } : {}),
+                  ...(error.retryable !== undefined ? { retryable: error.retryable } : {}),
+                },
+              });
+            } else {
+              const publicValue = toolResult?.ok === true ? toolResult.data : value;
+              const output = yield* validateOperationSchema(
+                definition.outputSchema,
+                publicValue,
+                "output",
+              ).pipe(
+                Effect.match({
+                  onFailure: () => ({ ok: false as const }),
+                  onSuccess: (sanitizedOutput) => ({ ok: true as const, sanitizedOutput }),
+                }),
+              );
+              if (!output.ok) {
+                result = baseResult({
+                  policy,
+                  approval: baseApproval(
+                    policy,
+                    invocation.value.approval,
+                    new Date().toISOString(),
+                  ),
+                  providerReconciliation,
+                  status: "failed",
+                  failure: { code: "output_schema_invalid", retryable: false },
+                });
+              } else {
+                const outputSha256 = yield* hashOperationValue(output.sanitizedOutput).pipe(
+                  Effect.match({
+                    onFailure: () => undefined,
+                    onSuccess: (hash) => hash,
+                  }),
+                );
+                const reconciled = reconcileProvider({
+                  expectedTransport: definition.providerTransport,
+                  evidence: providerEvidence,
+                  requestSha256: sanitizedRequest.requestSha256,
+                  outputSha256,
+                });
+                const providerFailure: ExecuteOperationFailure | undefined =
+                  reconciled.status === "matched" || reconciled.status === "not_attempted"
+                    ? undefined
+                    : {
+                        code:
+                          reconciled.status === "mismatch"
+                            ? "provider_receipt_mismatch"
+                            : "provider_receipt_unavailable",
+                        retryable: reconciled.status === "unavailable",
+                      };
+                result = baseResult({
+                  policy,
+                  approval: baseApproval(
+                    policy,
+                    invocation.value.approval,
+                    new Date().toISOString(),
+                  ),
+                  providerReconciliation: reconciled,
+                  status: providerFailure ? "failed" : "completed",
+                  outputSha256: providerFailure ? undefined : outputSha256,
+                  output: providerFailure ? undefined : output.sanitizedOutput,
+                  failure: providerFailure,
+                });
+              }
+            }
+          }
+        }
+        if (result === undefined) {
+          return yield* new OperationContractError({ field: "result", reason: "invalid_value" });
+        }
+        const validatedResult = yield* validateAndRebindOperationResult({
+          raw: result,
+          request: sanitizedRequest,
+          descriptor,
+          definition,
+          tenant,
+          subject,
+          carrier,
+        });
+        const settleStatus = yield* operationReplayStore.settle({
+          tenant,
+          subject: subject ?? undefined,
+          jobId: sanitizedRequest.jobId,
+          requestSha256: sanitizedRequest.requestSha256,
+          reservationToken,
+          result: validatedResult,
+        });
+        if (settleStatus !== "settled") {
+          return yield* new OperationContractError({
+            field: "reservation",
+            reason: "stale_reservation",
+          });
+        }
+        reservationSettled = true;
+        return validatedResult;
+      }).pipe(
+        // Never let an adapter/plugin defect carry provider-owned data into
+        // an observer. Typed failures retain their contract identity; defects
+        // become an opaque contract error and the finalizer still settles the
+        // reservation below.
+        Effect.catchCause((cause) =>
+          Cause.hasDies(cause)
+            ? Effect.fail(
+                new OperationContractError({ field: "execution", reason: "invalid_value" }),
+              )
+            : Effect.failCause(cause),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            const binding = reservationBinding;
+            const makeCancelled = cancellationResultFactory;
+            const store = operationReplayStore;
+            if (!binding || !makeCancelled || !store || reservationSettled) return Effect.void;
+            return validateAndRebindOperationResult({
+              raw: makeCancelled(),
+              request: binding.request,
+              descriptor: binding.descriptor,
+              definition: binding.definition,
+              tenant: binding.tenant,
+              subject: binding.subject,
+              carrier: binding.carrier,
+            }).pipe(
+              Effect.flatMap((result) =>
+                store
+                  .settle({
+                    tenant: binding.tenant,
+                    subject: binding.subject ?? undefined,
+                    jobId: binding.jobId,
+                    requestSha256: binding.requestSha256,
+                    reservationToken: binding.reservationToken,
+                    result,
+                  })
+                  .pipe(
+                    Effect.tap((status) => {
+                      if (status === "settled") reservationSettled = true;
+                      return Effect.void;
+                    }),
+                    Effect.asVoid,
+                  ),
+              ),
+              Effect.ignore,
+            );
+          }).pipe(
+            Effect.flatten,
+            Effect.uninterruptible,
+            Effect.catchCause(() => Effect.void),
+          ),
+        ),
+      );
+    };
+
+    // ------------------------------------------------------------------
     // close
     // ------------------------------------------------------------------
 
@@ -4101,6 +5537,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         resolve: policiesResolve,
       },
       execute,
+      operationExecutionAvailable,
+      executeOperation,
       close,
     };
 
