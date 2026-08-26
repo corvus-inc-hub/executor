@@ -374,6 +374,57 @@ export {
   type ToolHttpMeta,
 } from "./tool-result";
 
+// Connection catalog census is a server-owned, hash-only catalog proof. The
+// finalizer and hash helpers are public contract utilities; raw validation
+// helpers remain private to the module boundary.
+export {
+  CONNECTION_CATALOG_CENSUS_MAX_CANONICAL_BYTES,
+  CONNECTION_CATALOG_CENSUS_MAX_DESCRIPTORS,
+  CONNECTION_CATALOG_CENSUS_MAX_DESCRIPTORS_PER_PAGE,
+  CONNECTION_CATALOG_CENSUS_MAX_DESCRIPTOR_BYTES,
+  CONNECTION_CATALOG_CENSUS_MAX_PAGES,
+  CONNECTION_CATALOG_CENSUS_MAX_STRING_BYTES,
+  CONNECTION_CATALOG_CENSUS_OPERATION_KEY,
+  CONNECTION_CATALOG_CENSUS_OPERATION_VERSION,
+  CONNECTION_CATALOG_CENSUS_REQUEST_SCHEMA_VERSION,
+  CONNECTION_CATALOG_CENSUS_RESULT_SCHEMA_VERSION,
+  CONNECTION_CATALOG_CENSUS_TARGET,
+  ConnectionCatalogCensusDescriptor,
+  ConnectionCatalogCensusError,
+  ConnectionCatalogCensusFailureReason,
+  ConnectionCatalogCensusInput,
+  ConnectionCatalogCensusOwner,
+  ConnectionCatalogCensusRequest,
+  ConnectionCatalogCensusResult,
+  ConnectionCatalogCensusTransport,
+  canonicalizeConnectionCatalogValue,
+  finalizeConnectionCatalogCensus,
+  hashConnectionCatalogBinding,
+  hashConnectionCatalogValue,
+  type ConnectionCatalogCanonicalSnapshot,
+  type ConnectionCatalogCensusBinding,
+  type ConnectionCatalogCensusDescriptorInput,
+  type ConnectionCatalogCensusFailureReason as ConnectionCatalogCensusFailureReasonV1,
+  type ConnectionCatalogCensusPage,
+  type ConnectionCatalogCensusSource,
+  type ConnectionCatalogCensusResult as ConnectionCatalogCensusResultV1,
+  type ConnectionCatalogCensusTransport as ConnectionCatalogCensusTransportV1,
+  type ConnectionCatalogCensusOwner as ConnectionCatalogCensusOwnerV1,
+  type ConnectionCatalogCensusRequest as ConnectionCatalogCensusRequestV1,
+  type ConnectionCatalogCensusInput as ConnectionCatalogCensusInputV1,
+  type ConnectionCatalogCensusDescriptor as ConnectionCatalogCensusDescriptorV1,
+} from "./connection-catalog-census";
+
+// Deterministic, credential-free census conformance fixture. This is test
+// data only and does not register or implement a provider operation.
+export {
+  CONNECTION_CATALOG_CENSUS_GOLDEN_BINDING,
+  CONNECTION_CATALOG_CENSUS_GOLDEN_OBSERVED_AT,
+  CONNECTION_CATALOG_CENSUS_GOLDEN_REQUEST,
+  CONNECTION_CATALOG_CENSUS_GOLDEN_RESULT,
+  CONNECTION_CATALOG_CENSUS_GOLDEN_SOURCE,
+} from "./connection-catalog-census-fixtures";
+
 // Stamped boot-time data-migration ledger for the libSQL-backed apps.
 export {
   DataMigrationError,
