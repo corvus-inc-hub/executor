@@ -1,4 +1,4 @@
-import { createHmac, createSecretKey, type KeyObject, timingSafeEqual } from "node:crypto";
+import { createHmac, createSecretKey, timingSafeEqual } from "node:crypto";
 
 import { Effect } from "effect";
 
@@ -18,8 +18,8 @@ const CLOCK_SKEW_MS = 5_000;
 
 type OAuthCorrelationConfig = {
   readonly audience: string;
-  readonly key: KeyObject;
   readonly keyId: string;
+  readonly sign: (payload: string) => Buffer;
 };
 
 const storageFailure = (message: string) => new StorageError({ message, cause: null });
@@ -43,15 +43,16 @@ export const loadOAuthCorrelationConfig = (
     // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: process configuration is synchronously loaded while the host Layer boots
     throw storageFailure("OAuth correlation key is too short.");
   }
-  return { audience, key: createSecretKey(Buffer.from(key, "utf8")), keyId };
+  const signingKey = createSecretKey(Buffer.from(key, "utf8"));
+  return {
+    audience,
+    keyId,
+    sign: (payload) => createHmac("sha256", signingKey).update(payload).digest(),
+  };
 };
 
 const signatureFor = (envelope: OAuthCorrelationEnvelope, config: OAuthCorrelationConfig): Buffer =>
-  createHmac("sha256", config.key)
-    .update(config.audience)
-    .update("\0")
-    .update(canonicalOAuthCorrelationEnvelopePayload(envelope))
-    .digest();
+  config.sign(`${config.audience}\0${canonicalOAuthCorrelationEnvelopePayload(envelope)}`);
 
 const verifyEnvelope = (
   envelope: OAuthCorrelationEnvelope,
