@@ -1,4 +1,12 @@
-import { Effect, Match, Option, Predicate, Schema, SchemaIssue } from "effect";
+import {
+  Effect,
+  Match,
+  Option,
+  Predicate,
+  Schema,
+  SchemaIssue,
+  SchemaTransformation,
+} from "effect";
 
 /** Fixed, server-owned operation identity. */
 export const CONNECTION_CATALOG_CENSUS_OPERATION_KEY =
@@ -199,16 +207,18 @@ const strictStandardSchema = <S extends Schema.Decoder<unknown, never>>(
     }),
   );
   const strictBase = Schema.decodeTo(base)(exactObject);
+  const structuralSchema = Schema.toType(base);
   const safeSchema = Schema.declareConstructor<S["Type"], unknown>()(
-    [],
+    [structuralSchema],
     () => (input, _self, options) =>
       Schema.decodeUnknownEffect(strictBase)(input, {
         ...options,
         onExcessProperty: "error",
-      }).pipe(
-        Effect.map((value) => Option.some(value)),
-        Effect.mapError(safeSchemaIssue),
-      ),
+      }).pipe(Effect.mapError(safeSchemaIssue)),
+    {
+      toCodec: ([structuralSchema]) =>
+        Schema.link<S["Type"]>()(structuralSchema, SchemaTransformation.passthrough<S["Type"]>()),
+    },
   );
   return Schema.toStandardSchemaV1(safeSchema, {
     parseOptions: { onExcessProperty: "error" },

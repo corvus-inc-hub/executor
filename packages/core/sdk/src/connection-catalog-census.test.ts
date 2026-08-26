@@ -1346,6 +1346,15 @@ describe("connection catalog census finalizer", () => {
         source: source(),
         observedAt,
       });
+      const requestEffect = yield* Schema.decodeUnknownEffect(ConnectionCatalogCensusRequest)(
+        REQUEST,
+      );
+      const descriptorEffect = yield* Schema.decodeUnknownEffect(ConnectionCatalogCensusDescriptor)(
+        finalized.descriptors[0],
+      );
+      const resultEffect = yield* Schema.decodeUnknownEffect(ConnectionCatalogCensusResult)(
+        finalized,
+      );
       const requestValidation = yield* Effect.promise(() =>
         Promise.resolve(ConnectionCatalogCensusRequest["~standard"].validate(REQUEST)),
       );
@@ -1357,11 +1366,143 @@ describe("connection catalog census finalizer", () => {
       const resultValidation = yield* Effect.promise(() =>
         Promise.resolve(ConnectionCatalogCensusResult["~standard"].validate(finalized)),
       );
-      expect("issues" in requestValidation).toBe(false);
-      expect("issues" in descriptorValidation).toBe(false);
-      expect("issues" in resultValidation).toBe(false);
+      expect(requestEffect).toEqual(REQUEST);
+      expect(descriptorEffect).toEqual(finalized.descriptors[0]);
+      expect(resultEffect).toEqual(finalized);
+      expect(requestValidation).toEqual({ value: REQUEST });
+      expect(descriptorValidation).toEqual({ value: finalized.descriptors[0] });
+      expect(resultValidation).toEqual({ value: finalized });
     }),
   );
+
+  it("preserves structural JSON Schema documents for every public schema", () => {
+    const requestDocument = Schema.toJsonSchemaDocument(ConnectionCatalogCensusRequest);
+    const descriptorDocument = Schema.toJsonSchemaDocument(ConnectionCatalogCensusDescriptor);
+    const resultDocument = Schema.toJsonSchemaDocument(ConnectionCatalogCensusResult);
+
+    expect(requestDocument).toMatchObject({
+      schema: { $ref: "#/$defs/ConnectionCatalogCensusRequestV1" },
+      definitions: {
+        ConnectionCatalogCensusRequestV1: {
+          type: "object",
+          properties: {
+            schemaVersion: { type: "string" },
+            connectionAddress: { type: "string" },
+            expectedIntegration: { type: "string" },
+            expectedCredentialProvider: { type: "string" },
+            refresh: { type: "boolean" },
+          },
+          required: [
+            "schemaVersion",
+            "connectionAddress",
+            "expectedIntegration",
+            "expectedCredentialProvider",
+            "refresh",
+          ],
+          additionalProperties: false,
+        },
+      },
+    });
+    expect(descriptorDocument).toMatchObject({
+      schema: { $ref: "#/$defs/ConnectionCatalogCensusDescriptorV1" },
+      definitions: {
+        ConnectionCatalogCensusDescriptorV1: {
+          type: "object",
+          properties: {
+            address: { type: "string" },
+            name: { type: "string" },
+            descriptionSha256: { $ref: "#/$defs/ConnectionCatalogCensusSha256" },
+            annotationsSha256: { $ref: "#/$defs/ConnectionCatalogCensusSha256" },
+            inputSchemaSha256: { $ref: "#/$defs/ConnectionCatalogCensusSha256" },
+            outputSchemaSha256: { $ref: "#/$defs/ConnectionCatalogCensusSha256" },
+            definitionsSha256: { $ref: "#/$defs/ConnectionCatalogCensusSha256" },
+            descriptorSha256: { $ref: "#/$defs/ConnectionCatalogCensusSha256" },
+          },
+          required: [
+            "address",
+            "name",
+            "descriptionSha256",
+            "annotationsSha256",
+            "inputSchemaSha256",
+            "outputSchemaSha256",
+            "definitionsSha256",
+            "descriptorSha256",
+          ],
+          additionalProperties: false,
+        },
+      },
+    });
+    expect(resultDocument).toMatchObject({
+      schema: { $ref: "#/$defs/ConnectionCatalogCensusResultV1" },
+      definitions: {
+        ConnectionCatalogCensusDescriptorV1: {
+          type: "object",
+          properties: {
+            address: { type: "string" },
+            name: { type: "string" },
+            descriptorSha256: { $ref: "#/$defs/ConnectionCatalogCensusSha256" },
+          },
+          required: [
+            "address",
+            "name",
+            "descriptionSha256",
+            "annotationsSha256",
+            "inputSchemaSha256",
+            "outputSchemaSha256",
+            "definitionsSha256",
+            "descriptorSha256",
+          ],
+          additionalProperties: false,
+        },
+        ConnectionCatalogCensusResultV1: {
+          type: "object",
+          properties: {
+            schemaVersion: { type: "string" },
+            address: { type: "string" },
+            owner: { type: "string" },
+            integration: { type: "string" },
+            name: { type: "string" },
+            credentialProvider: { type: "string" },
+            bindingSha256: { $ref: "#/$defs/ConnectionCatalogCensusSha256" },
+            sourceTransport: { type: "string" },
+            complete: { type: "boolean" },
+            observedAt: { $ref: "#/$defs/ConnectionCatalogCensusTimestamp" },
+            sourcePageCount: { type: "integer" },
+            sourceTerminalCursor: { type: "null" },
+            toolCount: { type: "integer" },
+            descriptors: {
+              type: "array",
+              items: { $ref: "#/$defs/ConnectionCatalogCensusDescriptorV1" },
+            },
+            descriptorHashes: {
+              type: "array",
+              items: { $ref: "#/$defs/ConnectionCatalogCensusSha256" },
+            },
+            catalogSha256: { $ref: "#/$defs/ConnectionCatalogCensusSha256" },
+          },
+          required: [
+            "schemaVersion",
+            "address",
+            "owner",
+            "integration",
+            "name",
+            "credentialProvider",
+            "bindingSha256",
+            "sourceTransport",
+            "complete",
+            "observedAt",
+            "sourcePageCount",
+            "sourceTerminalCursor",
+            "toolCount",
+            "descriptors",
+            "descriptorHashes",
+            "catalogSha256",
+          ],
+          additionalProperties: false,
+        },
+      },
+    });
+  });
 
   it.effect("rejects malformed public hashes", () =>
     Effect.gen(function* () {
