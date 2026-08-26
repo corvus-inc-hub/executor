@@ -22,23 +22,34 @@ import {
 export { OAUTH_POPUP_MESSAGE_TYPE, isOAuthPopupResult } from "@executor-js/sdk";
 export type { OAuthPopupResult } from "@executor-js/sdk";
 
-const sanitizePopupBoundaryText = (value: string, max = 240): string => {
-  const withoutUrls = value.replaceAll(/https?:\/\/[^\s)]+/gi, (raw) => {
-    const candidate = raw.replace(/[.,;]+$/g, "");
-    if (!URL.canParse(candidate)) return "[url]";
-    const parsed = new URL(candidate);
-    return `${parsed.origin}${parsed.pathname}`;
-  });
-  const redacted = withoutUrls
-    .replaceAll(/Bearer\s+[^\s,;]+/gi, "Bearer [redacted]")
-    .replaceAll(
-      /((?:access_token|refresh_token|id_token|client_secret|client_id|code|token|secret|password)[=:]\s*)[^\s&,;)}]+/gi,
-      "$1[redacted]",
-    )
-    .replaceAll(/\p{Cc}/gu, " ")
-    .replaceAll(/\s+/g, " ")
-    .trim();
-  return redacted.length > max ? `${redacted.slice(0, max)}...` : redacted;
+const SAFE_OAUTH_PROVIDER_ERROR_CODES = new Set([
+  "access_denied",
+  "authorization_pending",
+  "expired_token",
+  "invalid_client",
+  "invalid_client_metadata",
+  "invalid_grant",
+  "invalid_request",
+  "invalid_redirect_uri",
+  "invalid_scope",
+  "invalid_software_statement",
+  "server_error",
+  "slow_down",
+  "temporarily_unavailable",
+  "unauthorized_client",
+  "unapproved_software_statement",
+  "unsupported_grant_type",
+  "unsupported_response_type",
+]);
+
+/** Reduce callback diagnostics to fixed evidence without importing SDK host
+ * internals into the browser-facing API dependency graph. */
+const sanitizePopupBoundaryText = (value: string): string => {
+  const tokens = value.toLowerCase().match(/[a-z][a-z0-9_]{2,63}/g) ?? [];
+  const providerCode = tokens.find((token) => SAFE_OAUTH_PROVIDER_ERROR_CODES.has(token));
+  if (providerCode) return providerCode;
+  const status = /\bHTTP\s+([1-5]\d{2})\b/i.exec(value)?.[1];
+  return status ? `http_${status}` : "oauth_failure";
 };
 
 // ---------------------------------------------------------------------------
@@ -237,8 +248,8 @@ export const runOAuthCallback = <TAuth, E, R>(
 
   return result.pipe(
     Effect.catchCause((cause) => {
-      const { short, details } = input.toErrorMessage(Cause.squash(cause));
-      const safeShort = sanitizePopupBoundaryText(short);
+      const { details } = input.toErrorMessage(Cause.squash(cause));
+      const safeShort = "OAuth completion failed";
       const safeDetails = details === undefined ? undefined : sanitizePopupBoundaryText(details);
       return Effect.succeed<OAuthPopupResult<TAuth>>({
         type: OAUTH_POPUP_MESSAGE_TYPE,

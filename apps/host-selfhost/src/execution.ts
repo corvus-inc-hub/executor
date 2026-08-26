@@ -54,6 +54,9 @@ export const SelfHostHostConfig: Layer.Layer<HostConfig> = Layer.sync(HostConfig
     allowLocalNetwork: config.allowLocalNetwork,
     webBaseUrl: config.webBaseUrl,
     oauthCallbackPath: "/api/oauth/callback",
+    // Self-host has no authoritative Workspace signer yet. Keep browser OAuth
+    // closed rather than accepting caller-asserted tenant/actor/workspace data.
+    requireOAuthCorrelation: true,
   };
 });
 

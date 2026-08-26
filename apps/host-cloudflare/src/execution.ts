@@ -51,6 +51,9 @@ export const makeCloudflareHostConfig = (config: CloudflareConfig): Layer.Layer<
     allowLocalNetwork: config.allowLocalNetwork,
     webBaseUrl: config.webBaseUrl,
     oauthCallbackPath: "/api/oauth/callback",
+    // The Worker host has no authoritative Workspace signer/verifier yet.
+    // Keep browser OAuth unavailable instead of accepting unsigned state.
+    requireOAuthCorrelation: true,
   });
 
 /**

@@ -288,7 +288,9 @@ describe("exchangeAuthorizationCode", () => {
       );
       expect(Exit.isFailure(exit)).toBe(true);
       if (!Exit.isFailure(exit)) return;
-      expect(JSON.stringify(exit.cause)).toContain("Token URL must use https: or loopback http:");
+      const failure = JSON.stringify(exit.cause);
+      expect(failure).toContain("oauth_failure");
+      expect(failure).not.toContain("example.com/token");
     }),
   );
 
@@ -511,7 +513,7 @@ describe("exchangeAuthorizationCode", () => {
           const failure = JSON.stringify(exit.cause);
           expect(failure).toContain("OAuth2Error");
           expect(failure).toContain("invalid_grant");
-          expect(failure).toContain("authorization code expired");
+          expect(failure).not.toContain("authorization code expired");
         }),
     ),
   );
@@ -603,7 +605,7 @@ describe("exchangeAuthorizationCode", () => {
     }),
   );
 
-  it.effect("propagates RFC 6749 error_description text in the OAuth2Error", () =>
+  it.effect("keeps the RFC code but drops provider error_description text", () =>
     withTokenEndpoint(
       () =>
         json(400, {
@@ -623,12 +625,14 @@ describe("exchangeAuthorizationCode", () => {
           );
           expect(Exit.isFailure(exit)).toBe(true);
           if (!Exit.isFailure(exit)) return;
-          expect(JSON.stringify(exit.cause)).toContain("Code expired");
+          const failure = JSON.stringify(exit.cause);
+          expect(failure).toContain("invalid_grant");
+          expect(failure).not.toContain("Code expired");
         }),
     ),
   );
 
-  it.effect("includes HTTP status and body preview for non-OAuth token endpoint errors", () =>
+  it.effect("includes only fixed HTTP status evidence for non-OAuth token errors", () =>
     withTokenEndpoint(
       () => HttpServerResponse.text("route not found", { status: 404 }),
       ({ tokenUrl }) =>
@@ -645,13 +649,13 @@ describe("exchangeAuthorizationCode", () => {
           expect(Exit.isFailure(exit)).toBe(true);
           if (!Exit.isFailure(exit)) return;
           const failure = JSON.stringify(exit.cause);
-          expect(failure).toContain("HTTP 404");
-          expect(failure).toContain("route not found");
+          expect(failure).toContain("http_404");
+          expect(failure).not.toContain("route not found");
         }),
     ),
   );
 
-  it.effect("preserves provider error codes while redacting token endpoint secrets", () =>
+  it.effect("drops non-standard provider details and token endpoint secrets", () =>
     withTokenEndpoint(
       () =>
         json(400, {
@@ -675,10 +679,10 @@ describe("exchangeAuthorizationCode", () => {
           expect(Exit.isFailure(exit)).toBe(true);
           if (!Exit.isFailure(exit)) return;
           const failure = JSON.stringify(exit.cause);
-          expect(failure).toContain("invalid_client_id");
-          expect(failure).toContain("Invalid client_id");
-          expect(failure).toContain("client_secret");
-          expect(failure).toContain("[redacted]");
+          expect(failure).toContain("oauth_failure");
+          expect(failure).not.toContain("invalid_client_id");
+          expect(failure).not.toContain("Invalid client_id");
+          expect(failure).not.toContain("client_secret");
           expect(failure).not.toContain("do-not-log");
         }),
     ),
@@ -686,15 +690,26 @@ describe("exchangeAuthorizationCode", () => {
 });
 
 describe("OAuth boundary diagnostics", () => {
-  it("removes provider query material, bearer values, control text, and truncates", () => {
-    const output = sanitizeOAuthBoundaryText(
-      "https://provider.example/callback?client_secret=secret-123&code=one-time Bearer bearer-secret\nstack=token-value",
+  it("reduces arbitrary provider diagnostics to fixed allowlisted evidence", () => {
+    const samples = [
+      "https://user:pass@provider.example/secret-path/tenant-42?token=query-secret",
+      "Error: provider exploded at /srv/private/client-secret-file.ts:42:7 api_key=api-secret",
+      '{"secret":"json-secret","authorization":"Basic basic-secret"}',
+    ];
+    expect(samples.map((sample) => sanitizeOAuthBoundaryText(sample))).toEqual([
+      "oauth_failure",
+      "oauth_failure",
+      "oauth_failure",
+    ]);
+  });
+
+  it("preserves only fixed RFC OAuth codes and bounded HTTP status evidence", () => {
+    expect(sanitizeOAuthBoundaryText("invalid_grant: authorization code expired")).toBe(
+      "invalid_grant",
     );
-    expect(output).not.toContain("secret-123");
-    expect(output).not.toContain("one-time");
-    expect(output).not.toContain("bearer-secret");
-    expect(output).toContain("https://provider.example/callback");
-    expect(output).not.toContain("\n");
+    expect(sanitizeOAuthBoundaryText("HTTP 401 from https://provider.example/private/token")).toBe(
+      "http_401",
+    );
   });
 });
 
@@ -753,7 +768,9 @@ describe("exchangeClientCredentials", () => {
       );
       expect(Exit.isFailure(exit)).toBe(true);
       if (!Exit.isFailure(exit)) return;
-      expect(JSON.stringify(exit.cause)).toContain("Token URL must use https: or loopback http:");
+      const failure = JSON.stringify(exit.cause);
+      expect(failure).toContain("oauth_failure");
+      expect(failure).not.toContain("example.com/token");
     }),
   );
 });

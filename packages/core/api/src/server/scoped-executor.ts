@@ -40,6 +40,7 @@ import {
   Tenant,
   type AnyPlugin,
   type Executor,
+  type OAuthCorrelationAuthority,
   type OAuthCorrelationVerifier,
   type StorageFailure,
 } from "@executor-js/sdk";
@@ -82,7 +83,12 @@ export interface HostConfigShape {
   readonly oauthCallbackPath: string;
   /** Host signer/verifier for the versioned OAuth correlation envelope. */
   readonly verifyOAuthCorrelation?: OAuthCorrelationVerifier;
-  /** Production UI readiness gate; absent/false keeps SDK test/CLI behavior. */
+  /** Product-host authority for minting browser envelopes and verifying them
+   * at this Executor boundary. The verifier is used here; the signer is
+   * exposed to the product's authenticated Workspace route. */
+  readonly oauthCorrelationAuthority?: OAuthCorrelationAuthority;
+  /** Hosted authorization-code readiness gate. The shared host boundary
+   * defaults this to true; only direct SDK/CLI construction may opt out. */
   readonly requireOAuthCorrelation?: boolean;
   /**
    * Whether Executor's built-in agent tools should expose credential provider
@@ -280,8 +286,9 @@ export const makeScopedExecutor = <
       onElicitation: "accept-all",
       redirectUri,
       oauthCallbackStateOrgSlug: orgSlug,
-      verifyOAuthCorrelation: config.verifyOAuthCorrelation,
-      requireOAuthCorrelation: config.requireOAuthCorrelation,
+      verifyOAuthCorrelation:
+        config.oauthCorrelationAuthority?.verify ?? config.verifyOAuthCorrelation,
+      requireOAuthCorrelation: config.requireOAuthCorrelation ?? true,
       coreTools: {
         webBaseUrl,
         orgSlug,

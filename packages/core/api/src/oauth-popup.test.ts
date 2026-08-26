@@ -317,10 +317,33 @@ describe("runOAuthCallback", () => {
     expect(html).toContain("<title>Connection failed</title>");
     expect(html).toContain("OAuth provider rejected authorization");
     expect(html).toContain("invalid_scope");
-    expect(html).toContain("unknown scope wizard_session:write");
+    expect(html).not.toContain("unknown scope wizard_session:write");
   });
 
-  it("renders a failure popup when completeOAuth fails and uses toErrorMessage", async () => {
+  it("does not render provider URLs, stack paths, or secret-shaped diagnostics", async () => {
+    const sentinels = [
+      "https://provider.example/private/tenant-42?token=query-secret",
+      "/srv/private/oauth-client.ts:42:7",
+      "api_key=api-secret",
+      '"authorization":"Basic basic-secret"',
+    ];
+    const html = await Effect.runPromise(
+      runOAuthCallback<GoogleAuth, never, never>({
+        complete: () => Effect.die("complete must not run"),
+        urlParams: {
+          state: "s1",
+          error: "server_error",
+          error_description: sentinels.join(" "),
+        },
+        toErrorMessage: () => ({ short: "unused" }),
+        channelName: "c",
+      }),
+    );
+    expect(html).toContain("server_error");
+    for (const sentinel of sentinels) expect(html).not.toContain(sentinel);
+  });
+
+  it("renders fixed diagnostics when completeOAuth fails", async () => {
     class DomainError extends Data.TaggedError("DomainError")<{
       readonly message: string;
     }> {}
@@ -337,12 +360,14 @@ describe("runOAuthCallback", () => {
       }),
     );
     expect(html).toContain("<title>Connection failed</title>");
-    expect(html).toContain("Auth failed");
+    expect(html).toContain("OAuth completion failed");
+    expect(html).not.toContain("Auth failed");
     expect(html).toContain("<summary");
-    expect(html).toContain("Code expired");
+    expect(html).toContain("oauth_failure");
+    expect(html).not.toContain("Code expired");
   });
 
-  it("omits the details disclosure when details match the short message", async () => {
+  it("does not trust mapper summaries or details at the callback boundary", async () => {
     class DomainError extends Data.TaggedError("DomainError")<{
       readonly message: string;
     }> {}
@@ -354,8 +379,9 @@ describe("runOAuthCallback", () => {
         channelName: "c",
       }),
     );
-    expect(html).toContain("Same");
-    expect(html).not.toContain("<details");
+    expect(html).toContain("OAuth completion failed");
+    expect(html).toContain("oauth_failure");
+    expect(html).not.toContain("Same");
   });
 
   it("never rejects — even defects are rendered as a failure popup", async () => {
@@ -368,6 +394,7 @@ describe("runOAuthCallback", () => {
       }),
     );
     expect(html).toContain("<title>Connection failed</title>");
-    expect(html).toContain("transport error");
+    expect(html).toContain("OAuth completion failed");
+    expect(html).not.toContain("transport error");
   });
 });

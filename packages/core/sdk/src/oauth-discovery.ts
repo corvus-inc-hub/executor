@@ -559,24 +559,16 @@ export const registerDynamicClient = (
       DcrErrorBody: (err) =>
         Effect.fail(
           new OAuthDiscoveryError({
-            message: `Dynamic Client Registration failed: ${err.error}${
-              err.error_description ? ` — ${sanitizeOAuthBoundaryText(err.error_description)}` : ""
-            }`,
+            message: `Dynamic Client Registration failed: ${sanitizeOAuthBoundaryText(err.error)}`,
             status: err.status,
-            error: err.error,
-            errorDescription:
-              err.error_description === undefined
-                ? undefined
-                : sanitizeOAuthBoundaryText(err.error_description),
-            cause: err,
+            error: sanitizeOAuthBoundaryText(err.error),
           }),
         ),
       DcrTransport: (err) =>
         Effect.fail(
           new OAuthDiscoveryError({
-            message: `Dynamic Client Registration failed: ${err.detail}`,
+            message: `Dynamic Client Registration failed: ${sanitizeOAuthBoundaryText(err.detail)}`,
             status: err.status,
-            cause: err.cause ?? err,
           }),
         ),
     }),

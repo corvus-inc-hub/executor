@@ -89,6 +89,23 @@ export type OAuthCorrelationVerifier = (
   envelope: OAuthCorrelationEnvelope,
 ) => Effect.Effect<OAuthCorrelationBinding, StorageFailure>;
 
+/** Host-side signing half of the correlation contract. The host must derive
+ * `binding` from its authenticated actor, organization, and Workspace record,
+ * not browser JSON. `audience` is signature domain separation, `keyId` selects
+ * an active rotation key, and the envelope lifetime must fit inside the OAuth
+ * session lifetime. Executor hosts consume only `verify`; the product host
+ * that owns Workspace authority consumes `sign` before rendering browser UI. */
+export type OAuthCorrelationSigner = (
+  binding: OAuthCorrelationBinding,
+) => Effect.Effect<OAuthCorrelationEnvelope, StorageFailure>;
+
+export interface OAuthCorrelationAuthority {
+  /** Fixed signature audience for this Executor deployment. */
+  readonly audience: string;
+  readonly sign: OAuthCorrelationSigner;
+  readonly verify: OAuthCorrelationVerifier;
+}
+
 /** Canonical JSON for the non-secret correlation descriptor. Keep the property
  * order explicit because this string is hashed into the durable receipt. */
 export const canonicalOAuthCorrelationBinding = (binding: OAuthCorrelationBinding): string =>

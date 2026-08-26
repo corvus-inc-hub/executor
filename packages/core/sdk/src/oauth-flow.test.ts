@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Predicate } from "effect";
+import { Deferred, Effect, Fiber, Predicate } from "effect";
 
 import {
   AuthTemplateSlug,
@@ -135,6 +135,38 @@ const partialCredentialsPlugin = definePlugin(() => ({
     },
   ],
 }));
+
+const delayedCredentialStore = new Map<string, string>();
+const delayedCredentialsPlugin = (
+  refreshWriteStarted: Deferred.Deferred<void>,
+  releaseRefreshWrite: Deferred.Deferred<void>,
+) =>
+  definePlugin(() => ({
+    id: "delayed-credentials" as const,
+    storage: () => ({}),
+    credentialProviders: [
+      {
+        key: ProviderKey.make("delayed-memory"),
+        writable: true,
+        get: (id: ProviderItemId) =>
+          Effect.sync(() => delayedCredentialStore.get(String(id)) ?? null),
+        set: (id: ProviderItemId, value: string) =>
+          String(id).endsWith(":refresh")
+            ? Effect.gen(function* () {
+                yield* Deferred.succeed(refreshWriteStarted, undefined);
+                yield* Deferred.await(releaseRefreshWrite);
+                delayedCredentialStore.set(String(id), value);
+              })
+            : Effect.sync(() => {
+                delayedCredentialStore.set(String(id), value);
+              }),
+        delete: (id: ProviderItemId) =>
+          Effect.sync(() => {
+            delayedCredentialStore.delete(String(id));
+          }),
+      },
+    ],
+  }))();
 
 const plugins = [memoryCredentialsPlugin(), oauthPlugin] as const;
 
@@ -272,7 +304,7 @@ describe("oauth.start / oauth.complete", () => {
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* serveOAuthTestServer({ scopes: ["read"] });
-        const { executor } = yield* makeTestWorkspaceHarness({ plugins });
+        const { executor, config } = yield* makeTestWorkspaceHarness({ plugins });
         yield* executor.acme.seed();
 
         yield* executor.oauth.createClient({
@@ -373,6 +405,25 @@ describe("oauth.start / oauth.complete", () => {
           }),
         );
         expect(Predicate.isTagged("OAuthCompleteError")(workspaceMismatch)).toBe(true);
+
+        yield* Effect.promise(() =>
+          config.db.updateMany("oauth_completion_receipt", {
+            where: (b) => b("attempt_key", "=", correlation.attemptKey),
+            set: { workspace_id: "forged-workspace" },
+          }),
+        );
+        const corruptedReplay = yield* Effect.flip(
+          executor.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("receipt-account"),
+            integration: INTEG,
+            template: TEMPLATE,
+            correlation,
+          }),
+        );
+        expect(Predicate.isTagged("OAuthStartError")(corruptedReplay)).toBe(true);
       }),
     ),
   );
@@ -562,6 +613,91 @@ describe("oauth.start / oauth.complete", () => {
     ),
   );
 
+  it.effect("recovers a prepared exchange intent after process loss without reusing a code", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor, config } = yield* makeTestWorkspaceHarness({ plugins });
+        yield* executor.acme.seed();
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+        const correlation = {
+          schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
+          attemptKey: "attempt-oauth-prepared-recovery-1",
+          actorUserId: "test-subject",
+          organizationId: "test-tenant",
+          workspaceId: "workspace-1",
+          provider: "acme",
+          keyId: "test",
+          issuedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          signature: "test-signature",
+        } as const;
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("prepared-recovery"),
+          integration: INTEG,
+          template: TEMPLATE,
+          correlation,
+        });
+        if (started.status !== "redirect") return;
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        const now = new Date();
+        const codeHash = yield* sha256Hex(callback.code);
+        yield* Effect.promise(() =>
+          config.db.create("oauth_exchange_intent", {
+            tenant: "test-tenant",
+            attempt_key: correlation.attemptKey,
+            state: String(started.state),
+            provider: "acme",
+            client_slug: String(CLIENT),
+            code_hash: codeHash,
+            provider_transaction_key: `executor:${correlation.attemptKey}`,
+            status: "prepared",
+            lease_token: "stale-worker",
+            lease_generation: 1,
+            access_token_hash: null,
+            refresh_token_hash: null,
+            started_at: now,
+            updated_at: now,
+            completed_at: null,
+            failure_code: null,
+          }),
+        );
+        yield* Effect.promise(() =>
+          config.db.updateMany("oauth_attempt", {
+            where: (b) => b("attempt_key", "=", correlation.attemptKey),
+            set: {
+              status: "exchanging",
+              lease_token: "stale-worker",
+              lease_generation: 1,
+              lease_expires_at: Date.now() - 1,
+            },
+          }),
+        );
+        const connection = yield* executor.oauth.complete({
+          state: started.state,
+          code: callback.code,
+        });
+        expect(String(connection.address)).toBe("tools.acme.org.preparedRecovery");
+        expect(
+          (yield* server.requests).filter((request) => request.path === "/token"),
+        ).toHaveLength(1);
+      }),
+    ),
+  );
+
   it.effect("recovers partial access and refresh writes without re-exchanging", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -632,14 +768,109 @@ describe("oauth.start / oauth.complete", () => {
           (request) => request.path === "/token",
         ).length;
         expect(requestsAfterRecovery).toBe(requestsBeforeRecovery);
-        expect(
-          Array.from(partialCredentialStore.keys()).filter((key) => key.startsWith("oauth:")),
-        ).toEqual([]);
+        const storedKeys = Array.from(partialCredentialStore.keys()).filter((key) =>
+          key.startsWith("oauth:"),
+        );
+        expect(storedKeys).toHaveLength(1);
+        const recoveryItems = yield* Effect.promise(() =>
+          config.db.findMany("oauth_credential_item", {
+            where: (b) => b("attempt_key", "=", correlation.attemptKey),
+          }),
+        );
+        expect(storedKeys.every((key) => recoveryItems.some((row) => row.item_id === key))).toBe(
+          true,
+        );
+        expect(recoveryItems.map((row) => String(row.status)).sort()).toEqual([
+          "stored",
+          "writing",
+        ]);
       }).pipe(
         Effect.ensuring(
           Effect.sync(() => {
             failPartialRefreshWrite = true;
             partialCredentialStore.clear();
+          }),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("keeps a delayed provider write under one live lease and one completion", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        delayedCredentialStore.clear();
+        const refreshWriteStarted = yield* Deferred.make<void>();
+        const releaseRefreshWrite = yield* Deferred.make<void>();
+        const delayedPlugins = [
+          delayedCredentialsPlugin(refreshWriteStarted, releaseRefreshWrite),
+          oauthPlugin,
+        ] as const;
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor } = yield* makeTestWorkspaceHarness({
+          plugins: delayedPlugins,
+          oauthAttemptLeaseMs: 100,
+          oauthAttemptHeartbeatMs: 25,
+        });
+        yield* executor.acme.seed();
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+        const correlation = {
+          schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
+          attemptKey: "attempt-oauth-delayed-provider-1",
+          actorUserId: "test-subject",
+          organizationId: "test-tenant",
+          workspaceId: "workspace-1",
+          provider: "acme",
+          keyId: "test",
+          issuedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          signature: "test-signature",
+        } as const;
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("delayed-provider"),
+          integration: INTEG,
+          template: TEMPLATE,
+          correlation,
+        });
+        if (started.status !== "redirect") return;
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        const first = yield* executor.oauth
+          .complete({ state: started.state, code: callback.code })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(refreshWriteStarted);
+        yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 150)));
+        const second = yield* executor.oauth
+          .complete({ state: started.state, code: callback.code })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 50)));
+        yield* Deferred.succeed(releaseRefreshWrite, undefined);
+        const [firstConnection, secondConnection] = yield* Effect.all(
+          [Fiber.join(first), Fiber.join(second)],
+          { concurrency: 2 },
+        );
+        expect(String(firstConnection.address)).toBe(String(secondConnection.address));
+        expect(
+          (yield* server.requests).filter((request) => request.path === "/token"),
+        ).toHaveLength(1);
+        expect(
+          Array.from(delayedCredentialStore.keys()).filter((key) => key.startsWith("oauth:")),
+        ).toHaveLength(2);
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            delayedCredentialStore.clear();
           }),
         ),
       ),
@@ -1085,7 +1316,25 @@ describe("oauth.start / oauth.complete", () => {
         );
         expect(Predicate.isTagged("OAuthStartError")(forged)).toBe(true);
         const forgedError = forged as OAuthStartError;
-        expect(forgedError.message).toContain("mismatched binding");
+        expect(forgedError.message).toBe("oauth_failure");
+        const expired = yield* Effect.flip(
+          executor.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("expired-envelope"),
+            integration: INTEG,
+            template: TEMPLATE,
+            correlation: {
+              ...envelope,
+              attemptKey: "attempt-oauth-expired-envelope-1",
+              issuedAt: new Date(Date.now() - 120_000).toISOString(),
+              expiresAt: new Date(Date.now() - 60_000).toISOString(),
+            },
+          }),
+        );
+        expect(Predicate.isTagged("OAuthStartError")(expired)).toBe(true);
+        expect((expired as OAuthStartError).message).toBe("oauth_failure");
       }),
     ),
   );
@@ -1438,7 +1687,8 @@ describe("oauth token refresh in resolveConnectionValue", () => {
         });
 
         expect(result.status).toBe("expired");
-        expect(result.detail).toContain("Grant not found");
+        expect(result.detail).toContain("invalid_grant");
+        expect(result.detail).not.toContain("Grant not found");
         const refreshed = yield* executor.connections.get({
           owner: "org",
           integration: INTEG,
@@ -1446,7 +1696,7 @@ describe("oauth token refresh in resolveConnectionValue", () => {
         });
         expect(refreshed?.lastHealth).toMatchObject({
           status: "expired",
-          detail: expect.stringContaining("Grant not found"),
+          detail: expect.stringContaining("invalid_grant"),
         });
         const requests = yield* server.requests;
         const refreshRequest = requests.find(

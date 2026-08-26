@@ -292,6 +292,7 @@ const OAUTH_ATTEMPT_LEASE_MS = 30_000;
 const OAUTH_ATTEMPT_WAIT_MS = 30_000;
 const OAUTH_ATTEMPT_POLL_MS = 100;
 const OAUTH_ATTEMPT_HEARTBEAT_MS = 5_000;
+const OAUTH_CORRELATION_CLOCK_SKEW_MS = 60_000;
 
 type OAuthAttemptStatus = "pending" | "exchanging" | "completed" | "failed";
 
@@ -783,6 +784,24 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       return Effect.fail(
         new StorageError({
           message: "OAuth correlation envelope is invalid or oversized.",
+          cause: undefined,
+        }),
+      );
+    }
+    const issuedAt = Date.parse(envelope.issuedAt);
+    const expiresAt = Date.parse(envelope.expiresAt);
+    const now = Date.now();
+    if (
+      !Number.isFinite(issuedAt) ||
+      !Number.isFinite(expiresAt) ||
+      expiresAt <= issuedAt ||
+      expiresAt - issuedAt > OAUTH2_SESSION_TTL_MS ||
+      issuedAt > now + OAUTH_CORRELATION_CLOCK_SKEW_MS ||
+      expiresAt <= now
+    ) {
+      return Effect.fail(
+        new StorageError({
+          message: "OAuth correlation envelope lifetime is invalid or expired.",
           cause: undefined,
         }),
       );
@@ -1786,15 +1805,17 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         });
       }
       if (String(existing.status) === "completed") {
-        const row = yield* deps.fuma.use("oauth_completion_receipt.findFirst", (db) =>
-          looseDb(db).findFirst("oauth_completion_receipt", {
-            where: (b: any) => b("attempt_key", "=", correlation.attemptKey),
-          }),
+        const connection = yield* loadValidatedCompletionConnection({
+          correlation,
+          descriptorHash,
+        }).pipe(
+          Effect.mapError(
+            () =>
+              new OAuthStartError({
+                message: "Completed OAuth attempt receipt validation failed.",
+              }),
+          ),
         );
-        const receipt = row ? receiptFromRow(row) : null;
-        const connection = receipt
-          ? yield* deps.getConnection(connectionRefFromReceipt(receipt))
-          : null;
         if (connection) return { status: "connected", connection } as const;
         return yield* new OAuthStartError({
           message: "Completed OAuth attempt is missing its connection receipt.",
@@ -1834,6 +1855,61 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     left.organizationId === right.organizationId &&
     left.workspaceId === right.workspaceId &&
     left.provider === right.provider;
+
+  const loadValidatedCompletionReceipt = (input: {
+    readonly correlation: OAuthCorrelationBindingType;
+    readonly descriptorHash: string;
+    readonly requestHash?: string;
+  }): Effect.Effect<OAuthCompletionReceiptType | null, OAuthCompleteError | StorageFailure> =>
+    Effect.gen(function* () {
+      const row = yield* loadCompletionReceiptRow(input.correlation.attemptKey);
+      if (!row) return null;
+      const receipt = receiptFromRow(row);
+      if (!receipt) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth completion receipt is invalid; operator recovery is required.",
+          restartRequired: false,
+        });
+      }
+      if (!sameCorrelation(input.correlation, receipt)) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth completion receipt does not match the supplied correlation binding.",
+          restartRequired: false,
+        });
+      }
+      if (receipt.descriptorHash !== input.descriptorHash) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth completion descriptor does not match the durable receipt.",
+          restartRequired: false,
+        });
+      }
+      if (input.requestHash !== undefined && receipt.requestHash !== input.requestHash) {
+        return yield* new OAuthCompleteError({
+          message: "OAuth completion request does not match the durable receipt.",
+          restartRequired: false,
+        });
+      }
+      return receipt;
+    });
+
+  const loadValidatedCompletionConnection = (input: {
+    readonly correlation: OAuthCorrelationBindingType;
+    readonly descriptorHash: string;
+    readonly requestHash?: string;
+  }): Effect.Effect<Connection | null, OAuthCompleteError | StorageFailure> =>
+    Effect.gen(function* () {
+      const receipt = yield* loadValidatedCompletionReceipt(input);
+      if (!receipt) return null;
+      const connection = yield* deps.getConnection(connectionRefFromReceipt(receipt));
+      if (!connection) {
+        return yield* new OAuthCompleteError({
+          message:
+            "OAuth completion receipt exists but its connection is unavailable; operator recovery is required.",
+          restartRequired: false,
+        });
+      }
+      return connection;
+    });
 
   const validateCompletionCorrelation = (
     correlation: OAuthCorrelationBindingType,
@@ -1876,7 +1952,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         (cause) =>
           new OAuthCompleteError({
             // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: the verifier exposes a typed StorageFailure message
-            message: cause.message,
+            message: sanitizeOAuthBoundaryText(cause.message),
             restartRequired: false,
           }),
       ),
@@ -1912,50 +1988,18 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           const descriptorHash = yield* sha256Hex(
             canonicalOAuthCorrelationBinding(suppliedCorrelation),
           );
-          const receiptRow = yield* loadCompletionReceiptRow(suppliedCorrelation.attemptKey);
-          if (receiptRow) {
-            const receipt = receiptFromRow(receiptRow);
-            if (!receipt) {
-              return yield* new OAuthCompleteError({
-                message: "OAuth completion receipt is invalid; operator recovery is required.",
-                restartRequired: false,
-              });
-            }
-            if (!sameCorrelation(suppliedCorrelation, receipt)) {
-              return yield* new OAuthCompleteError({
-                message:
-                  "OAuth completion receipt does not match the supplied correlation binding.",
-                restartRequired: false,
-              });
-            }
-            if (receipt.descriptorHash !== descriptorHash) {
-              return yield* new OAuthCompleteError({
-                message: "OAuth completion descriptor does not match the durable receipt.",
-                restartRequired: false,
-              });
-            }
-            const requestHash = yield* requestHashForCompletion(
-              input.state,
-              input.code,
-              callbackDomain,
-              descriptorHash,
-            );
-            if (receipt.requestHash !== requestHash) {
-              return yield* new OAuthCompleteError({
-                message: "OAuth completion request does not match the durable receipt.",
-                restartRequired: false,
-              });
-            }
-            const connection = yield* deps.getConnection(connectionRefFromReceipt(receipt));
-            if (!connection) {
-              return yield* new OAuthCompleteError({
-                message:
-                  "OAuth completion receipt exists but its connection is unavailable; operator recovery is required.",
-                restartRequired: false,
-              });
-            }
-            return connection;
-          }
+          const requestHash = yield* requestHashForCompletion(
+            input.state,
+            input.code,
+            callbackDomain,
+            descriptorHash,
+          );
+          const connection = yield* loadValidatedCompletionConnection({
+            correlation: suppliedCorrelation,
+            descriptorHash,
+            requestHash,
+          });
+          if (connection) return connection;
         }
         return yield* new OAuthSessionNotFoundError({ state: input.state });
       }
@@ -2058,18 +2102,28 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       // checking expiry or loading the provider client so replay never exchanges
       // the authorization code a second time.
       if (correlation && descriptorHash) {
-        const receiptRow = yield* loadCompletionReceiptRow(correlation.attemptKey);
-        if (receiptRow) {
-          const receipt = receiptFromRow(receiptRow);
-          if (!receipt) {
+        const requestHash = yield* requestHashForCompletion(
+          input.state,
+          input.code,
+          callbackDomain,
+          descriptorHash,
+        );
+        const connection = yield* loadValidatedCompletionConnection({
+          correlation,
+          descriptorHash,
+          requestHash,
+        });
+        if (connection) return connection;
+      }
+
+      const correlatedAttemptKey = correlation?.attemptKey;
+      let claim = correlatedAttemptKey ? yield* claimAttempt(correlatedAttemptKey) : null;
+      while (claim && claim.kind === "waiting") {
+        const winner = yield* waitForAttemptWinner(correlatedAttemptKey ?? "");
+        if (winner === "completed") {
+          if (!correlation || !descriptorHash) {
             return yield* new OAuthCompleteError({
-              message: "OAuth completion receipt is invalid; operator recovery is required.",
-              restartRequired: false,
-            });
-          }
-          if (!sameCorrelation(correlation, receipt) || receipt.descriptorHash !== descriptorHash) {
-            return yield* new OAuthCompleteError({
-              message: "OAuth completion receipt does not match the OAuth session.",
+              message: "OAuth attempt completed without its correlation binding.",
               restartRequired: false,
             });
           }
@@ -2079,34 +2133,11 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             callbackDomain,
             descriptorHash,
           );
-          if (receipt.requestHash !== requestHash) {
-            return yield* new OAuthCompleteError({
-              message: "OAuth completion request does not match the durable receipt.",
-              restartRequired: false,
-            });
-          }
-          const connection = yield* deps.getConnection(connectionRefFromReceipt(receipt));
-          if (!connection) {
-            return yield* new OAuthCompleteError({
-              message:
-                "OAuth completion receipt exists but its connection is unavailable; operator recovery is required.",
-              restartRequired: false,
-            });
-          }
-          return connection;
-        }
-      }
-
-      const correlatedAttemptKey = correlation?.attemptKey;
-      let claim = correlatedAttemptKey ? yield* claimAttempt(correlatedAttemptKey) : null;
-      while (claim && claim.kind === "waiting") {
-        const winner = yield* waitForAttemptWinner(correlatedAttemptKey ?? "");
-        if (winner === "completed") {
-          const row = yield* loadCompletionReceiptRow(correlatedAttemptKey ?? "");
-          const receipt = row ? receiptFromRow(row) : null;
-          const connection = receipt
-            ? yield* deps.getConnection(connectionRefFromReceipt(receipt))
-            : null;
+          const connection = yield* loadValidatedCompletionConnection({
+            correlation,
+            descriptorHash,
+            requestHash,
+          });
           if (connection) return connection;
           return yield* new OAuthCompleteError({
             message: "OAuth attempt completed without a recoverable connection receipt.",
@@ -2122,11 +2153,23 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         claim = yield* claimAttempt(correlatedAttemptKey ?? "");
       }
       if (claim && claim.kind === "completed") {
-        const row = yield* loadCompletionReceiptRow(correlatedAttemptKey ?? "");
-        const receipt = row ? receiptFromRow(row) : null;
-        const connection = receipt
-          ? yield* deps.getConnection(connectionRefFromReceipt(receipt))
-          : null;
+        if (!correlation || !descriptorHash) {
+          return yield* new OAuthCompleteError({
+            message: "OAuth attempt completed without its correlation binding.",
+            restartRequired: false,
+          });
+        }
+        const requestHash = yield* requestHashForCompletion(
+          input.state,
+          input.code,
+          callbackDomain,
+          descriptorHash,
+        );
+        const connection = yield* loadValidatedCompletionConnection({
+          correlation,
+          descriptorHash,
+          requestHash,
+        });
         if (connection) return connection;
         return yield* new OAuthCompleteError({
           message: "OAuth attempt completed without a recoverable connection receipt.",
@@ -2209,7 +2252,14 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           });
         }
         const itemState = yield* verifyStoredCredentialItems({ claim: activeClaim, provider });
-        if (itemState === "partial") {
+        if (itemState === "uncertain") {
+          return yield* new OAuthCompleteError({
+            message:
+              "OAuth credential provider write outcome is unresolved; completion remains fenced for recovery.",
+            restartRequired: false,
+          });
+        }
+        if (itemState === "compensatable") {
           yield* rebindCredentialItems(activeClaim);
           yield* compensateCredentialItems({ claim: activeClaim, provider });
           return yield* new OAuthCompleteError({
@@ -2296,15 +2346,18 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           }
           // Establish the durable intent before any provider write. The intent
           // must survive an external write that outlives a rolled-back DB txn.
-          const stored = yield* persistCredentialIntent({
-            claim: activeClaim,
-            target,
-            client,
-            token,
-            requestedScopes: session.requestedScopes ?? [],
-            clientOwner: session.clientOwner,
-            oauthTokenUrl: tokenUrl === client.tokenUrl ? null : tokenUrl,
-          }).pipe(
+          const stored = yield* withAttemptHeartbeat(
+            activeClaim,
+            persistCredentialIntent({
+              claim: activeClaim,
+              target,
+              client,
+              token,
+              requestedScopes: session.requestedScopes ?? [],
+              clientOwner: session.clientOwner,
+              oauthTokenUrl: tokenUrl === client.tokenUrl ? null : tokenUrl,
+            }),
+          ).pipe(
             Effect.mapError(
               (cause) =>
                 new OAuthCompleteError({
@@ -2602,7 +2655,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           )
           .pipe(Effect.catchTag("UniqueViolationError", () => Effect.void));
       }
-      const row = yield* loadExchangeIntent(input.claim.attemptKey);
+      let row = yield* loadExchangeIntent(input.claim.attemptKey);
       if (!row) {
         return yield* new OAuthCompleteError({
           message: "OAuth exchange intent disappeared; operator recovery is required.",
@@ -2634,6 +2687,39 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         // process crash, while blindly re-exchanging would consume a one-time
         // code twice.
         return row;
+      }
+      if (
+        row.lease_token !== input.claim.token ||
+        Number(row.lease_generation ?? 0) !== input.claim.generation
+      ) {
+        // `prepared` proves the provider exchange never started. A process may
+        // die after committing that pre-exchange intent but before the guarded
+        // transition to `exchanging`. The current authoritative attempt lease
+        // can safely adopt only this untouched state; exchanging/succeeded
+        // rows remain fenced from one-time code reuse.
+        yield* deps.fuma.use("oauth_exchange_intent.rebindPrepared", (db) =>
+          looseDb(db).updateMany("oauth_exchange_intent", {
+            where: (b: any) =>
+              b.and(b("attempt_key", "=", input.claim.attemptKey), b("status", "=", "prepared")),
+            set: {
+              lease_token: input.claim.token,
+              lease_generation: input.claim.generation,
+              updated_at: now,
+            },
+          }),
+        );
+        row = yield* loadExchangeIntent(input.claim.attemptKey);
+        if (
+          !row ||
+          String(row.status) !== "prepared" ||
+          row.lease_token !== input.claim.token ||
+          Number(row.lease_generation ?? 0) !== input.claim.generation
+        ) {
+          return yield* new OAuthCompleteError({
+            message: "OAuth exchange intent was reclaimed; provider outcome is serialized.",
+            restartRequired: false,
+          });
+        }
       }
       yield* deps.fuma.use("oauth_exchange_intent.begin", (db) =>
         looseDb(db).updateMany("oauth_exchange_intent", {
@@ -2911,7 +2997,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   const verifyStoredCredentialItems = (input: {
     readonly claim: OAuthAttemptClaim;
     readonly provider: CredentialProvider;
-  }): Effect.Effect<"complete" | "partial" | "missing", StorageFailure> =>
+  }): Effect.Effect<"complete" | "compensatable" | "uncertain" | "missing", StorageFailure> =>
     Effect.gen(function* () {
       const rows = yield* loadCredentialItems(input.claim.attemptKey);
       if (rows.length === 0) return "missing" as const;
@@ -2929,14 +3015,17 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           continue;
         }
         if (String(row.status) === "writing" || String(row.status) === "stored") {
-          return "partial" as const;
+          // A `writing` row may still have an in-flight provider promise from
+          // the prior process/fiber. Deleting another item here could let that
+          // late write land after compensation and orphan a credential.
+          return "uncertain" as const;
         }
       }
       if (stored === rows.length) return "complete";
       // A planned item alongside a stored item is still a partial external
       // effect. Recovery must compensate it instead of treating the exchange
       // as missing and risking an unauthorized re-exchange.
-      return stored > 0 ? "partial" : "missing";
+      return stored > 0 ? "compensatable" : "missing";
     });
 
   const compensateCredentialItems = (input: {
