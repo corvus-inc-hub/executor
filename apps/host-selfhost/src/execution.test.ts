@@ -5,10 +5,10 @@ import { HostConfig } from "@executor-js/api/server";
 
 import { SelfHostHostConfig } from "./execution";
 
-it.effect("fails closed until self-host wires a server-signed OAuth correlation authority", () =>
+it.effect("requires and wires a server-signed OAuth correlation verifier", () =>
   Effect.gen(function* () {
     const config = yield* HostConfig;
     expect(config.requireOAuthCorrelation).toBe(true);
-    expect(config.verifyOAuthCorrelation).toBeUndefined();
+    expect(config.verifyOAuthCorrelation).toBeDefined();
   }).pipe(Effect.provide(SelfHostHostConfig)),
 );
