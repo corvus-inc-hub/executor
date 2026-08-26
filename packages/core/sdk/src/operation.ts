@@ -160,6 +160,19 @@ export interface ExecuteOperationBindingDefinition {
   readonly version: number;
 }
 
+interface OperationDescriptorPayload {
+  readonly schemaVersion: typeof EXECUTE_OPERATION_SCHEMA_VERSION;
+  readonly operationKey: string;
+  readonly version: number;
+  readonly target: string;
+  readonly providerTransport: ExecuteOperationProviderTransport;
+  readonly inputSchema: unknown;
+  readonly outputSchema: unknown;
+  readonly bindingMode?: string;
+  readonly bindingKey?: string;
+  readonly bindingVersion?: number;
+}
+
 /** Non-secret connection identity returned by a host-owned binding resolver.
  * Generation and catalog revision are opaque immutable lineage values; the
  * Executor never interprets them or exposes credentials behind them. */
@@ -501,12 +514,13 @@ export const makeInMemoryOperationReplayStore = (): ExecuteOperationReplayStore 
           return { status: "reserved" as const, reservationToken };
         }
         if (existing.requestSha256 !== requestSha256) {
+          if (existing.bindingSha256 === undefined) {
+            return { status: "conflict" as const, requestSha256: existing.requestSha256 };
+          }
           return {
             status: "conflict" as const,
             requestSha256: existing.requestSha256,
-            ...(existing.bindingSha256 !== undefined
-              ? { bindingSha256: existing.bindingSha256 }
-              : {}),
+            bindingSha256: existing.bindingSha256,
           };
         }
         return existing.result
@@ -750,13 +764,25 @@ const standardSchemaRoot = (schema: StaticToolSchema, side: "input" | "output"):
 const OPERATION_BINDING_IDENTIFIER = /^[a-z][a-z0-9._-]*$/;
 const OPERATION_BINDING_IDENTIFIER_MAX_LENGTH = 128;
 
+const OperationBindingIdentifier = Schema.NonEmptyString.check(
+  Schema.isMaxLength(OPERATION_BINDING_IDENTIFIER_MAX_LENGTH),
+  Schema.isPattern(OPERATION_BINDING_IDENTIFIER),
+).annotate({ identifier: "ExecutorOperationBindingIdentifier" });
+
+const OperationBindingVersion = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).annotate({
+  identifier: "ExecutorOperationBindingVersion",
+});
+
+const OperationBindingFieldsSchema = Schema.Struct({
+  mode: Schema.optional(OperationBindingIdentifier),
+  key: Schema.optional(OperationBindingIdentifier),
+  version: Schema.optional(OperationBindingVersion),
+}).annotate({ identifier: "ExecutorOperationBindingFields" });
+type OperationBindingFields = typeof OperationBindingFieldsSchema.Type;
+
 const operationBindingFields = (
   definition: ExecuteOperationDefinition,
-): {
-  readonly mode: unknown;
-  readonly key: unknown;
-  readonly version: unknown;
-} => ({
+): OperationBindingFields => ({
   mode: definition.bindingMode,
   key: definition.bindingKey,
   version: definition.bindingVersion,
@@ -772,20 +798,14 @@ const validateOperationBindingDefinition = (
 ): Effect.Effect<ExecuteOperationBindingDefinition | undefined, OperationContractError> =>
   Effect.gen(function* () {
     if (!hasOperationBindingField(definition)) return undefined;
-    const fields = operationBindingFields(definition);
-    if (
-      typeof fields.mode !== "string" ||
-      typeof fields.key !== "string" ||
-      typeof fields.version !== "number" ||
-      fields.mode.length === 0 ||
-      fields.key.length === 0 ||
-      fields.mode.length > OPERATION_BINDING_IDENTIFIER_MAX_LENGTH ||
-      fields.key.length > OPERATION_BINDING_IDENTIFIER_MAX_LENGTH ||
-      !OPERATION_BINDING_IDENTIFIER.test(fields.mode) ||
-      !OPERATION_BINDING_IDENTIFIER.test(fields.key) ||
-      !Number.isInteger(fields.version) ||
-      fields.version < 1
-    ) {
+    const fields = yield* Schema.decodeUnknownEffect(OperationBindingFieldsSchema)(
+      operationBindingFields(definition),
+    ).pipe(
+      Effect.mapError(
+        () => new OperationContractError({ field: "binding", reason: "invalid_value" }),
+      ),
+    );
+    if (fields.mode === undefined || fields.key === undefined || fields.version === undefined) {
       return yield* new OperationContractError({ field: "binding", reason: "invalid_value" });
     }
     return {
@@ -798,22 +818,24 @@ const validateOperationBindingDefinition = (
 const descriptorPayload = (
   definition: ExecuteOperationDefinition,
   binding?: ExecuteOperationBindingDefinition,
-): Record<string, unknown> => ({
-  schemaVersion: EXECUTE_OPERATION_SCHEMA_VERSION,
-  operationKey: definition.operationKey,
-  version: definition.version,
-  target: String(definition.target),
-  providerTransport: definition.providerTransport,
-  inputSchema: standardSchemaRoot(definition.inputSchema, "input"),
-  outputSchema: standardSchemaRoot(definition.outputSchema, "output"),
-  ...(binding
-    ? {
-        bindingMode: binding.mode,
-        bindingKey: binding.key,
-        bindingVersion: binding.version,
-      }
-    : {}),
-});
+): OperationDescriptorPayload => {
+  const payload = {
+    schemaVersion: EXECUTE_OPERATION_SCHEMA_VERSION,
+    operationKey: definition.operationKey,
+    version: definition.version,
+    target: String(definition.target),
+    providerTransport: definition.providerTransport,
+    inputSchema: standardSchemaRoot(definition.inputSchema, "input"),
+    outputSchema: standardSchemaRoot(definition.outputSchema, "output"),
+  };
+  if (binding === undefined) return payload;
+  return {
+    ...payload,
+    bindingMode: binding.mode,
+    bindingKey: binding.key,
+    bindingVersion: binding.version,
+  };
+};
 
 const hashCanonicalJson = (
   canonical: string,
@@ -846,7 +868,7 @@ export const deriveOperationDescriptor = (
     const payload = descriptorPayload(definition, binding);
     const canonical = yield* canonicalOperationJson(payload);
     const descriptorSha256 = yield* hashCanonicalJson(canonical, "descriptorSha256");
-    return {
+    const descriptorBase = {
       schemaVersion: EXECUTE_OPERATION_SCHEMA_VERSION,
       operationKey: definition.operationKey,
       version: definition.version,
@@ -854,14 +876,14 @@ export const deriveOperationDescriptor = (
       providerTransport: definition.providerTransport,
       inputSchema: payload.inputSchema,
       outputSchema: payload.outputSchema,
-      ...(binding
-        ? {
-            bindingMode: binding.mode,
-            bindingKey: binding.key,
-            bindingVersion: binding.version,
-          }
-        : {}),
       descriptorSha256,
+    } satisfies ExecuteOperationDescriptor;
+    if (binding === undefined) return descriptorBase;
+    return {
+      ...descriptorBase,
+      bindingMode: binding.mode,
+      bindingKey: binding.key,
+      bindingVersion: binding.version,
     };
   });
 
