@@ -13,6 +13,7 @@ import { makeQuickJsExecutor } from "@executor-js/runtime-quickjs";
 import executorConfig from "../executor.config";
 import { SelfHostDb, SelfHostDbProvider } from "./db/self-host-db";
 import { loadConfig } from "./config";
+import { loadOAuthCorrelationConfig, makeOAuthCorrelationVerifier } from "./oauth-correlation";
 
 // ---------------------------------------------------------------------------
 // Self-host execution-stack seams.
@@ -50,10 +51,13 @@ export const SelfHostPluginsProvider: Layer.Layer<PluginsProvider> = Layer.succe
 
 export const SelfHostHostConfig: Layer.Layer<HostConfig> = Layer.sync(HostConfig, () => {
   const config = loadConfig();
+  const oauthCorrelation = loadOAuthCorrelationConfig();
   return {
     allowLocalNetwork: config.allowLocalNetwork,
     webBaseUrl: config.webBaseUrl,
     oauthCallbackPath: "/api/oauth/callback",
+    verifyOAuthCorrelation: makeOAuthCorrelationVerifier(oauthCorrelation),
+    requireOAuthCorrelation: true,
   };
 });
 

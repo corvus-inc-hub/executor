@@ -45,7 +45,16 @@ const OAUTH_CALLBACK_PATH = "/api/oauth/callback";
 const oauthCallbackOrgScopedRequest = (request: Request): Request => {
   const url = new URL(request.url);
   const callbackState = decodeOAuthCallbackState(url.searchParams.get("state"));
-  if (callbackState === null) return request;
+  if (callbackState === null || !callbackState.orgSlug) return request;
+  // Keep the signed correlation envelope in the browser callback state. The
+  // OAuth handler decodes this wrapper to derive the raw session state and
+  // forwards the envelope to Executor; stripping it here would turn a normal
+  // org-selected browser callback into an uncorrelated completion.
+  if (callbackState.correlation) {
+    const headers = new Headers(request.headers);
+    headers.set(ORG_SELECTOR_HEADER, callbackState.orgSlug);
+    return new Request(request, { headers });
+  }
   url.searchParams.set("state", callbackState.state);
   const rewritten = new Request(url, request);
   const headers = new Headers(rewritten.headers);

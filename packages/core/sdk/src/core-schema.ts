@@ -29,6 +29,7 @@ export const nullableBigintColumn = (name: string) => column(name, "bigint").nul
 export const jsonColumn = (name: string) => column(name, "json");
 export const nullableJsonColumn = (name: string) => column(name, "json").nullable();
 export const dateColumn = (name: string) => column(name, "timestamp");
+export const nullableDateColumn = (name: string) => column(name, "timestamp").nullable();
 
 // The policy callback hands us a `ConditionBuilder` typed to the specific table's
 // columns; it isn't assignable to the generic `Record<string, AnyColumn>` builder
@@ -86,6 +87,10 @@ const ownedExecutorTable = <const TColumns extends UserColumns>(
   name: string,
   columns: TColumns,
   uniqueKey: readonly string[],
+  additionalUniqueKeys: readonly {
+    readonly name: string;
+    readonly columns: readonly string[];
+  }[] = [],
 ) => {
   const out = table(name, {
     ...columns,
@@ -95,6 +100,9 @@ const ownedExecutorTable = <const TColumns extends UserColumns>(
     subject: keyColumn("subject"),
   });
   out.unique(`${name}_uidx`, [...uniqueKey]);
+  for (const key of additionalUniqueKeys) {
+    out.unique(key.name, [...key.columns]);
+  }
   return out.policy<ExecutorOwnerPolicyContext>({
     name: executorOwnerPolicyName,
     onRead: ({ builder, context }) => ownerVisibility(builder, context),
@@ -249,10 +257,168 @@ export const coreTables = defineTables({
       pkce_verifier: nullableTextColumn("pkce_verifier"),
       identity_label: nullableTextColumn("identity_label"),
       payload: jsonColumn("payload"),
+      // Correlated attempts are first-class on the session row; payload is
+      // reserved for legacy scope/client metadata and is not the authority.
+      attempt_key: nullableKeyColumn("attempt_key"),
+      actor_user_id: nullableKeyColumn("actor_user_id"),
+      authenticated_subject_id: nullableKeyColumn("authenticated_subject_id"),
+      workspace_id: nullableKeyColumn("workspace_id"),
+      provider: nullableKeyColumn("provider"),
+      descriptor_hash: nullableKeyColumn("descriptor_hash"),
+      execution_id: nullableKeyColumn("execution_id"),
+      correlation_envelope: nullableJsonColumn("correlation_envelope"),
       expires_at: bigintColumn("expires_at"),
       created_at: dateColumn("created_at"),
     },
     ["tenant", "state"],
+    // Correlated sessions are first-class by attempt key as well as provider
+    // state. Nullable legacy rows remain valid, while a tenant cannot hold two
+    // sessions for one durable attempt.
+    [{ name: "oauth_session_attempt_uidx", columns: ["tenant", "attempt_key"] }],
+  ),
+
+  // Durable attempt reservation and exchange claim. This row survives session
+  // deletion, so duplicate attempt keys and crashed exchanges are recoverable.
+  // It contains no OAuth code, token, or client secret.
+  oauth_attempt: tenantExecutorTable(
+    "oauth_attempt",
+    {
+      attempt_key: keyColumn("attempt_key"),
+      state: keyColumn("state"),
+      actor_user_id: keyColumn("actor_user_id"),
+      authenticated_subject_id: keyColumn("authenticated_subject_id"),
+      organization_id: keyColumn("organization_id"),
+      workspace_id: keyColumn("workspace_id"),
+      provider: keyColumn("provider"),
+      integration: keyColumn("integration"),
+      execution_id: keyColumn("execution_id"),
+      descriptor_hash: keyColumn("descriptor_hash"),
+      status: keyColumn("status"),
+      lease_token: nullableKeyColumn("lease_token"),
+      lease_generation: nullableBigintColumn("lease_generation"),
+      lease_expires_at: nullableBigintColumn("lease_expires_at"),
+      authorization_url: textColumn("authorization_url"),
+      started_at: dateColumn("started_at"),
+      updated_at: dateColumn("updated_at"),
+      completed_at: nullableDateColumn("completed_at"),
+    },
+    ["tenant", "attempt_key"],
+  ),
+
+  // External credential writes are represented by a metadata-only intent. The
+  // provider item ids are deterministic and the hashes let a recovery process
+  // detect a write that completed before the Executor process crashed.
+  oauth_credential_intent: tenantExecutorTable(
+    "oauth_credential_intent",
+    {
+      attempt_key: keyColumn("attempt_key"),
+      owner: keyColumn("owner"),
+      integration: keyColumn("integration"),
+      name: keyColumn("name"),
+      template: keyColumn("template"),
+      provider_key: keyColumn("provider_key"),
+      item_id: textColumn("item_id"),
+      refresh_item_id: nullableTextColumn("refresh_item_id"),
+      oauth_client: keyColumn("oauth_client"),
+      oauth_client_owner: keyColumn("oauth_client_owner"),
+      oauth_token_url: nullableTextColumn("oauth_token_url"),
+      identity_label: nullableTextColumn("identity_label"),
+      expires_at: nullableBigintColumn("expires_at"),
+      oauth_scope: nullableTextColumn("oauth_scope"),
+      missing_oauth_scopes: nullableJsonColumn("missing_oauth_scopes"),
+      access_token_hash: keyColumn("access_token_hash"),
+      refresh_token_hash: nullableKeyColumn("refresh_token_hash"),
+      status: keyColumn("status"),
+      lease_token: nullableKeyColumn("lease_token"),
+      lease_generation: nullableBigintColumn("lease_generation"),
+      created_at: dateColumn("created_at"),
+      updated_at: dateColumn("updated_at"),
+      stored_at: nullableDateColumn("stored_at"),
+      committed_at: nullableDateColumn("committed_at"),
+    },
+    ["tenant", "attempt_key"],
+  ),
+
+  // Immutable, tenant-scoped evidence that an authorization-code completion
+  // minted a connection. This is Executor evidence only: `provider` is the
+  // verified integration/provider identity, never a provider-native receipt.
+  // Credential values, OAuth codes, client secrets, and refresh material are
+  // intentionally absent. The attempt key is unique per tenant so a lost
+  // callback can be recovered without re-running the provider exchange.
+  oauth_completion_receipt: tenantExecutorTable(
+    "oauth_completion_receipt",
+    {
+      attempt_key: keyColumn("attempt_key"),
+      actor_user_id: keyColumn("actor_user_id"),
+      authenticated_subject_id: keyColumn("authenticated_subject_id"),
+      organization_id: keyColumn("organization_id"),
+      workspace_id: keyColumn("workspace_id"),
+      provider: keyColumn("provider"),
+      execution_id: keyColumn("execution_id"),
+      status: keyColumn("status"),
+      result_reference: textColumn("result_reference"),
+      connection_owner: keyColumn("connection_owner"),
+      connection_integration: keyColumn("connection_integration"),
+      connection_name: keyColumn("connection_name"),
+      connection_address: textColumn("connection_address"),
+      request_hash: keyColumn("request_hash"),
+      descriptor_hash: keyColumn("descriptor_hash"),
+      started_at: dateColumn("started_at"),
+      completed_at: dateColumn("completed_at"),
+      duration_ms: bigintColumn("duration_ms"),
+      lease_token: nullableKeyColumn("lease_token"),
+      lease_generation: nullableBigintColumn("lease_generation"),
+      created_at: dateColumn("created_at"),
+    },
+    ["tenant", "attempt_key"],
+  ),
+
+  // Durable authorization-code exchange lifecycle. The code itself is never
+  // stored; an in-flight exchange is fail-closed after a crash because OAuth
+  // providers generally offer no idempotent readback for one-time codes.
+  oauth_exchange_intent: tenantExecutorTable(
+    "oauth_exchange_intent",
+    {
+      attempt_key: keyColumn("attempt_key"),
+      state: keyColumn("state"),
+      provider: keyColumn("provider"),
+      client_slug: keyColumn("client_slug"),
+      code_hash: keyColumn("code_hash"),
+      provider_transaction_key: keyColumn("provider_transaction_key"),
+      status: keyColumn("status"),
+      lease_token: nullableKeyColumn("lease_token"),
+      lease_generation: nullableBigintColumn("lease_generation"),
+      access_token_hash: nullableKeyColumn("access_token_hash"),
+      refresh_token_hash: nullableKeyColumn("refresh_token_hash"),
+      started_at: dateColumn("started_at"),
+      updated_at: dateColumn("updated_at"),
+      completed_at: nullableDateColumn("completed_at"),
+      failure_code: nullableKeyColumn("failure_code"),
+    },
+    ["tenant", "attempt_key"],
+  ),
+
+  // Per-item credential outbox. Values remain in the external credential
+  // provider; hashes and deterministic item IDs make writes idempotent and
+  // let recovery compensate partial access/refresh writes without re-exchange.
+  oauth_credential_item: tenantExecutorTable(
+    "oauth_credential_item",
+    {
+      attempt_key: keyColumn("attempt_key"),
+      item_kind: keyColumn("item_kind"),
+      required: boolColumn("required", true),
+      provider_key: keyColumn("provider_key"),
+      item_id: textColumn("item_id"),
+      token_hash: keyColumn("token_hash"),
+      status: keyColumn("status"),
+      lease_token: nullableKeyColumn("lease_token"),
+      lease_generation: nullableBigintColumn("lease_generation"),
+      created_at: dateColumn("created_at"),
+      updated_at: dateColumn("updated_at"),
+      stored_at: nullableDateColumn("stored_at"),
+      compensated_at: nullableDateColumn("compensated_at"),
+    },
+    ["tenant", "attempt_key", "item_kind"],
   ),
 
   // Persisted, per-connection tools (option C). Address is derived from
@@ -332,6 +498,9 @@ export type IntegrationRow = FumaRow<CoreSchema["integration"]>;
 export type ConnectionRow = FumaRow<CoreSchema["connection"]>;
 export type OAuthClientRow = FumaRow<CoreSchema["oauth_client"]>;
 export type OAuthSessionRow = FumaRow<CoreSchema["oauth_session"]>;
+export type OAuthAttemptRow = FumaRow<CoreSchema["oauth_attempt"]>;
+export type OAuthCredentialIntentRow = FumaRow<CoreSchema["oauth_credential_intent"]>;
+export type OAuthCompletionReceiptRow = FumaRow<CoreSchema["oauth_completion_receipt"]>;
 export type ToolRow = FumaRow<CoreSchema["tool"]>;
 /** The tool-row projection the invoke/list hot paths load: everything except
  *  the heavy `input_schema`/`output_schema` JSON, which only `tools.schema`

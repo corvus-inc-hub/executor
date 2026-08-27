@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "oauth_session_attempt_uidx" ON "oauth_session" USING btree ("tenant","attempt_key");

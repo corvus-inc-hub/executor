@@ -15,11 +15,42 @@ import { Cause, Effect } from "effect";
 import {
   decodeOAuthCallbackState,
   OAUTH_POPUP_MESSAGE_TYPE,
+  type OAuthCorrelationEnvelope,
   type OAuthPopupResult,
 } from "@executor-js/sdk";
 
 export { OAUTH_POPUP_MESSAGE_TYPE, isOAuthPopupResult } from "@executor-js/sdk";
 export type { OAuthPopupResult } from "@executor-js/sdk";
+
+const SAFE_OAUTH_PROVIDER_ERROR_CODES = new Set([
+  "access_denied",
+  "authorization_pending",
+  "expired_token",
+  "invalid_client",
+  "invalid_client_metadata",
+  "invalid_grant",
+  "invalid_request",
+  "invalid_redirect_uri",
+  "invalid_scope",
+  "invalid_software_statement",
+  "server_error",
+  "slow_down",
+  "temporarily_unavailable",
+  "unauthorized_client",
+  "unapproved_software_statement",
+  "unsupported_grant_type",
+  "unsupported_response_type",
+]);
+
+/** Reduce callback diagnostics to fixed evidence without importing SDK host
+ * internals into the browser-facing API dependency graph. */
+const sanitizePopupBoundaryText = (value: string): string => {
+  const tokens = value.toLowerCase().match(/[a-z][a-z0-9_]{2,63}/g) ?? [];
+  const providerCode = tokens.find((token) => SAFE_OAUTH_PROVIDER_ERROR_CODES.has(token));
+  if (providerCode) return providerCode;
+  const status = /\bHTTP\s+([1-5]\d{2})\b/i.exec(value)?.[1];
+  return status ? `http_${status}` : "oauth_failure";
+};
 
 // ---------------------------------------------------------------------------
 // Completion listener — optional process-wide hook called every time an
@@ -152,6 +183,7 @@ export type RunOAuthCallbackInput<TAuth, E, R> = {
     readonly code: string | null;
     readonly error: string | null;
     readonly callbackDomain: string | null;
+    readonly correlation: OAuthCorrelationEnvelope | null;
   }) => Effect.Effect<TAuth, E, R>;
   readonly urlParams: OAuthCallbackUrlParams;
   /** Map a plugin-specific error into a short summary and optional details. */
@@ -166,7 +198,9 @@ const providerErrorMessage = (params: OAuthCallbackUrlParams): PopupErrorMessage
   if (!value) return null;
   return {
     short: "OAuth provider rejected authorization",
-    details: error && description && description !== error ? `${error}: ${description}` : value,
+    details: sanitizePopupBoundaryText(
+      error && description && description !== error ? `${error}: ${description}` : value,
+    ),
   };
 };
 
@@ -192,6 +226,7 @@ export const runOAuthCallback = <TAuth, E, R>(
             code: input.urlParams.code ?? null,
             error: null,
             callbackDomain: input.urlParams.domain ?? input.urlParams.site ?? null,
+            correlation: callbackState?.correlation ?? null,
           })
           .pipe(
             Effect.map(
@@ -213,13 +248,15 @@ export const runOAuthCallback = <TAuth, E, R>(
 
   return result.pipe(
     Effect.catchCause((cause) => {
-      const { short, details } = input.toErrorMessage(Cause.squash(cause));
+      const { details } = input.toErrorMessage(Cause.squash(cause));
+      const safeShort = "OAuth completion failed";
+      const safeDetails = details === undefined ? undefined : sanitizePopupBoundaryText(details);
       return Effect.succeed<OAuthPopupResult<TAuth>>({
         type: OAUTH_POPUP_MESSAGE_TYPE,
         ok: false,
         sessionId,
-        error: short,
-        ...(details && details !== short ? { errorDetails: details } : {}),
+        error: safeShort,
+        ...(safeDetails && safeDetails !== safeShort ? { errorDetails: safeDetails } : {}),
       });
     }),
     Effect.tap((result) =>

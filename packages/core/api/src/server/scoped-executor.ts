@@ -40,6 +40,8 @@ import {
   Tenant,
   type AnyPlugin,
   type Executor,
+  type OAuthCorrelationAuthority,
+  type OAuthCorrelationVerifier,
   type StorageFailure,
 } from "@executor-js/sdk";
 import { makeHostedFetch, makeHostedHttpClientLayer } from "@executor-js/sdk/host-internal";
@@ -79,6 +81,15 @@ export interface HostConfigShape {
    * so the host-provided value is the only valid source of truth.
    */
   readonly oauthCallbackPath: string;
+  /** Host signer/verifier for the versioned OAuth correlation envelope. */
+  readonly verifyOAuthCorrelation?: OAuthCorrelationVerifier;
+  /** Product-host authority for minting browser envelopes and verifying them
+   * at this Executor boundary. The verifier is used here; the signer is
+   * exposed to the product's authenticated Workspace route. */
+  readonly oauthCorrelationAuthority?: OAuthCorrelationAuthority;
+  /** Hosted authorization-code readiness gate. The shared host boundary
+   * defaults this to true; only direct SDK/CLI construction may opt out. */
+  readonly requireOAuthCorrelation?: boolean;
   /**
    * Whether Executor's built-in agent tools should expose credential provider
    * discovery. Local/self-host can use this for 1Password/keychain style
@@ -275,6 +286,9 @@ export const makeScopedExecutor = <
       onElicitation: "accept-all",
       redirectUri,
       oauthCallbackStateOrgSlug: orgSlug,
+      verifyOAuthCorrelation:
+        config.oauthCorrelationAuthority?.verify ?? config.verifyOAuthCorrelation,
+      requireOAuthCorrelation: config.requireOAuthCorrelation ?? true,
       coreTools: {
         webBaseUrl,
         orgSlug,

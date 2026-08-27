@@ -856,9 +856,10 @@ describe("beginDynamicAuthorization", () => {
               _tag: "OAuthDiscoveryError",
               status: 400,
               error: "invalid_redirect_uri",
-              errorDescription: "redirect is not allowed",
             }),
           );
+          expect(reason?.error).not.toHaveProperty("errorDescription");
+          expect(JSON.stringify(reason?.error)).not.toContain("redirect is not allowed");
         }),
     ),
   );

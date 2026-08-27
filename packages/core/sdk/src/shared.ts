@@ -127,26 +127,7 @@ export {
 } from "./health-check";
 
 // OAuth wire contracts (data + tagged errors; the flow impl is server-only).
-export {
-  type OAuthGrant,
-  type OAuthAuthentication,
-  type OAuthClient,
-  type OAuthClientOrigin,
-  type OAuthClientSummary,
-  type CreateOAuthClientInput,
-  type RegisterDynamicClientInput,
-  type ConnectResult,
-  type OAuthStartInput,
-  type OAuthCompleteInput,
-  type OAuthProbeInput,
-  type OAuthProbeResult,
-  type OAuthService,
-  OAuthStartError,
-  OAuthCompleteError,
-  OAuthProbeError,
-  OAuthRegisterDynamicError,
-  OAuthSessionNotFoundError,
-} from "./oauth-client";
+export * from "./oauth-client";
 
 // Wire-level HTTP error schema for plugin HttpApiGroup definitions.
 export { InternalError } from "./api-errors";

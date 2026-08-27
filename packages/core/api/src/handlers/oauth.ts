@@ -1,9 +1,9 @@
 // ---------------------------------------------------------------------------
 // OAuth HTTP handlers — thin forwarders over `executor.oauth.*` (v2).
 //
-// `createClient` / `cancel` / `probe` are implemented in the SDK;
-// `start` / `complete` are STUBBED there (milestone 2) and fail at runtime —
-// the handlers are wired to call them so the surface is complete.
+// `createClient` / `start` / `complete` / `cancel` / `probe` are implemented in
+// the SDK; the receipt lookup remains on the same authenticated tenant-bound
+// service surface.
 // ---------------------------------------------------------------------------
 
 import { HttpApiBuilder } from "effect/unstable/httpapi";
@@ -13,6 +13,7 @@ import { Effect, Option, Schema } from "effect";
 import { runOAuthCallback, type PopupErrorMessage } from "../oauth-popup";
 import {
   OAUTH_POPUP_MESSAGE_TYPE,
+  OAUTH_CORRELATION_SCHEMA_VERSION,
   OAuthCompleteError,
   OAuthProbeError,
   OAuthSessionNotFoundError,
@@ -162,6 +163,7 @@ export const OAuthHandlers = HttpApiBuilder.group(ExecutorApi, "oauth", (handler
             template: payload.template,
             identityLabel: payload.identityLabel,
             redirectUri: payload.redirectUri,
+            correlation: payload.correlation,
           });
           return startResultToResponse(result);
         }),
@@ -175,8 +177,31 @@ export const OAuthHandlers = HttpApiBuilder.group(ExecutorApi, "oauth", (handler
             state: payload.state,
             code: payload.code,
             callbackDomain: payload.callbackDomain ?? null,
+            correlation: payload.correlation,
           });
           return connectionToResponse(connection);
+        }),
+      ),
+    )
+    .handle("lookupCompletionReceipt", ({ params, query }) =>
+      capture(
+        Effect.gen(function* () {
+          const executor = yield* ExecutorService;
+          return yield* executor.oauth.getCompletionReceipt({
+            correlation: {
+              schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
+              attemptKey: params.attemptKey,
+              actorUserId: query.actorUserId,
+              authenticatedSubjectId: query.authenticatedSubjectId,
+              organizationId: query.organizationId,
+              workspaceId: query.workspaceId,
+              provider: query.provider,
+              keyId: query.keyId,
+              issuedAt: query.issuedAt,
+              expiresAt: query.expiresAt,
+              signature: query.signature,
+            },
+          });
         }),
       ),
     )
@@ -204,7 +229,7 @@ export const OAuthHandlers = HttpApiBuilder.group(ExecutorApi, "oauth", (handler
         Effect.gen(function* () {
           const executor = yield* ExecutorService;
           const html = yield* runOAuthCallback({
-            complete: ({ state, code, callbackDomain }) =>
+            complete: ({ state, code, callbackDomain, correlation }) =>
               executor.oauth
                 .complete({
                   // `runOAuthCallback`'s `state` is a raw string from the URL;
@@ -212,6 +237,7 @@ export const OAuthHandlers = HttpApiBuilder.group(ExecutorApi, "oauth", (handler
                   state: OAuthState.make(state),
                   code: code ?? "",
                   callbackDomain,
+                  ...(correlation ? { correlation } : {}),
                 })
                 .pipe(
                   Effect.tapError((cause: unknown) =>

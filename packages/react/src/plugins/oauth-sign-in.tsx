@@ -36,6 +36,7 @@ import {
   type ConnectionName,
   type IntegrationSlug,
   type OAuthClientSlug,
+  type OAuthCorrelationEnvelope,
   type Owner,
 } from "@executor-js/sdk/shared";
 
@@ -70,6 +71,9 @@ export type OAuthStartPayload = {
   readonly template: AuthTemplateSlug;
   readonly identityLabel?: string;
   readonly redirectUri?: string;
+  /** Server-signed tenant/actor/workspace/provider binding. Hosts that expose
+   * browser OAuth mint this outside the browser and pass it through unchanged. */
+  readonly correlation?: OAuthCorrelationEnvelope;
 };
 
 export type StartOAuthPopupInput<TPayload extends OAuthCompletionPayload> = {
@@ -382,6 +386,7 @@ export function useOAuthPopupFlow<
               template: input.payload.template,
               identityLabel: input.payload.identityLabel,
               redirectUri: input.payload.redirectUri ?? oauthCallbackUrl(callbackPath),
+              correlation: input.payload.correlation,
             },
           }).then((exit) =>
             Exit.isSuccess(exit)

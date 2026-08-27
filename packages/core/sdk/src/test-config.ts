@@ -6,6 +6,7 @@ import { ProviderItemId, ProviderKey, Subject, Tenant } from "./ids";
 import { definePlugin, type AnyPlugin } from "./plugin";
 import type { ExecutorOwnerPolicyContext } from "./owner-policy";
 import type { CredentialProvider } from "./provider";
+import type { OAuthCorrelationBinding, OAuthCorrelationEnvelope } from "./oauth-client";
 import type { SqliteTestFumaDb } from "./sqlite-test-db";
 
 // ---------------------------------------------------------------------------
@@ -111,6 +112,22 @@ const makeLazyTestFumaDb = (options: {
  *  loudly" path override this with `redirectUri: null`. */
 export const TEST_OAUTH_REDIRECT_URI = "http://localhost/oauth/callback";
 
+/** Test-only host authority. Production hosts must provide a real verifier
+ * backed by their signed request/workspace authority; the SDK itself fails
+ * closed when no verifier is configured. */
+export const TEST_OAUTH_CORRELATION_VERIFIER = (
+  envelope: OAuthCorrelationEnvelope,
+): Effect.Effect<OAuthCorrelationBinding> =>
+  Effect.succeed({
+    schemaVersion: envelope.schemaVersion,
+    attemptKey: envelope.attemptKey,
+    actorUserId: envelope.actorUserId,
+    authenticatedSubjectId: envelope.authenticatedSubjectId,
+    organizationId: envelope.organizationId,
+    workspaceId: envelope.workspaceId,
+    provider: envelope.provider,
+  });
+
 export type TestConfigOptions<TPlugins extends readonly AnyPlugin[] = readonly []> = {
   readonly tenant?: string;
   readonly subject?: string | null;
@@ -122,6 +139,10 @@ export type TestConfigOptions<TPlugins extends readonly AnyPlugin[] = readonly [
    *  no OAuth callback (exercises the fail-loud redirect path). */
   readonly redirectUri?: string | null;
   readonly oauthCallbackStateOrgSlug?: string;
+  readonly verifyOAuthCorrelation?: ExecutorConfig<TPlugins>["verifyOAuthCorrelation"];
+  readonly requireOAuthCorrelation?: boolean;
+  readonly oauthAttemptLeaseMs?: number;
+  readonly oauthAttemptHeartbeatMs?: number;
 };
 
 export const makeTestConfig = <const TPlugins extends readonly AnyPlugin[] = readonly []>(
@@ -161,6 +182,10 @@ export const makeTestConfig = <const TPlugins extends readonly AnyPlugin[] = rea
     onElicitation: "accept-all",
     ...(redirectUri != null ? { redirectUri } : {}),
     oauthCallbackStateOrgSlug: options?.oauthCallbackStateOrgSlug,
+    verifyOAuthCorrelation: options?.verifyOAuthCorrelation ?? TEST_OAUTH_CORRELATION_VERIFIER,
+    requireOAuthCorrelation: options?.requireOAuthCorrelation,
+    oauthAttemptLeaseMs: options?.oauthAttemptLeaseMs,
+    oauthAttemptHeartbeatMs: options?.oauthAttemptHeartbeatMs,
   };
 };
 

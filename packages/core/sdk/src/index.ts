@@ -145,6 +145,7 @@ export {
   type ConnectionRow,
   type OAuthClientRow,
   type OAuthSessionRow,
+  type OAuthCompletionReceiptRow,
   type ToolRow,
   type ToolInvocationRow,
   type DefinitionRow,
@@ -244,25 +245,7 @@ export {
   encodeOAuthCallbackState,
   type OAuthCallbackState,
 } from "./oauth";
-export {
-  OAuthStartError,
-  OAuthCompleteError,
-  OAuthProbeError,
-  OAuthRegisterDynamicError,
-  OAuthSessionNotFoundError,
-  type OAuthGrant,
-  type OAuthAuthentication,
-  type OAuthClient,
-  type OAuthClientSummary,
-  type CreateOAuthClientInput,
-  type RegisterDynamicClientInput,
-  type ConnectResult,
-  type OAuthStartInput,
-  type OAuthCompleteInput,
-  type OAuthProbeInput,
-  type OAuthProbeResult,
-  type OAuthService,
-} from "./oauth-client";
+export * from "./oauth-client";
 
 // NOTE: the OAuth 2.1 implementation helpers (`./oauth-helpers`,
 // `makeOAuthService` in `./oauth-service`, discovery in `./oauth-discovery`)

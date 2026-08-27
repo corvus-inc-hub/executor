@@ -25,6 +25,142 @@ import {
 
 export type OAuthGrant = "authorization_code" | "client_credentials";
 
+/** Versioned, non-secret binding supplied by a trusted host for a durable
+ * OAuth completion receipt. The values are signed by the host and verified by
+ * the Executor before they become an attempt binding. `workspaceId` is not
+ * inferred from caller JSON: a host verifier must resolve it against its
+ * authenticated target authority. */
+export const OAUTH_CORRELATION_SCHEMA_VERSION = "executor.oauth-correlation.v2" as const;
+
+export const OAuthCorrelationBinding = Schema.Struct({
+  schemaVersion: Schema.Literal(OAUTH_CORRELATION_SCHEMA_VERSION),
+  attemptKey: Schema.NonEmptyString,
+  actorUserId: Schema.NonEmptyString,
+  authenticatedSubjectId: Schema.NonEmptyString,
+  organizationId: Schema.NonEmptyString,
+  workspaceId: Schema.NonEmptyString,
+  provider: Schema.NonEmptyString,
+}).annotate({ identifier: "OAuthCorrelationBinding" });
+
+export type OAuthCorrelationBinding = typeof OAuthCorrelationBinding.Type;
+
+/** Server-signed envelope carried by start, complete, and the browser callback
+ * state. The signature covers `canonicalOAuthCorrelationEnvelopePayload`; the
+ * host verifier owns the key, audience, expiry, and workspace lookup. No
+ * secret is present in this envelope. */
+export const OAuthCorrelationEnvelope = Schema.Struct({
+  schemaVersion: Schema.Literal(OAUTH_CORRELATION_SCHEMA_VERSION),
+  attemptKey: Schema.NonEmptyString,
+  actorUserId: Schema.NonEmptyString,
+  authenticatedSubjectId: Schema.NonEmptyString,
+  organizationId: Schema.NonEmptyString,
+  workspaceId: Schema.NonEmptyString,
+  provider: Schema.NonEmptyString,
+  keyId: Schema.NonEmptyString,
+  issuedAt: Schema.NonEmptyString,
+  expiresAt: Schema.NonEmptyString,
+  signature: Schema.NonEmptyString,
+}).annotate({ identifier: "OAuthCorrelationEnvelope" });
+
+export type OAuthCorrelationEnvelope = typeof OAuthCorrelationEnvelope.Type;
+
+/** Canonical, signature-excluded JSON payload for the server-signed envelope.
+ * Hosts sign this exact property order and verify the same bytes before
+ * returning an authoritative binding to the Executor. */
+export const canonicalOAuthCorrelationEnvelopePayload = (
+  envelope: OAuthCorrelationEnvelope,
+): string =>
+  JSON.stringify({
+    schemaVersion: envelope.schemaVersion,
+    attemptKey: envelope.attemptKey,
+    actorUserId: envelope.actorUserId,
+    authenticatedSubjectId: envelope.authenticatedSubjectId,
+    organizationId: envelope.organizationId,
+    workspaceId: envelope.workspaceId,
+    provider: envelope.provider,
+    keyId: envelope.keyId,
+    issuedAt: envelope.issuedAt,
+    expiresAt: envelope.expiresAt,
+  });
+
+/** Host authority for signed correlation. The host MUST verify the envelope's
+ * signature and lifetime, authenticate the organization and actor, resolve the
+ * workspace target, and return the authoritative binding. Missing verifiers
+ * are a hard failure for correlated OAuth; the Executor never falls back to
+ * treating the envelope's caller-provided workspace/provider as authority. */
+export type OAuthCorrelationVerifier = (
+  envelope: OAuthCorrelationEnvelope,
+) => Effect.Effect<OAuthCorrelationBinding, StorageFailure>;
+
+/** Host-side signing half of the correlation contract. The host must derive
+ * `binding` from its authenticated actor, organization, and Workspace record,
+ * not browser JSON. `audience` is signature domain separation, `keyId` selects
+ * an active rotation key, and the envelope lifetime must fit inside the OAuth
+ * session lifetime. Executor hosts consume only `verify`; the product host
+ * that owns Workspace authority consumes `sign` before rendering browser UI. */
+export type OAuthCorrelationSigner = (
+  binding: OAuthCorrelationBinding,
+) => Effect.Effect<OAuthCorrelationEnvelope, StorageFailure>;
+
+export interface OAuthCorrelationAuthority {
+  /** Fixed signature audience for this Executor deployment. */
+  readonly audience: string;
+  readonly sign: OAuthCorrelationSigner;
+  readonly verify: OAuthCorrelationVerifier;
+}
+
+/** Canonical JSON for the non-secret correlation descriptor. Keep the property
+ * order explicit because this string is hashed into the durable receipt. */
+export const canonicalOAuthCorrelationBinding = (binding: OAuthCorrelationBinding): string =>
+  JSON.stringify({
+    schemaVersion: binding.schemaVersion,
+    attemptKey: binding.attemptKey,
+    actorUserId: binding.actorUserId,
+    authenticatedSubjectId: binding.authenticatedSubjectId,
+    organizationId: binding.organizationId,
+    workspaceId: binding.workspaceId,
+    provider: binding.provider,
+  });
+
+export const OAUTH_COMPLETION_RECEIPT_SCHEMA_VERSION =
+  "executor.oauth-completion-receipt.v1" as const;
+
+/** The connection identity carried by an Executor receipt. It is deliberately
+ * metadata-only and contains no access, refresh, client, or provider secret. */
+export const OAuthCompletionConnectionIdentity = Schema.Struct({
+  owner: Schema.Literals(["org", "user"]),
+  integration: Schema.NonEmptyString,
+  name: Schema.NonEmptyString,
+  address: Schema.NonEmptyString,
+}).annotate({ identifier: "OAuthCompletionConnectionIdentity" });
+
+/** Executor-owned completion evidence. `provider` is the caller's correlation
+ * label. This contract does not claim or contain provider-native evidence. */
+export const OAuthCompletionReceipt = Schema.Struct({
+  schemaVersion: Schema.Literal(OAUTH_COMPLETION_RECEIPT_SCHEMA_VERSION),
+  receiptKind: Schema.Literal("executor.oauth.completion"),
+  attemptKey: Schema.NonEmptyString,
+  actorUserId: Schema.NonEmptyString,
+  authenticatedSubjectId: Schema.NonEmptyString,
+  organizationId: Schema.NonEmptyString,
+  workspaceId: Schema.NonEmptyString,
+  executionId: Schema.NonEmptyString,
+  status: Schema.Literal("completed"),
+  resultReference: Schema.NonEmptyString,
+  provider: Schema.NonEmptyString,
+  connection: OAuthCompletionConnectionIdentity,
+  requestHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  descriptorHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+  startedAt: Schema.String,
+  completedAt: Schema.String,
+  durationMs: Schema.Finite.check(
+    Schema.isGreaterThanOrEqualTo(0),
+    Schema.isLessThanOrEqualTo(15 * 60 * 1000),
+  ),
+}).annotate({ identifier: "OAuthCompletionReceipt" });
+
+export type OAuthCompletionReceipt = typeof OAuthCompletionReceipt.Type;
+
 /** Provider OAuth config an integration declares as one of its auth templates —
  *  what to request. (The flow itself runs off the self-contained OAuthClient.)
  *  Keyed `kind: "oauth2"` like every auth method across the plugins. */
@@ -125,6 +261,9 @@ export interface OAuthStartInput {
   readonly identityLabel?: string | null;
   /** Browser-facing callback URL for this flow. Defaults to the executor's configured redirectUri. */
   readonly redirectUri?: string | null;
+  /** Optional server-signed binding. When present, completion is
+   * receipt-ledgered and the host verifier must be configured. */
+  readonly correlation?: OAuthCorrelationEnvelope;
 }
 
 export interface OAuthCompleteInput {
@@ -135,6 +274,13 @@ export interface OAuthCompleteInput {
    *  org's actual region rather than the statically advertised one. Used only
    *  when it is a sibling subdomain of the client's configured token host. */
   readonly callbackDomain?: string | null;
+  /** The signed binding recorded by `start`. Browser callbacks derive this
+   * from the signed state envelope; legacy unbound sessions may omit it. */
+  readonly correlation?: OAuthCorrelationEnvelope;
+}
+
+export interface OAuthCompletionReceiptLookupInput {
+  readonly correlation: OAuthCorrelationEnvelope;
 }
 
 /** Probe a base/issuer URL for OAuth 2.1 authorization-server metadata so the
@@ -282,6 +428,12 @@ export interface OAuthService {
   readonly complete: (
     input: OAuthCompleteInput,
   ) => Effect.Effect<Connection, OAuthCompleteError | OAuthSessionNotFoundError | StorageFailure>;
+  /** Read the immutable Executor completion receipt after a callback response
+   * was lost. A missing receipt is represented by `null`; the binding is still
+   * checked against the authenticated tenant and the persisted attempt. */
+  readonly getCompletionReceipt: (
+    input: OAuthCompletionReceiptLookupInput,
+  ) => Effect.Effect<OAuthCompletionReceipt | null, OAuthCompleteError | StorageFailure>;
   readonly cancel: (state: OAuthState) => Effect.Effect<void, StorageFailure>;
   readonly probe: (
     input: OAuthProbeInput,

@@ -7,8 +7,9 @@
 // exchanges the authorization code; `cancel` drops an in-flight session;
 // `probe` discovers an authorization-server's metadata for the onboarding UI.
 //
-// NOTE(v2): `start`/`complete` are STUBBED in the SDK (milestone 2) — the routes
-// are wired to call them but will fail at runtime until the flow is implemented.
+// NOTE(v2): `complete` accepts an optional versioned correlation binding for
+// durable receipt-ledgering; the legacy state/code callback remains valid for
+// unbound sessions.
 // ---------------------------------------------------------------------------
 
 import { HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/unstable/httpapi";
@@ -22,6 +23,8 @@ import {
   InternalError,
   OAuthClientSlug,
   OAuthCompleteError,
+  OAuthCompletionReceipt,
+  OAuthCorrelationEnvelope,
   OAuthProbeError,
   OAuthRegisterDynamicError,
   OAuthSessionNotFoundError,
@@ -161,6 +164,7 @@ const StartPayload = Schema.Struct({
   template: AuthTemplateSlug,
   identityLabel: Schema.optional(Schema.NullOr(Schema.String)),
   redirectUri: Schema.optional(Schema.NullOr(Schema.String)),
+  correlation: Schema.optional(OAuthCorrelationEnvelope),
 });
 
 const StartResponse = Schema.Union([
@@ -185,6 +189,25 @@ const CompletePayload = Schema.Struct({
   /** Regional host echoed back by the authorization server (Datadog's
    *  `domain`/`site`); forwarded so the code is redeemed at the org's region. */
   callbackDomain: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Host-signed correlation envelope. Browser callbacks may carry it in
+   * OAuth state; legacy unbound sessions may omit it. */
+  correlation: Schema.optional(OAuthCorrelationEnvelope),
+});
+
+// A receipt lookup is deliberately envelope-shaped rather than attempt-key-only:
+// the Executor validates the tenant, actor, workspace, and provider before
+// returning any durable completion evidence.
+const ReceiptLookupParams = { attemptKey: Schema.NonEmptyString };
+const ReceiptLookupQuery = Schema.Struct({
+  actorUserId: Schema.NonEmptyString,
+  authenticatedSubjectId: Schema.NonEmptyString,
+  organizationId: Schema.NonEmptyString,
+  workspaceId: Schema.NonEmptyString,
+  provider: Schema.NonEmptyString,
+  keyId: Schema.NonEmptyString,
+  issuedAt: Schema.NonEmptyString,
+  expiresAt: Schema.NonEmptyString,
+  signature: Schema.NonEmptyString,
 });
 
 // ---------------------------------------------------------------------------
@@ -292,6 +315,14 @@ export const OAuthApi = HttpApiGroup.make("oauth")
       payload: CompletePayload,
       success: ConnectionResponse,
       error: [InternalError, OAuthComplete, OAuthSessionNotFound],
+    }),
+  )
+  .add(
+    HttpApiEndpoint.get("lookupCompletionReceipt", "/oauth/receipts/:attemptKey", {
+      params: ReceiptLookupParams,
+      query: ReceiptLookupQuery,
+      success: Schema.NullOr(OAuthCompletionReceipt),
+      error: [InternalError, OAuthComplete],
     }),
   )
   .add(

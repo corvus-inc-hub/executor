@@ -16,7 +16,7 @@
 //     construction keeps the call sync and lets callers opt out of PAR
 // ---------------------------------------------------------------------------
 
-import { Data, Effect, Option, Predicate, Schema } from "effect";
+import { Data, Effect, Option, Schema } from "effect";
 import * as oauth from "oauth4webapi";
 
 // ---------------------------------------------------------------------------
@@ -61,6 +61,42 @@ export const OAUTH2_DEFAULT_TIMEOUT_MS = 20_000;
 export interface OAuthEndpointUrlPolicy {
   readonly allowHttp?: boolean;
 }
+
+const SAFE_OAUTH_PROVIDER_ERROR_CODES = new Set([
+  "access_denied",
+  "authorization_pending",
+  "expired_token",
+  "invalid_client",
+  "invalid_client_metadata",
+  "invalid_grant",
+  "invalid_request",
+  "invalid_redirect_uri",
+  "invalid_scope",
+  "invalid_software_statement",
+  "server_error",
+  "slow_down",
+  "temporarily_unavailable",
+  "unauthorized_client",
+  "unapproved_software_statement",
+  "unsupported_grant_type",
+  "unsupported_response_type",
+]);
+
+const safeOAuthProviderErrorCode = (value: unknown): string | undefined => {
+  if (typeof value !== "string") return undefined;
+  const tokens = value.toLowerCase().match(/[a-z][a-z0-9_]{2,63}/g) ?? [];
+  return tokens.find((token) => SAFE_OAUTH_PROVIDER_ERROR_CODES.has(token));
+};
+
+/** Reduce provider/verifier diagnostics to fixed, non-secret evidence. Arbitrary
+ * descriptions, URLs, paths, stack frames, and serialized exception contents
+ * never cross the OAuth boundary. */
+export const sanitizeOAuthBoundaryText = (value: string): string => {
+  const providerCode = safeOAuthProviderErrorCode(value);
+  if (providerCode) return providerCode;
+  const status = /\bHTTP\s+([1-5]\d{2})\b/i.exec(value)?.[1];
+  return status ? `http_${status}` : "oauth_failure";
+};
 
 export const isLoopbackHttpUrl = (value: string): boolean => {
   if (!URL.canParse(value)) return false;
@@ -272,8 +308,6 @@ export const rebindTokenEndpointHostToCallbackDomain = (
 // to reauth-required) across wrappers.
 // ---------------------------------------------------------------------------
 
-const isOAuth2Error = Predicate.isTagged("OAuth2Error") as (cause: unknown) => cause is OAuth2Error;
-
 const responseFromOAuthErrorCause = (cause: unknown): Response | undefined => {
   if (cause instanceof Response) return cause;
   if (typeof cause !== "object" || cause === null) return undefined;
@@ -286,81 +320,34 @@ const responseFromOAuthErrorCause = (cause: unknown): Response | undefined => {
   return undefined;
 };
 
-const redactTokenEndpointBody = (body: string): string =>
-  body
-    .replaceAll(
-      /("(?:access_token|refresh_token|id_token|client_secret)"\s*:\s*")[^"]*(")/gi,
-      "$1[redacted]$2",
-    )
-    .replaceAll(
-      /((?:access_token|refresh_token|id_token|client_secret|code)=)[^&\s]*/gi,
-      "$1[redacted]",
-    );
-
-const tokenEndpointHttpSummary = async (response: Response): Promise<string> => {
-  const status = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
-  const contentType = response.headers.get("content-type");
-  const url = response.url ? ` from ${response.url}` : "";
-  const parts = [`${status}${url}`];
-  if (contentType) parts.push(`content-type ${contentType}`);
-  const preview = await bodyPreviewFromResponse(response);
-  if (preview) parts.push(`body: ${preview}`);
-  return parts.join("; ");
-};
-
-const bodyPreviewFromResponse = async (response: Response): Promise<string | undefined> => {
-  const text = await Promise.resolve()
-    .then(() => response.clone().text())
-    .then(
-      (value) => value.trim(),
-      () => "",
-    );
-  if (!text) return undefined;
-  const redacted = redactTokenEndpointBody(text.replaceAll(/\s+/g, " "));
-  return redacted.length > 500 ? `${redacted.slice(0, 500)}...` : redacted;
-};
+const tokenEndpointHttpSummary = (response: Response): string => `http_${response.status}`;
 
 const toOAuth2Error = (cause: unknown): OAuth2Error => {
-  if (isOAuth2Error(cause)) return cause;
   if (typeof cause === "object" && cause !== null) {
     const c = cause as {
       error?: unknown;
-      error_description?: unknown;
       message?: unknown;
     };
-    const code = typeof c.error === "string" ? c.error : undefined;
-    const description =
-      typeof c.error_description === "string"
-        ? c.error_description
-        : typeof c.message === "string"
-          ? c.message
-          : undefined;
+    const code = safeOAuthProviderErrorCode(c.error) ?? safeOAuthProviderErrorCode(c.message);
     return new OAuth2Error({
-      message: `OAuth token exchange failed: ${description ?? code ?? "unknown error"}`,
+      message: `OAuth token exchange failed: ${code ?? "oauth_failure"}`,
       error: code,
-      cause,
     });
   }
   return new OAuth2Error({
-    message: "OAuth token exchange failed",
-    cause,
+    message: "OAuth token exchange failed: oauth_failure",
   });
 };
 
 const toOAuth2ErrorWithHttpSummary = (cause: unknown): Effect.Effect<OAuth2Error> => {
-  if (isOAuth2Error(cause)) return Effect.succeed(cause);
   const base = toOAuth2Error(cause);
   const response = responseFromOAuthErrorCause(cause);
   if (!response) return Effect.succeed(base);
-  return Effect.promise(() => tokenEndpointHttpSummary(response)).pipe(
-    Effect.map(
-      (summary) =>
-        new OAuth2Error({
-          message: `${base.message} (${summary})`,
-          error: base.error,
-          cause,
-        }),
-    ),
+  return Effect.succeed(
+    new OAuth2Error({
+      message: `${base.message} (${tokenEndpointHttpSummary(response)})`,
+      error: base.error,
+    }),
   );
 };
 

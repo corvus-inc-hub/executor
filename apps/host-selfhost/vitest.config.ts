@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     include: ["src/**/*.test.ts"],
     passWithNoTests: true,
+    setupFiles: ["./src/test-setup.ts"],
     // These are integration suites: several files boot a full self-host app
     // graph (Better Auth + libSQL + MCP + plugins) in beforeAll, then drive it
     // over the in-memory handler. Each boot is CPU-heavy and every query

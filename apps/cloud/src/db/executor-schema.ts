@@ -112,6 +112,14 @@ export const oauth_session = pgTable(
     pkce_verifier: text("pkce_verifier"),
     identity_label: text("identity_label"),
     payload: json("payload").notNull(),
+    attempt_key: varchar("attempt_key", { length: 255 }),
+    actor_user_id: varchar("actor_user_id", { length: 255 }),
+    authenticated_subject_id: varchar("authenticated_subject_id", { length: 255 }),
+    workspace_id: varchar("workspace_id", { length: 255 }),
+    provider: varchar("provider", { length: 255 }),
+    descriptor_hash: varchar("descriptor_hash", { length: 255 }),
+    execution_id: varchar("execution_id", { length: 255 }),
+    correlation_envelope: json("correlation_envelope"),
     expires_at: bigint("expires_at", { mode: "bigint" }).notNull(),
     created_at: timestamp("created_at").notNull(),
     row_id: varchar("row_id", { length: 255 })
@@ -122,7 +130,163 @@ export const oauth_session = pgTable(
     owner: varchar("owner", { length: 255 }).notNull(),
     subject: varchar("subject", { length: 255 }).notNull(),
   },
-  (table) => [uniqueIndex("oauth_session_uidx").on(table.tenant, table.state)],
+  (table) => [
+    uniqueIndex("oauth_session_uidx").on(table.tenant, table.state),
+    uniqueIndex("oauth_session_attempt_uidx").on(table.tenant, table.attempt_key),
+  ],
+);
+
+export const oauth_attempt = pgTable(
+  "oauth_attempt",
+  {
+    attempt_key: varchar("attempt_key", { length: 255 }).notNull(),
+    state: varchar("state", { length: 255 }).notNull(),
+    actor_user_id: varchar("actor_user_id", { length: 255 }).notNull(),
+    authenticated_subject_id: varchar("authenticated_subject_id", { length: 255 }).notNull(),
+    organization_id: varchar("organization_id", { length: 255 }).notNull(),
+    workspace_id: varchar("workspace_id", { length: 255 }).notNull(),
+    provider: varchar("provider", { length: 255 }).notNull(),
+    integration: varchar("integration", { length: 255 }).notNull(),
+    execution_id: varchar("execution_id", { length: 255 }).notNull(),
+    descriptor_hash: varchar("descriptor_hash", { length: 255 }).notNull(),
+    status: varchar("status", { length: 255 }).notNull(),
+    lease_token: varchar("lease_token", { length: 255 }),
+    lease_generation: bigint("lease_generation", { mode: "bigint" }),
+    lease_expires_at: bigint("lease_expires_at", { mode: "bigint" }),
+    authorization_url: text("authorization_url").notNull(),
+    started_at: timestamp("started_at").notNull(),
+    updated_at: timestamp("updated_at").notNull(),
+    completed_at: timestamp("completed_at"),
+    row_id: varchar("row_id", { length: 255 })
+      .primaryKey()
+      .notNull()
+      .$defaultFn(() => createId()),
+    tenant: varchar("tenant", { length: 255 }).notNull(),
+  },
+  (table) => [uniqueIndex("oauth_attempt_uidx").on(table.tenant, table.attempt_key)],
+);
+
+export const oauth_credential_intent = pgTable(
+  "oauth_credential_intent",
+  {
+    attempt_key: varchar("attempt_key", { length: 255 }).notNull(),
+    owner: varchar("owner", { length: 255 }).notNull(),
+    integration: varchar("integration", { length: 255 }).notNull(),
+    name: varchar("name", { length: 255 }).notNull(),
+    template: varchar("template", { length: 255 }).notNull(),
+    provider_key: varchar("provider_key", { length: 255 }).notNull(),
+    item_id: text("item_id").notNull(),
+    refresh_item_id: text("refresh_item_id"),
+    oauth_client: varchar("oauth_client", { length: 255 }).notNull(),
+    oauth_client_owner: varchar("oauth_client_owner", { length: 255 }).notNull(),
+    oauth_token_url: text("oauth_token_url"),
+    identity_label: text("identity_label"),
+    expires_at: bigint("expires_at", { mode: "bigint" }),
+    oauth_scope: text("oauth_scope"),
+    missing_oauth_scopes: json("missing_oauth_scopes"),
+    access_token_hash: varchar("access_token_hash", { length: 255 }).notNull(),
+    refresh_token_hash: varchar("refresh_token_hash", { length: 255 }),
+    status: varchar("status", { length: 255 }).notNull(),
+    lease_token: varchar("lease_token", { length: 255 }),
+    lease_generation: bigint("lease_generation", { mode: "bigint" }),
+    created_at: timestamp("created_at").notNull(),
+    updated_at: timestamp("updated_at").notNull(),
+    stored_at: timestamp("stored_at"),
+    committed_at: timestamp("committed_at"),
+    row_id: varchar("row_id", { length: 255 })
+      .primaryKey()
+      .notNull()
+      .$defaultFn(() => createId()),
+    tenant: varchar("tenant", { length: 255 }).notNull(),
+  },
+  (table) => [uniqueIndex("oauth_credential_intent_uidx").on(table.tenant, table.attempt_key)],
+);
+
+export const oauth_exchange_intent = pgTable(
+  "oauth_exchange_intent",
+  {
+    attempt_key: varchar("attempt_key", { length: 255 }).notNull(),
+    state: varchar("state", { length: 255 }).notNull(),
+    provider: varchar("provider", { length: 255 }).notNull(),
+    client_slug: varchar("client_slug", { length: 255 }).notNull(),
+    code_hash: varchar("code_hash", { length: 255 }).notNull(),
+    provider_transaction_key: varchar("provider_transaction_key", { length: 255 }).notNull(),
+    status: varchar("status", { length: 255 }).notNull(),
+    lease_token: varchar("lease_token", { length: 255 }),
+    lease_generation: bigint("lease_generation", { mode: "bigint" }),
+    access_token_hash: varchar("access_token_hash", { length: 255 }),
+    refresh_token_hash: varchar("refresh_token_hash", { length: 255 }),
+    started_at: timestamp("started_at").notNull(),
+    updated_at: timestamp("updated_at").notNull(),
+    completed_at: timestamp("completed_at"),
+    failure_code: varchar("failure_code", { length: 255 }),
+    row_id: varchar("row_id", { length: 255 })
+      .primaryKey()
+      .notNull()
+      .$defaultFn(() => createId()),
+    tenant: varchar("tenant", { length: 255 }).notNull(),
+  },
+  (table) => [uniqueIndex("oauth_exchange_intent_uidx").on(table.tenant, table.attempt_key)],
+);
+
+export const oauth_credential_item = pgTable(
+  "oauth_credential_item",
+  {
+    attempt_key: varchar("attempt_key", { length: 255 }).notNull(),
+    item_kind: varchar("item_kind", { length: 255 }).notNull(),
+    required: boolean("required").notNull().default(true),
+    provider_key: varchar("provider_key", { length: 255 }).notNull(),
+    item_id: text("item_id").notNull(),
+    token_hash: varchar("token_hash", { length: 255 }).notNull(),
+    status: varchar("status", { length: 255 }).notNull(),
+    lease_token: varchar("lease_token", { length: 255 }),
+    lease_generation: bigint("lease_generation", { mode: "bigint" }),
+    created_at: timestamp("created_at").notNull(),
+    updated_at: timestamp("updated_at").notNull(),
+    stored_at: timestamp("stored_at"),
+    compensated_at: timestamp("compensated_at"),
+    row_id: varchar("row_id", { length: 255 })
+      .primaryKey()
+      .notNull()
+      .$defaultFn(() => createId()),
+    tenant: varchar("tenant", { length: 255 }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("oauth_credential_item_uidx").on(table.tenant, table.attempt_key, table.item_kind),
+  ],
+);
+
+export const oauth_completion_receipt = pgTable(
+  "oauth_completion_receipt",
+  {
+    attempt_key: varchar("attempt_key", { length: 255 }).notNull(),
+    actor_user_id: varchar("actor_user_id", { length: 255 }).notNull(),
+    authenticated_subject_id: varchar("authenticated_subject_id", { length: 255 }).notNull(),
+    organization_id: varchar("organization_id", { length: 255 }).notNull(),
+    workspace_id: varchar("workspace_id", { length: 255 }).notNull(),
+    provider: varchar("provider", { length: 255 }).notNull(),
+    execution_id: varchar("execution_id", { length: 255 }).notNull(),
+    status: varchar("status", { length: 255 }).notNull(),
+    result_reference: text("result_reference").notNull(),
+    connection_owner: varchar("connection_owner", { length: 255 }).notNull(),
+    connection_integration: varchar("connection_integration", { length: 255 }).notNull(),
+    connection_name: varchar("connection_name", { length: 255 }).notNull(),
+    connection_address: text("connection_address").notNull(),
+    request_hash: varchar("request_hash", { length: 255 }).notNull(),
+    descriptor_hash: varchar("descriptor_hash", { length: 255 }).notNull(),
+    started_at: timestamp("started_at").notNull(),
+    completed_at: timestamp("completed_at").notNull(),
+    duration_ms: bigint("duration_ms", { mode: "bigint" }).notNull(),
+    lease_token: varchar("lease_token", { length: 255 }),
+    lease_generation: bigint("lease_generation", { mode: "bigint" }),
+    created_at: timestamp("created_at").notNull(),
+    row_id: varchar("row_id", { length: 255 })
+      .primaryKey()
+      .notNull()
+      .$defaultFn(() => createId()),
+    tenant: varchar("tenant", { length: 255 }).notNull(),
+  },
+  (table) => [uniqueIndex("oauth_completion_receipt_uidx").on(table.tenant, table.attempt_key)],
 );
 
 export const tool = pgTable(
@@ -164,7 +328,7 @@ export const definition = pgTable(
     integration: varchar("integration", { length: 255 }).notNull(),
     connection: varchar("connection", { length: 255 }).notNull(),
     plugin_id: text("plugin_id").notNull(),
-    name: varchar("name", { length: 255 }).notNull(),
+    name: text("name").notNull(),
     schema: json("schema").notNull(),
     created_at: timestamp("created_at").notNull(),
     row_id: varchar("row_id", { length: 255 })

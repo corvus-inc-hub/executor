@@ -27,6 +27,7 @@ import {
   buildAuthorizationUrl,
   createPkceCodeChallenge,
   createPkceCodeVerifier,
+  sanitizeOAuthBoundaryText,
   type OAuthEndpointUrlPolicy,
 } from "./oauth-helpers";
 
@@ -463,7 +464,7 @@ const interpretDcrFailure = (status: number, text: string): DcrErrorBody | DcrTr
       onNone: () =>
         new DcrTransport({
           detail: `Dynamic Client Registration endpoint returned status ${status}${
-            text ? ` — ${text.slice(0, 200)}` : ""
+            text ? ` — ${sanitizeOAuthBoundaryText(text)}` : ""
           }`,
           status,
         }),
@@ -476,7 +477,7 @@ const interpretDcrFailure = (status: number, text: string): DcrErrorBody | DcrTr
             })
           : new DcrTransport({
               detail: `Dynamic Client Registration endpoint returned status ${status}${
-                text ? ` — ${text.slice(0, 200)}` : ""
+                text ? ` — ${sanitizeOAuthBoundaryText(text)}` : ""
               }`,
               status,
             }),
@@ -484,7 +485,7 @@ const interpretDcrFailure = (status: number, text: string): DcrErrorBody | DcrTr
   }
   return new DcrTransport({
     detail: `Dynamic Client Registration endpoint returned status ${status}${
-      text ? ` — ${text.slice(0, 200)}` : ""
+      text ? ` — ${sanitizeOAuthBoundaryText(text)}` : ""
     }`,
     status,
   });
@@ -558,21 +559,16 @@ export const registerDynamicClient = (
       DcrErrorBody: (err) =>
         Effect.fail(
           new OAuthDiscoveryError({
-            message: `Dynamic Client Registration failed: ${err.error}${
-              err.error_description ? ` — ${err.error_description}` : ""
-            }`,
+            message: `Dynamic Client Registration failed: ${sanitizeOAuthBoundaryText(err.error)}`,
             status: err.status,
-            error: err.error,
-            errorDescription: err.error_description,
-            cause: err,
+            error: sanitizeOAuthBoundaryText(err.error),
           }),
         ),
       DcrTransport: (err) =>
         Effect.fail(
           new OAuthDiscoveryError({
-            message: `Dynamic Client Registration failed: ${err.detail}`,
+            message: `Dynamic Client Registration failed: ${sanitizeOAuthBoundaryText(err.detail)}`,
             status: err.status,
-            cause: err.cause ?? err,
           }),
         ),
     }),

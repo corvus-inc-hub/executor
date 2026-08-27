@@ -92,7 +92,7 @@ import {
   type MintOAuthConnectionInput,
   type OAuthScopePolicy,
 } from "./oauth-service";
-import type { OAuthService } from "./oauth-client";
+import type { OAuthCorrelationVerifier, OAuthService } from "./oauth-client";
 import {
   comparePolicyRow,
   isValidPattern,
@@ -427,6 +427,17 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
   readonly redirectUri?: string;
   /** Optional URL selected organization slug to carry inside OAuth `state`. */
   readonly oauthCallbackStateOrgSlug?: string;
+  /** Host authority for correlated OAuth. It verifies the signed envelope,
+   * authenticates actor/organization, and resolves the workspace target. If
+   * absent, correlated OAuth fails closed. */
+  readonly verifyOAuthCorrelation?: OAuthCorrelationVerifier;
+  /** Hosted UI readiness gate. When true, authorization-code OAuth refuses
+   * legacy uncorrelated starts/completions until the host supplies a signed
+   * correlation verifier. */
+  readonly requireOAuthCorrelation?: boolean;
+  /** Test-only lease timing overrides for crash/concurrency boundary tests. */
+  readonly oauthAttemptLeaseMs?: number;
+  readonly oauthAttemptHeartbeatMs?: number;
   readonly oauthEndpointUrlPolicy?: OAuthEndpointUrlPolicy;
   /**
    * Enable the built-in `core-tools` plugin which contributes agent-facing
@@ -3832,6 +3843,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       ownedKeys: (owner: Owner) => ownedKeys(owner),
       defaultWritableProvider,
       mintOAuthConnection: (input: MintOAuthConnectionInput) => mintOAuthConnection(input),
+      getConnection: (ref: ConnectionRef) =>
+        findConnectionRow(ref).pipe(Effect.map((row) => (row ? rowToConnection(row) : null))),
       // One integration-row read + one projector run. Resolve the method this
       // template selects exactly as the runtime's `selectAuthMethod` does —
       // exact slug match, else the sole declared method (single-method
@@ -3864,6 +3877,10 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       // OAuth (cloud, self-host) derive a real `${webBaseUrl}/oauth/callback`.
       redirectUri: config.redirectUri ?? null,
       callbackStateOrgSlug: config.oauthCallbackStateOrgSlug ?? null,
+      verifyCorrelationEnvelope: config.verifyOAuthCorrelation,
+      requireOAuthCorrelation: config.requireOAuthCorrelation,
+      oauthAttemptLeaseMs: config.oauthAttemptLeaseMs,
+      oauthAttemptHeartbeatMs: config.oauthAttemptHeartbeatMs,
     });
 
     // ------------------------------------------------------------------

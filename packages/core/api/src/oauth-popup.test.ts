@@ -7,7 +7,11 @@
 
 import { describe, expect, it } from "@effect/vitest";
 import { Data, Effect, Schema } from "effect";
-import { encodeOAuthCallbackState } from "@executor-js/sdk";
+import {
+  encodeOAuthCallbackState,
+  OAUTH_CORRELATION_SCHEMA_VERSION,
+  type OAuthCorrelationEnvelope,
+} from "@executor-js/sdk";
 
 import {
   OAUTH_POPUP_MESSAGE_TYPE,
@@ -181,6 +185,7 @@ describe("runOAuthCallback", () => {
       code: string | null;
       error: string | null;
       callbackDomain: string | null;
+      correlation: OAuthCorrelationEnvelope | null;
     }> = [];
     await Effect.runPromise(
       runOAuthCallback<GoogleAuth, never, never>({
@@ -200,18 +205,44 @@ describe("runOAuthCallback", () => {
       }),
     );
     expect(received).toEqual([
-      { state: "s1", code: "code1", error: null, callbackDomain: "us5.datadoghq.com" },
+      {
+        state: "s1",
+        code: "code1",
+        error: null,
+        callbackDomain: "us5.datadoghq.com",
+        correlation: null,
+      },
     ]);
   });
 
   it("completes wrapped callback state with the raw OAuth session state", async () => {
-    const providerState = encodeOAuthCallbackState({ state: "session-raw", orgSlug: "default" });
-    const received: Array<{ state: string }> = [];
+    const correlation: OAuthCorrelationEnvelope = {
+      schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
+      attemptKey: "attempt-popup-1",
+      actorUserId: "actor-1",
+      authenticatedSubjectId: "actor-1",
+      organizationId: "org-1",
+      workspaceId: "workspace-1",
+      provider: "acme",
+      keyId: "test",
+      issuedAt: "2026-08-24T19:00:00.000Z",
+      expiresAt: "2026-08-24T20:00:00.000Z",
+      signature: "signed-by-host",
+    };
+    const providerState = encodeOAuthCallbackState({
+      state: "session-raw",
+      orgSlug: "default",
+      correlation,
+    });
+    const received: Array<{
+      state: string;
+      correlation: OAuthCorrelationEnvelope | null;
+    }> = [];
 
     const html = await Effect.runPromise(
       runOAuthCallback<GoogleAuth, never, never>({
         complete: (params) => {
-          received.push({ state: params.state });
+          received.push({ state: params.state, correlation: params.correlation });
           return Effect.succeed({
             kind: "oauth2",
             accessTokenSecretId: "s",
@@ -224,7 +255,7 @@ describe("runOAuthCallback", () => {
       }),
     );
 
-    expect(received).toEqual([{ state: "session-raw" }]);
+    expect(received).toEqual([{ state: "session-raw", correlation }]);
     expect(html).toContain('"sessionId":"session-raw"');
     expect(html).not.toContain(`"sessionId":"${providerState}"`);
   });
@@ -287,10 +318,33 @@ describe("runOAuthCallback", () => {
     expect(html).toContain("<title>Connection failed</title>");
     expect(html).toContain("OAuth provider rejected authorization");
     expect(html).toContain("invalid_scope");
-    expect(html).toContain("unknown scope wizard_session:write");
+    expect(html).not.toContain("unknown scope wizard_session:write");
   });
 
-  it("renders a failure popup when completeOAuth fails and uses toErrorMessage", async () => {
+  it("does not render provider URLs, stack paths, or secret-shaped diagnostics", async () => {
+    const sentinels = [
+      "https://provider.example/private/tenant-42?token=query-secret",
+      "/srv/private/oauth-client.ts:42:7",
+      "api_key=api-secret",
+      '"authorization":"Basic basic-secret"',
+    ];
+    const html = await Effect.runPromise(
+      runOAuthCallback<GoogleAuth, never, never>({
+        complete: () => Effect.die("complete must not run"),
+        urlParams: {
+          state: "s1",
+          error: "server_error",
+          error_description: sentinels.join(" "),
+        },
+        toErrorMessage: () => ({ short: "unused" }),
+        channelName: "c",
+      }),
+    );
+    expect(html).toContain("server_error");
+    for (const sentinel of sentinels) expect(html).not.toContain(sentinel);
+  });
+
+  it("renders fixed diagnostics when completeOAuth fails", async () => {
     class DomainError extends Data.TaggedError("DomainError")<{
       readonly message: string;
     }> {}
@@ -307,12 +361,14 @@ describe("runOAuthCallback", () => {
       }),
     );
     expect(html).toContain("<title>Connection failed</title>");
-    expect(html).toContain("Auth failed");
+    expect(html).toContain("OAuth completion failed");
+    expect(html).not.toContain("Auth failed");
     expect(html).toContain("<summary");
-    expect(html).toContain("Code expired");
+    expect(html).toContain("oauth_failure");
+    expect(html).not.toContain("Code expired");
   });
 
-  it("omits the details disclosure when details match the short message", async () => {
+  it("does not trust mapper summaries or details at the callback boundary", async () => {
     class DomainError extends Data.TaggedError("DomainError")<{
       readonly message: string;
     }> {}
@@ -324,8 +380,9 @@ describe("runOAuthCallback", () => {
         channelName: "c",
       }),
     );
-    expect(html).toContain("Same");
-    expect(html).not.toContain("<details");
+    expect(html).toContain("OAuth completion failed");
+    expect(html).toContain("oauth_failure");
+    expect(html).not.toContain("Same");
   });
 
   it("never rejects — even defects are rendered as a failure popup", async () => {
@@ -338,6 +395,7 @@ describe("runOAuthCallback", () => {
       }),
     );
     expect(html).toContain("<title>Connection failed</title>");
-    expect(html).toContain("transport error");
+    expect(html).toContain("OAuth completion failed");
+    expect(html).not.toContain("transport error");
   });
 });
