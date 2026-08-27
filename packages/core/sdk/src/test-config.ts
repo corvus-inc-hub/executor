@@ -122,6 +122,7 @@ export const TEST_OAUTH_CORRELATION_VERIFIER = (
     schemaVersion: envelope.schemaVersion,
     attemptKey: envelope.attemptKey,
     actorUserId: envelope.actorUserId,
+    authenticatedSubjectId: envelope.authenticatedSubjectId,
     organizationId: envelope.organizationId,
     workspaceId: envelope.workspaceId,
     provider: envelope.provider,

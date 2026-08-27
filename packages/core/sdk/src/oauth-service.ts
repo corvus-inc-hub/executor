@@ -365,6 +365,7 @@ const normalizeCorrelation = (
     schemaVersion: input.schemaVersion,
     attemptKey: input.attemptKey.trim(),
     actorUserId: input.actorUserId.trim(),
+    authenticatedSubjectId: input.authenticatedSubjectId.trim(),
     organizationId: input.organizationId.trim(),
     workspaceId: input.workspaceId.trim(),
     provider: input.provider.trim(),
@@ -384,6 +385,7 @@ const normalizeCorrelationEnvelope = (
     schemaVersion: input.schemaVersion,
     attemptKey: input.attemptKey.trim(),
     actorUserId: input.actorUserId.trim(),
+    authenticatedSubjectId: input.authenticatedSubjectId.trim(),
     organizationId: input.organizationId.trim(),
     workspaceId: input.workspaceId.trim(),
     provider: input.provider.trim(),
@@ -405,6 +407,7 @@ const bindingFromEnvelope = (
   schemaVersion: envelope.schemaVersion,
   attemptKey: envelope.attemptKey,
   actorUserId: envelope.actorUserId,
+  authenticatedSubjectId: envelope.authenticatedSubjectId,
   organizationId: envelope.organizationId,
   workspaceId: envelope.workspaceId,
   provider: envelope.provider,
@@ -436,6 +439,7 @@ const receiptFromRow = (row: Record<string, unknown>): OAuthCompletionReceiptTyp
       receiptKind: "executor.oauth.completion",
       attemptKey: String(row.attempt_key ?? ""),
       actorUserId: String(row.actor_user_id ?? ""),
+      authenticatedSubjectId: String(row.authenticated_subject_id ?? ""),
       organizationId: String(row.organization_id ?? ""),
       workspaceId: String(row.workspace_id ?? ""),
       executionId: String(row.execution_id ?? ""),
@@ -822,6 +826,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           !normalized ||
           normalized.attemptKey !== envelopeBinding.attemptKey ||
           normalized.actorUserId !== envelopeBinding.actorUserId ||
+          normalized.authenticatedSubjectId !== envelopeBinding.authenticatedSubjectId ||
           normalized.organizationId !== envelopeBinding.organizationId ||
           normalized.workspaceId !== envelopeBinding.workspaceId ||
           normalized.provider !== envelopeBinding.provider
@@ -859,10 +864,10 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             }),
           );
         }
-        if (deps.subject === null || binding.actorUserId !== deps.subject) {
+        if (deps.subject === null || binding.authenticatedSubjectId !== deps.subject) {
           return Effect.fail(
             new OAuthStartError({
-              message: "Correlated OAuth requires the authenticated actor subject.",
+              message: "Correlated OAuth requires the bound authenticated subject.",
             }),
           );
         }
@@ -893,6 +898,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
       attemptKey: String(row.attempt_key ?? ""),
       actorUserId: String(row.actor_user_id ?? ""),
+      authenticatedSubjectId: String(row.authenticated_subject_id ?? ""),
       organizationId: String(row.organization_id ?? ""),
       workspaceId: String(row.workspace_id ?? ""),
       provider: String(row.provider ?? ""),
@@ -930,6 +936,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               attempt_key: input.correlation.attemptKey,
               state: String(input.state),
               actor_user_id: input.correlation.actorUserId,
+              authenticated_subject_id: input.correlation.authenticatedSubjectId,
               organization_id: input.correlation.organizationId,
               workspace_id: input.correlation.workspaceId,
               provider: input.correlation.provider,
@@ -966,6 +973,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               },
               attempt_key: input.correlation.attemptKey,
               actor_user_id: input.correlation.actorUserId,
+              authenticated_subject_id: input.correlation.authenticatedSubjectId,
               workspace_id: input.correlation.workspaceId,
               provider: input.correlation.provider,
               descriptor_hash: input.descriptorHash,
@@ -1758,6 +1766,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             },
             attempt_key: null,
             actor_user_id: null,
+            authenticated_subject_id: null,
             workspace_id: null,
             provider: null,
             descriptor_hash: null,
@@ -1843,15 +1852,26 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   const sameCorrelation = (
     left: Pick<
       OAuthCorrelationBindingType,
-      "attemptKey" | "actorUserId" | "organizationId" | "workspaceId" | "provider"
+      | "attemptKey"
+      | "actorUserId"
+      | "authenticatedSubjectId"
+      | "organizationId"
+      | "workspaceId"
+      | "provider"
     >,
     right: Pick<
       OAuthCorrelationBindingType,
-      "attemptKey" | "actorUserId" | "organizationId" | "workspaceId" | "provider"
+      | "attemptKey"
+      | "actorUserId"
+      | "authenticatedSubjectId"
+      | "organizationId"
+      | "workspaceId"
+      | "provider"
     >,
   ): boolean =>
     left.attemptKey === right.attemptKey &&
     left.actorUserId === right.actorUserId &&
+    left.authenticatedSubjectId === right.authenticatedSubjectId &&
     left.organizationId === right.organizationId &&
     left.workspaceId === right.workspaceId &&
     left.provider === right.provider;
@@ -1924,10 +1944,10 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         }),
       );
     }
-    if (deps.subject === null || correlation.actorUserId !== deps.subject) {
+    if (deps.subject === null || correlation.authenticatedSubjectId !== deps.subject) {
       return Effect.fail(
         new OAuthCompleteError({
-          message: "Correlated OAuth requires the authenticated actor subject.",
+          message: "Correlated OAuth requires the bound authenticated subject.",
           restartRequired: false,
         }),
       );
@@ -2025,6 +2045,10 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           clientOwnerFromPayload(sessionRow.payload) ?? (String(sessionRow.owner) as Owner),
         attemptKey: sessionRow.attempt_key == null ? null : String(sessionRow.attempt_key),
         actorUserId: sessionRow.actor_user_id == null ? null : String(sessionRow.actor_user_id),
+        authenticatedSubjectId:
+          sessionRow.authenticated_subject_id == null
+            ? null
+            : String(sessionRow.authenticated_subject_id),
         workspaceId: sessionRow.workspace_id == null ? null : String(sessionRow.workspace_id),
         provider: sessionRow.provider == null ? null : String(sessionRow.provider),
         descriptorHashStored:
@@ -2034,11 +2058,16 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       };
 
       const firstClassStoredCorrelation =
-        session.attemptKey && session.actorUserId && session.workspaceId && session.provider
+        session.attemptKey &&
+        session.actorUserId &&
+        session.authenticatedSubjectId &&
+        session.workspaceId &&
+        session.provider
           ? normalizeCorrelation({
               schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
               attemptKey: session.attemptKey,
               actorUserId: session.actorUserId,
+              authenticatedSubjectId: session.authenticatedSubjectId,
               organizationId: deps.tenant,
               workspaceId: session.workspaceId,
               provider: session.provider,
@@ -2493,6 +2522,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
                 tenant: deps.tenant,
                 attempt_key: correlation.attemptKey,
                 actor_user_id: correlation.actorUserId,
+                authenticated_subject_id: correlation.authenticatedSubjectId,
                 organization_id: correlation.organizationId,
                 workspace_id: correlation.workspaceId,
                 provider: correlation.provider,

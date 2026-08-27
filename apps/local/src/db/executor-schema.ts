@@ -101,6 +101,7 @@ export const oauth_session = sqliteTable(
     payload: text("payload").notNull(),
     attempt_key: text("attempt_key"),
     actor_user_id: text("actor_user_id"),
+    authenticated_subject_id: text("authenticated_subject_id"),
     workspace_id: text("workspace_id"),
     provider: text("provider"),
     descriptor_hash: text("descriptor_hash"),
@@ -125,6 +126,7 @@ export const oauth_attempt = sqliteTable(
     attempt_key: text("attempt_key").notNull(),
     state: text("state").notNull(),
     actor_user_id: text("actor_user_id").notNull(),
+    authenticated_subject_id: text("authenticated_subject_id").notNull(),
     organization_id: text("organization_id").notNull(),
     workspace_id: text("workspace_id").notNull(),
     provider: text("provider").notNull(),
@@ -231,6 +233,7 @@ export const oauth_completion_receipt = sqliteTable(
   {
     attempt_key: text("attempt_key").notNull(),
     actor_user_id: text("actor_user_id").notNull(),
+    authenticated_subject_id: text("authenticated_subject_id").notNull(),
     organization_id: text("organization_id").notNull(),
     workspace_id: text("workspace_id").notNull(),
     provider: text("provider").notNull(),

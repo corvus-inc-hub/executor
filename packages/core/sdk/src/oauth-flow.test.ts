@@ -320,7 +320,8 @@ describe("oauth.start / oauth.complete", () => {
         const correlation = {
           schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
           attemptKey: "attempt-oauth-receipt-1",
-          actorUserId: "test-subject",
+          actorUserId: "human-user-1",
+          authenticatedSubjectId: "test-subject",
           organizationId: "test-tenant",
           workspaceId: "workspace-1",
           provider: "acme",
@@ -345,6 +346,24 @@ describe("oauth.start / oauth.complete", () => {
           authorizationUrl: started.authorizationUrl,
         });
         expect(decodeOAuthCallbackState(callback.state)?.correlation).toEqual(correlation);
+        const requestsBeforeSubjectMismatch = (yield* server.requests).filter(
+          (request) => request.path === "/token",
+        ).length;
+        const subjectMismatch = yield* Effect.flip(
+          executor.oauth.complete({
+            state: started.state,
+            code: callback.code,
+            correlation: {
+              ...correlation,
+              authenticatedSubjectId: "forged-service-subject",
+            },
+          }),
+        );
+        expect(Predicate.isTagged("OAuthCompleteError")(subjectMismatch)).toBe(true);
+        const requestsAfterSubjectMismatch = (yield* server.requests).filter(
+          (request) => request.path === "/token",
+        ).length;
+        expect(requestsAfterSubjectMismatch).toBe(requestsBeforeSubjectMismatch);
         const completed = yield* executor.oauth.complete({
           state: started.state,
           code: callback.code,
@@ -355,6 +374,8 @@ describe("oauth.start / oauth.complete", () => {
         expect(receipt.status).toBe("completed");
         expect(receipt.receiptKind).toBe("executor.oauth.completion");
         expect(receipt.attemptKey).toBe(correlation.attemptKey);
+        expect(receipt.actorUserId).toBe("human-user-1");
+        expect(receipt.authenticatedSubjectId).toBe("test-subject");
         expect(receipt.provider).toBe("acme");
         expect(receipt.connection.address).toBe(String(completed.address));
         expect(receipt.durationMs).toBeGreaterThanOrEqual(0);
@@ -447,6 +468,7 @@ describe("oauth.start / oauth.complete", () => {
           schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
           attemptKey: "attempt-oauth-concurrent-1",
           actorUserId: "test-subject",
+          authenticatedSubjectId: "test-subject",
           organizationId: "test-tenant",
           workspaceId: "workspace-1",
           provider: "acme",
@@ -512,6 +534,7 @@ describe("oauth.start / oauth.complete", () => {
           schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
           attemptKey: "attempt-oauth-subjectless-1",
           actorUserId: "test-subject",
+          authenticatedSubjectId: "test-subject",
           organizationId: "test-tenant",
           workspaceId: "workspace-1",
           provider: "acme",
@@ -547,6 +570,7 @@ describe("oauth.start / oauth.complete", () => {
           schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
           attemptKey: "attempt-oauth-lease-aba-1",
           actorUserId: "test-subject",
+          authenticatedSubjectId: "test-subject",
           organizationId: "test-tenant",
           workspaceId: "workspace-1",
           provider: "acme",
@@ -632,6 +656,7 @@ describe("oauth.start / oauth.complete", () => {
           schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
           attemptKey: "attempt-oauth-prepared-recovery-1",
           actorUserId: "test-subject",
+          authenticatedSubjectId: "test-subject",
           organizationId: "test-tenant",
           workspaceId: "workspace-1",
           provider: "acme",
@@ -720,6 +745,7 @@ describe("oauth.start / oauth.complete", () => {
           schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
           attemptKey: "attempt-oauth-partial-items-1",
           actorUserId: "test-subject",
+          authenticatedSubjectId: "test-subject",
           organizationId: "test-tenant",
           workspaceId: "workspace-1",
           provider: "acme",
@@ -825,6 +851,7 @@ describe("oauth.start / oauth.complete", () => {
           schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
           attemptKey: "attempt-oauth-delayed-provider-1",
           actorUserId: "test-subject",
+          authenticatedSubjectId: "test-subject",
           organizationId: "test-tenant",
           workspaceId: "workspace-1",
           provider: "acme",
@@ -900,6 +927,7 @@ describe("oauth.start / oauth.complete", () => {
           schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
           attemptKey: "attempt-oauth-crash-recovery-1",
           actorUserId: "test-subject",
+          authenticatedSubjectId: "test-subject",
           organizationId: "test-tenant",
           workspaceId: "workspace-1",
           provider: "recovery",
@@ -1263,6 +1291,7 @@ describe("oauth.start / oauth.complete", () => {
               schemaVersion: envelope.schemaVersion,
               attemptKey: envelope.attemptKey,
               actorUserId: envelope.actorUserId,
+              authenticatedSubjectId: envelope.authenticatedSubjectId,
               organizationId: envelope.organizationId,
               workspaceId: "authoritative-workspace",
               provider: envelope.provider,
@@ -1295,6 +1324,7 @@ describe("oauth.start / oauth.complete", () => {
           schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
           attemptKey: "attempt-oauth-forged-workspace-1",
           actorUserId: "test-subject",
+          authenticatedSubjectId: "test-subject",
           organizationId: "test-tenant",
           workspaceId: "caller-workspace",
           provider: "acme",

@@ -91,6 +91,7 @@ const seedTenant = async (db: DrizzleDb, tenant: string, tag: string) => {
   await db.insert(oauth_completion_receipt).values({
     attempt_key: `attempt-${tag}`,
     actor_user_id: "actor",
+    authenticated_subject_id: "service-subject",
     organization_id: tenant,
     workspace_id: "workspace",
     provider: "github",
@@ -113,6 +114,7 @@ const seedTenant = async (db: DrizzleDb, tenant: string, tag: string) => {
     attempt_key: `attempt-${tag}`,
     state: `state-${tag}`,
     actor_user_id: "actor",
+    authenticated_subject_id: "service-subject",
     organization_id: tenant,
     workspace_id: "workspace",
     provider: "int",

@@ -57,6 +57,13 @@
       "when": 1787607843539,
       "tag": "0007_loud_mastermind",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1787827737372,
+      "tag": "0008_dusty_reavers",
+      "breakpoints": true
     }
   ]
 }

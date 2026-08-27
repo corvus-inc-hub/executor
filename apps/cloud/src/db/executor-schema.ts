@@ -114,6 +114,7 @@ export const oauth_session = pgTable(
     payload: json("payload").notNull(),
     attempt_key: varchar("attempt_key", { length: 255 }),
     actor_user_id: varchar("actor_user_id", { length: 255 }),
+    authenticated_subject_id: varchar("authenticated_subject_id", { length: 255 }),
     workspace_id: varchar("workspace_id", { length: 255 }),
     provider: varchar("provider", { length: 255 }),
     descriptor_hash: varchar("descriptor_hash", { length: 255 }),
@@ -141,6 +142,7 @@ export const oauth_attempt = pgTable(
     attempt_key: varchar("attempt_key", { length: 255 }).notNull(),
     state: varchar("state", { length: 255 }).notNull(),
     actor_user_id: varchar("actor_user_id", { length: 255 }).notNull(),
+    authenticated_subject_id: varchar("authenticated_subject_id", { length: 255 }).notNull(),
     organization_id: varchar("organization_id", { length: 255 }).notNull(),
     workspace_id: varchar("workspace_id", { length: 255 }).notNull(),
     provider: varchar("provider", { length: 255 }).notNull(),
@@ -259,6 +261,7 @@ export const oauth_completion_receipt = pgTable(
   {
     attempt_key: varchar("attempt_key", { length: 255 }).notNull(),
     actor_user_id: varchar("actor_user_id", { length: 255 }).notNull(),
+    authenticated_subject_id: varchar("authenticated_subject_id", { length: 255 }).notNull(),
     organization_id: varchar("organization_id", { length: 255 }).notNull(),
     workspace_id: varchar("workspace_id", { length: 255 }).notNull(),
     provider: varchar("provider", { length: 255 }).notNull(),

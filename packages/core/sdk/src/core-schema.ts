@@ -261,6 +261,7 @@ export const coreTables = defineTables({
       // reserved for legacy scope/client metadata and is not the authority.
       attempt_key: nullableKeyColumn("attempt_key"),
       actor_user_id: nullableKeyColumn("actor_user_id"),
+      authenticated_subject_id: nullableKeyColumn("authenticated_subject_id"),
       workspace_id: nullableKeyColumn("workspace_id"),
       provider: nullableKeyColumn("provider"),
       descriptor_hash: nullableKeyColumn("descriptor_hash"),
@@ -285,6 +286,7 @@ export const coreTables = defineTables({
       attempt_key: keyColumn("attempt_key"),
       state: keyColumn("state"),
       actor_user_id: keyColumn("actor_user_id"),
+      authenticated_subject_id: keyColumn("authenticated_subject_id"),
       organization_id: keyColumn("organization_id"),
       workspace_id: keyColumn("workspace_id"),
       provider: keyColumn("provider"),
@@ -348,6 +350,7 @@ export const coreTables = defineTables({
     {
       attempt_key: keyColumn("attempt_key"),
       actor_user_id: keyColumn("actor_user_id"),
+      authenticated_subject_id: keyColumn("authenticated_subject_id"),
       organization_id: keyColumn("organization_id"),
       workspace_id: keyColumn("workspace_id"),
       provider: keyColumn("provider"),

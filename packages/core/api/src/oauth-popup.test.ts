@@ -220,6 +220,7 @@ describe("runOAuthCallback", () => {
       schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
       attemptKey: "attempt-popup-1",
       actorUserId: "actor-1",
+      authenticatedSubjectId: "actor-1",
       organizationId: "org-1",
       workspaceId: "workspace-1",
       provider: "acme",

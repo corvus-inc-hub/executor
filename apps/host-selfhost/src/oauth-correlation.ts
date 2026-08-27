@@ -86,6 +86,7 @@ const verifyEnvelope = (
     schemaVersion: envelope.schemaVersion,
     attemptKey: envelope.attemptKey,
     actorUserId: envelope.actorUserId,
+    authenticatedSubjectId: envelope.authenticatedSubjectId,
     organizationId: envelope.organizationId,
     workspaceId: envelope.workspaceId,
     provider: envelope.provider,

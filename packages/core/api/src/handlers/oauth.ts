@@ -192,6 +192,7 @@ export const OAuthHandlers = HttpApiBuilder.group(ExecutorApi, "oauth", (handler
               schemaVersion: OAUTH_CORRELATION_SCHEMA_VERSION,
               attemptKey: params.attemptKey,
               actorUserId: query.actorUserId,
+              authenticatedSubjectId: query.authenticatedSubjectId,
               organizationId: query.organizationId,
               workspaceId: query.workspaceId,
               provider: query.provider,

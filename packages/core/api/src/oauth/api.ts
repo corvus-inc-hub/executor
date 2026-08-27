@@ -200,6 +200,7 @@ const CompletePayload = Schema.Struct({
 const ReceiptLookupParams = { attemptKey: Schema.NonEmptyString };
 const ReceiptLookupQuery = Schema.Struct({
   actorUserId: Schema.NonEmptyString,
+  authenticatedSubjectId: Schema.NonEmptyString,
   organizationId: Schema.NonEmptyString,
   workspaceId: Schema.NonEmptyString,
   provider: Schema.NonEmptyString,
