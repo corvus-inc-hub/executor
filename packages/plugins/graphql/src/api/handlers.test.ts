@@ -15,9 +15,15 @@ import { describe, expect, it } from "@effect/vitest";
 import { Effect, Layer } from "effect";
 
 import { addGroup, observabilityMiddleware } from "@executor-js/api";
-import { CoreHandlers, ExecutionEngineService, ExecutorService } from "@executor-js/api/server";
+import {
+  AuthContext,
+  CoreHandlers,
+  ExecutionEngineService,
+  ExecutorService,
+} from "@executor-js/api/server";
 
 import { expandGraphqlAuthMethodInputs } from "../sdk/types";
+import { GraphqlManagedOAuthProfileNotConfiguredError } from "../sdk/errors";
 import type { GraphqlPluginExtension } from "../sdk/plugin";
 import type {
   GraphqlAuthMethod,
@@ -61,6 +67,7 @@ const makeStubExtension = (
     getIntegration: () => unused,
     removeIntegration: () => unused,
     configure: () => unused,
+    ensureManagedOAuthProfile: () => unused,
     getConfig: (slug: string) => Effect.sync(() => store.get(slug) ?? null),
     configureAuth: (
       slug: string,
@@ -88,7 +95,28 @@ const UnusedExecutionEngine = Layer.succeed(ExecutionEngineService)(
   {} as ExecutionEngineService["Service"],
 );
 
-const webHandlerFor = (extension: GraphqlPluginExtension) =>
+const authLayer = (
+  organizationId: string,
+  roles: readonly string[],
+  kind: "user" | "service" = "service",
+  accountId = kind === "service" ? "client_manifest" : "user_manifest",
+) => {
+  const auth = {
+    kind,
+    accountId,
+    organizationId,
+    email: "",
+    name: "Manifest service",
+    avatarUrl: null,
+    roles,
+  };
+  return Layer.succeed(AuthContext)(auth);
+};
+
+const webHandlerFor = (
+  extension: GraphqlPluginExtension,
+  auth = authLayer("org_target", ["service"]),
+) =>
   Effect.acquireRelease(
     Effect.sync(() =>
       HttpRouter.toWebHandler(
@@ -98,6 +126,7 @@ const webHandlerFor = (extension: GraphqlPluginExtension) =>
           Layer.provide(observabilityMiddleware(Api)),
           Layer.provide(UnusedExecutor),
           Layer.provide(UnusedExecutionEngine),
+          Layer.provide(auth),
           Layer.provide(Layer.succeed(GraphqlExtensionService, extension)),
           Layer.provideMerge(HttpServer.layerServices),
           Layer.provideMerge(Layer.succeed(HttpRouter.RouterConfig)({ maxParamLength: 1000 })),
@@ -138,6 +167,126 @@ const get = (web: { handler: (request: Request) => Promise<Response> }, url: str
   Effect.promise(() => web.handler(new Request(url, { method: "GET" })));
 
 describe("GraphqlHandlers — config surface", () => {
+  it.effect(
+    "binds a service-only ensure to the authenticated organization without a secret payload",
+    () =>
+      Effect.gen(function* () {
+        const calls: string[] = [];
+        const result = {
+          profile: "github",
+          readiness: "ready" as const,
+          integration: { slug: "github", action: "created" as const },
+          oauthClient: {
+            owner: "org" as const,
+            slug: "github-prod",
+            clientId: "public-client-id",
+            action: "created" as const,
+            credentialReferencePresent: true as const,
+          },
+        };
+        const extension = {
+          ...makeStubExtension(seededStore()),
+          ensureManagedOAuthProfile: (profile: string) =>
+            Effect.sync(() => {
+              calls.push(profile);
+              return result;
+            }),
+        };
+        const serviceWeb = (yield* webHandlerFor(extension)) as {
+          handler: (request: Request) => Promise<Response>;
+        };
+
+        const serviceResponse = yield* post(
+          serviceWeb,
+          "http://localhost/graphql/managed-oauth/profiles/github/ensure",
+          {},
+        );
+        expect(serviceResponse.status).toBe(200);
+        expect(yield* Effect.promise(() => serviceResponse.json())).toEqual({
+          ...result,
+          organizationId: "org_target",
+        });
+        expect(calls).toEqual(["github"]);
+
+        const humanWeb = (yield* webHandlerFor(
+          extension,
+          authLayer("org_target", ["member"], "user"),
+        )) as {
+          handler: (request: Request) => Promise<Response>;
+        };
+        const humanResponse = yield* post(
+          humanWeb,
+          "http://localhost/graphql/managed-oauth/profiles/github/ensure",
+          {},
+        );
+        expect(humanResponse.status).toBe(403);
+
+        const roleCollisionWeb = (yield* webHandlerFor(
+          extension,
+          authLayer("org_target", ["service"], "user", "user_role_collision"),
+        )) as { handler: (request: Request) => Promise<Response> };
+        const roleCollisionResponse = yield* post(
+          roleCollisionWeb,
+          "http://localhost/graphql/managed-oauth/profiles/github/ensure",
+          {},
+        );
+        expect(roleCollisionResponse.status).toBe(403);
+
+        const organizationApiKeyWeb = (yield* webHandlerFor(
+          extension,
+          authLayer("org_target", ["service"], "user", "api-key:organization"),
+        )) as { handler: (request: Request) => Promise<Response> };
+        const organizationApiKeyResponse = yield* post(
+          organizationApiKeyWeb,
+          "http://localhost/graphql/managed-oauth/profiles/github/ensure",
+          {},
+        );
+        expect(organizationApiKeyResponse.status).toBe(403);
+        expect(calls).toEqual(["github"]);
+
+        const attemptedOverride = yield* post(
+          serviceWeb,
+          "http://localhost/graphql/managed-oauth/profiles/github/ensure",
+          { organizationId: "org_other" },
+        );
+        expect(attemptedOverride.status).toBe(200);
+        expect(yield* Effect.promise(() => attemptedOverride.json())).toMatchObject({
+          organizationId: "org_target",
+        });
+        expect(calls).toEqual(["github", "github"]);
+      }),
+  );
+
+  it.effect("returns a typed 404 for an unconfigured managed OAuth profile", () =>
+    Effect.gen(function* () {
+      const extension = {
+        ...makeStubExtension(seededStore()),
+        ensureManagedOAuthProfile: (profile: string) =>
+          Effect.fail(
+            new GraphqlManagedOAuthProfileNotConfiguredError({
+              profile,
+              message: "Managed OAuth profile is not configured on this Executor host.",
+            }),
+          ),
+      };
+      const web = (yield* webHandlerFor(extension)) as {
+        handler: (request: Request) => Promise<Response>;
+      };
+
+      const response = yield* post(
+        web,
+        "http://localhost/graphql/managed-oauth/profiles/missing/ensure",
+        {},
+      );
+
+      expect(response.status).toBe(404);
+      expect(yield* Effect.promise(() => response.json())).toMatchObject({
+        _tag: "GraphqlManagedOAuthProfileNotConfiguredError",
+        profile: "missing",
+      });
+    }),
+  );
+
   it.effect("configure merge-appends a custom method and getConfig round-trips it", () =>
     Effect.gen(function* () {
       const store = seededStore();

@@ -28,12 +28,12 @@ import type { Cause } from "effect";
 // ---------------------------------------------------------------------------
 // Shared domain — the authenticated principal.
 //
-// One word per concept: this is the SAME authenticated-caller noun the
-// executor-API runs on (`Principal` in `@executor-js/api/server`); the shapes
-// are byte-identical so the Better Auth / WorkOS adapters map onto it without
-// translation. host-mcp keeps its own Schema'd copy (it does not depend on
-// `@executor-js/api`) so it remains the validated boundary between auth
-// (provider) and serving (envelope).
+// One word per concept: this is the same authenticated-caller noun the
+// executor API uses for tenancy, ownership, and display. host-mcp keeps its own
+// Schema'd copy (it does not depend on `@executor-js/api`) so it remains the
+// validated seam between auth and serving. The HTTP API Principal additionally
+// carries a trusted credential kind used by service-only control routes; MCP
+// role strings intentionally do not confer that HTTP authority.
 // ---------------------------------------------------------------------------
 
 export const Principal = Schema.Struct({

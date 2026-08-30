@@ -2,7 +2,13 @@ import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi";
 import { Schema } from "effect";
 import { InternalError, IntegrationAlreadyExistsError } from "@executor-js/sdk/shared";
 
-import { GraphqlIntrospectionError, GraphqlExtractionError } from "../sdk/errors";
+import {
+  GraphqlExtractionError,
+  GraphqlIntrospectionError,
+  GraphqlManagedOAuthProfileConflictError,
+  GraphqlManagedOAuthProfileForbiddenError,
+  GraphqlManagedOAuthProfileNotConfiguredError,
+} from "../sdk/errors";
 import { GraphqlAuthMethod, GraphqlAuthMethodInput } from "../sdk/types";
 
 // ---------------------------------------------------------------------------
@@ -11,6 +17,10 @@ import { GraphqlAuthMethod, GraphqlAuthMethodInput } from "../sdk/types";
 
 const IntegrationParams = {
   slug: Schema.String,
+};
+
+const ManagedOAuthProfileParams = {
+  profile: Schema.String,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,6 +74,23 @@ const ConfigureResponse = Schema.Struct({
   authenticationTemplate: Schema.Array(GraphqlAuthMethod),
 });
 
+const EnsureManagedOAuthProfileResponse = Schema.Struct({
+  profile: Schema.String,
+  organizationId: Schema.String,
+  readiness: Schema.Literal("ready"),
+  integration: Schema.Struct({
+    slug: Schema.String,
+    action: Schema.Literals(["created", "already-exact"]),
+  }),
+  oauthClient: Schema.Struct({
+    owner: Schema.Literal("org"),
+    slug: Schema.String,
+    clientId: Schema.String,
+    action: Schema.Literals(["created", "repaired-secret", "already-exact"]),
+    credentialReferencePresent: Schema.Literal(true),
+  }),
+});
+
 // ---------------------------------------------------------------------------
 // Errors with HTTP status
 // ---------------------------------------------------------------------------
@@ -72,6 +99,15 @@ const IntrospectionError = GraphqlIntrospectionError.annotate({
   httpApiStatus: 400,
 });
 const ExtractionError = GraphqlExtractionError.annotate({ httpApiStatus: 400 });
+const ManagedOAuthProfileNotConfiguredError = GraphqlManagedOAuthProfileNotConfiguredError.annotate(
+  { httpApiStatus: 404 },
+);
+const ManagedOAuthProfileConflictError = GraphqlManagedOAuthProfileConflictError.annotate({
+  httpApiStatus: 409,
+});
+const ManagedOAuthProfileForbiddenError = GraphqlManagedOAuthProfileForbiddenError.annotate({
+  httpApiStatus: 403,
+});
 
 // ---------------------------------------------------------------------------
 // Group — the GraphQL HTTP surface over integrations.
@@ -87,9 +123,23 @@ const GraphqlErrors = [
   IntrospectionError,
   ExtractionError,
   IntegrationAlreadyExistsError,
+  ManagedOAuthProfileNotConfiguredError,
+  ManagedOAuthProfileConflictError,
+  ManagedOAuthProfileForbiddenError,
 ] as const;
 
 export const GraphqlGroup = HttpApiGroup.make("graphql")
+  .add(
+    HttpApiEndpoint.post(
+      "ensureManagedOAuthProfile",
+      "/graphql/managed-oauth/profiles/:profile/ensure",
+      {
+        params: ManagedOAuthProfileParams,
+        success: EnsureManagedOAuthProfileResponse,
+        error: GraphqlErrors,
+      },
+    ),
+  )
   .add(
     HttpApiEndpoint.post("addIntegration", "/graphql/integrations", {
       payload: AddIntegrationPayload,

@@ -85,6 +85,7 @@ describe("protected API key auth", () => {
       );
 
       expect(identity).toEqual({
+        kind: "user",
         accountId: "user_123",
         organizationId: "org_123",
         organizationName: "Org org_123",

@@ -50,6 +50,7 @@ const OrgAuthMiddleware = HttpRouter.middleware<{ provides: AuthContext }>()(
 
         const session = sessionFromSealed(result, cookieValue);
         const auth = AuthContext.of({
+          kind: "user",
           accountId: session.accountId,
           organizationId: org.id,
           email: session.email,

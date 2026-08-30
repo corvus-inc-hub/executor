@@ -176,66 +176,95 @@ describe("provider", () => {
     expect(entries.map((e) => e.id).sort()).toEqual(["alpha", "beta"]);
   });
 });
-
-describe("partition derivation", () => {
-  const orgItem = id("connection:org:tiny:gh:token");
-  const userItem = id("connection:user:tiny:gh:token");
-
-  test("an org connection item written by a user-bound executor lands in the org partition", async () => {
+describe("owner-aware item custody", () => {
+  test.each([
+    "connection:org:github:main:token",
+    "oauth:org:github-prod:access_token",
+    "oauth-client:org:github-prod:secret",
+  ])("a subject-bound service write stores %s in the organization partition", async (itemId) => {
     const { provider, rows } = makeProvider("master", Owner.make("user"));
-    await Effect.runPromise(provider.set!(orgItem, "org-secret"));
-    const stored = [...rows.values()];
-    expect(stored).toHaveLength(1);
-    expect(stored[0]!.owner).toBe("org");
-    expect(await Effect.runPromise(provider.get(orgItem))).toBe("org-secret");
+    await Effect.runPromise(provider.set!(id(itemId), "secret"));
+
+    expect([...rows.values()]).toHaveLength(1);
+    expect([...rows.values()][0]!.owner).toBe("org");
+    expect(await Effect.runPromise(provider.get(id(itemId)))).toBe("secret");
   });
 
-  test("a user connection item stays in the writing subject's user partition", async () => {
+  test.each([
+    "connection:user:github:main:token",
+    "oauth:user:github-prod:access_token",
+    "oauth-client:user:github-prod:secret",
+  ])("a user-owned item %s stays in the user partition", async (itemId) => {
     const { provider, rows } = makeProvider("master", Owner.make("user"));
-    await Effect.runPromise(provider.set!(userItem, "user-secret"));
-    const stored = [...rows.values()];
-    expect(stored).toHaveLength(1);
-    expect(stored[0]!.owner).toBe("user");
-  });
+    await Effect.runPromise(provider.set!(id(itemId), "secret"));
 
-  test("a non-connection item keeps the binding-derived owner", async () => {
-    const { provider, rows } = makeProvider("master", Owner.make("user"));
-    await Effect.runPromise(provider.set!(id("plain"), "v"));
     expect([...rows.values()][0]!.owner).toBe("user");
   });
 
-  test("re-saving an org item clears a stray pre-fix user-partition copy", async () => {
+  test("an organization rewrite removes the subject's stale shadow copy", async () => {
+    const itemId = id("oauth-client:org:github-prod:secret");
     const { provider, rows } = makeProvider("master", Owner.make("user"));
-    // Simulate a pre-fix write: the org item's payload stranded in the writing
-    // subject's user partition, where it shadows the org row on read.
-    rows.set(`user secrets ${orgItem}`, {
+    rows.set(`user secrets ${itemId}`, {
       owner: Owner.make("user"),
-      key: orgItem,
+      key: itemId,
       collection: "secrets",
       data: "v1.stale",
     });
-    await Effect.runPromise(provider.set!(orgItem, "fresh"));
-    const stored = [...rows.values()];
-    expect(stored).toHaveLength(1);
-    expect(stored[0]!.owner).toBe("org");
-    expect(await Effect.runPromise(provider.get(orgItem))).toBe("fresh");
+
+    await Effect.runPromise(provider.set!(itemId, "fresh"));
+
+    expect([...rows.values()]).toHaveLength(1);
+    expect([...rows.values()][0]!.owner).toBe("org");
+    expect(await Effect.runPromise(provider.get(itemId))).toBe("fresh");
   });
 
-  test("deleting an org item clears both the org row and a stray user copy", async () => {
+  test("an exact legacy service-user secret is not accepted as organization-ready", async () => {
+    const itemId = id("oauth-client:org:github-prod:secret");
     const { provider, rows } = makeProvider("master", Owner.make("user"));
-    rows.set(`org secrets ${orgItem}`, {
+    const legacyPayload = await Effect.runPromise(
+      encryptSecret(deriveKey("master"), "managed-client-secret"),
+    );
+    rows.set(`user secrets ${itemId}`, {
+      owner: Owner.make("user"),
+      key: itemId,
+      collection: "secrets",
+      data: legacyPayload,
+    });
+
+    expect(await Effect.runPromise(provider.get(itemId))).toBeNull();
+    expect(await Effect.runPromise(provider.has!(itemId))).toBe(false);
+
+    await Effect.runPromise(provider.set!(itemId, "managed-client-secret"));
+
+    expect(await Effect.runPromise(provider.get(itemId))).toBe("managed-client-secret");
+    expect(rows.has(`org secrets ${itemId}`)).toBe(true);
+    expect(rows.has(`user secrets ${itemId}`)).toBe(false);
+  });
+
+  test("deleting an organization item clears both the exact row and a stale user shadow", async () => {
+    const itemId = id("oauth-client:org:github-prod:secret");
+    const { provider, rows } = makeProvider("master", Owner.make("user"));
+    rows.set(`org secrets ${itemId}`, {
       owner: Owner.make("org"),
-      key: orgItem,
+      key: itemId,
       collection: "secrets",
       data: "v1.current",
     });
-    rows.set(`user secrets ${orgItem}`, {
+    rows.set(`user secrets ${itemId}`, {
       owner: Owner.make("user"),
-      key: orgItem,
+      key: itemId,
       collection: "secrets",
       data: "v1.stale",
     });
-    await Effect.runPromise(provider.delete!(orgItem));
+
+    await Effect.runPromise(provider.delete!(itemId));
+
     expect(rows.size).toBe(0);
+  });
+
+  test("an opaque item keeps the subject-derived partition", async () => {
+    const { provider, rows } = makeProvider("master", Owner.make("user"));
+    await Effect.runPromise(provider.set!(id("opaque"), "secret"));
+    expect([...rows.values()][0]!.owner).toBe("user");
   });
 });

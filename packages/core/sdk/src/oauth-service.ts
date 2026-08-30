@@ -975,6 +975,31 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         ),
       );
 
+  /** Safe exactness probe for host-managed confidential apps. Stored bytes are
+   *  compared inside the service and are never returned or logged. */
+  const clientSecretMatches = (
+    owner: Owner,
+    slug: OAuthClientSlug,
+    expectedSecret: string,
+  ): Effect.Effect<boolean, StorageFailure> =>
+    deps.fuma
+      .use("oauth_client.findSecretReference", (db) =>
+        looseDb(db).findFirst("oauth_client", {
+          where: (b: any) => b.and(b("owner", "=", owner), b("slug", "=", String(slug))),
+        }),
+      )
+      .pipe(
+        Effect.flatMap((row) => {
+          const itemId = row?.client_secret_item_id;
+          if (typeof itemId !== "string" || itemId.length === 0) return Effect.succeed(false);
+          const provider = deps.defaultWritableProvider();
+          if (!provider) return Effect.succeed(false);
+          return provider
+            .get(ProviderItemId.make(itemId))
+            .pipe(Effect.map((value) => value === expectedSecret));
+        }),
+      );
+
   // -----------------------------------------------------------------------
   // Load an oauth_client row by (owner, slug).
   // -----------------------------------------------------------------------
@@ -1476,6 +1501,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     removeClient,
     registerDynamicClient,
     listClients,
+    clientSecretMatches,
     start,
     complete,
     cancel,

@@ -1,7 +1,28 @@
 import type { Effect } from "effect";
 
 import type { StorageFailure } from "./fuma-runtime";
-import type { ProviderItemId, ProviderKey } from "./ids";
+import { Owner, type ProviderItemId, type ProviderKey } from "./ids";
+
+const OWNER_SCOPED_ITEM_PREFIXES: ReadonlySet<string> = new Set([
+  "connection",
+  "oauth",
+  "oauth-client",
+]);
+
+/** The logical owner carried by a core credential item id. Provider backends
+ *  use this instead of the acting caller when deciding where shared material
+ *  belongs. Opaque third-party item ids return null. */
+export const providerItemOwner = (id: ProviderItemId): Owner | null => {
+  const [prefix, embeddedOwner] = String(id).split(":");
+  if (!OWNER_SCOPED_ITEM_PREFIXES.has(prefix ?? "")) return null;
+  if (embeddedOwner === "org" || embeddedOwner === "user") return Owner.make(embeddedOwner);
+  return null;
+};
+
+/** Resolve an item's embedded owner, falling back to the active executor
+ *  binding only for ids that do not carry a core ownership segment. */
+export const ownerForProviderItem = (id: ProviderItemId, fallback: Owner): Owner =>
+  providerItemOwner(id) ?? fallback;
 
 /* Where a credential's value actually lives — the v2 successor to v1's
  * `SecretProvider`. The default store holds pasted values; external backends

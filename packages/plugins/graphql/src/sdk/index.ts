@@ -9,6 +9,8 @@ export {
   type GraphqlAddIntegrationInput,
   type GraphqlConfigureInput,
   type GraphqlConfigureAuthInput,
+  type GraphqlManagedOAuthEnsureResult,
+  type GraphqlManagedOAuthProfile,
 } from "./plugin";
 export { makeDefaultGraphqlStore, type GraphqlStore, type StoredOperation } from "./store";
 export {
@@ -23,6 +25,9 @@ export {
   GraphqlExtractionError,
   GraphqlInvocationError,
   GraphqlAuthRequiredError,
+  GraphqlManagedOAuthProfileConflictError,
+  GraphqlManagedOAuthProfileForbiddenError,
+  GraphqlManagedOAuthProfileNotConfiguredError,
 } from "./errors";
 
 export {

@@ -20,6 +20,7 @@ import { toolkitsPlugin } from "@executor-js/plugin-toolkits/server";
 
 import { resolveSecretKey } from "./src/config";
 import { awsRoleIntegrationPlugin } from "./src/aws-role-integration";
+import { managedGraphqlOAuthProfilesFromEnv } from "./src/managed-oauth-profiles";
 
 // ---------------------------------------------------------------------------
 // Single source of truth for the self-hosted app's plugin list.
@@ -37,17 +38,24 @@ interface SelfHostPluginDeps {
   /** Accepted for test-harness parity; the Microsoft Graph URL override moved
    *  into the OpenAPI provider presets, so the factory no longer reads it. */
   readonly allowLocalNetwork?: boolean;
+  readonly managedGraphqlOAuthProfiles?: readonly import("@executor-js/plugin-graphql").GraphqlManagedOAuthProfile[];
 }
 
 export default defineExecutorConfig({
-  plugins: ({ activeToolkitSlug, sourceKinds }: SelfHostPluginDeps = {}) =>
+  plugins: ({
+    activeToolkitSlug,
+    sourceKinds,
+    managedGraphqlOAuthProfiles,
+  }: SelfHostPluginDeps = {}) =>
     [
       openApiHttpPlugin({
         presets: [...googleCatalog, ...microsoftCatalog],
         specFormats: [googleDiscoveryAdapter, microsoftGraphAdapter],
       }),
       mcpHttpPlugin({ dangerouslyAllowStdioMCP: false }),
-      graphqlHttpPlugin(),
+      graphqlHttpPlugin({
+        managedOAuthProfiles: managedGraphqlOAuthProfiles ?? managedGraphqlOAuthProfilesFromEnv(),
+      }),
       appsHttpPlugin({
         executor: makeWorkerdAppToolExecutor(),
         bundler: makeWorkerBundlerBackend(),

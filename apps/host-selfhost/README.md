@@ -70,6 +70,8 @@ or invalid.
 | `WORKOS_CREDENTIAL_LEASE_SCOPE`                 | no          | Required M2M scope, default `credentials:lease`.                                |
 | `EXECUTOR_CREDENTIAL_LEASE_DEFAULT_TTL_SECONDS` | no          | Default lease TTL, 3600 seconds.                                                |
 | `EXECUTOR_CREDENTIAL_LEASE_MAX_TTL_SECONDS`     | no          | Maximum lease TTL, 3600 seconds.                                                |
+| `EXECUTOR_MANAGED_GITHUB_OAUTH_CLIENT_ID`       | for GitHub  | Host-owned GitHub OAuth application client ID.                                  |
+| `EXECUTOR_MANAGED_GITHUB_OAUTH_CLIENT_SECRET`   | for GitHub  | Host-owned GitHub OAuth application secret; never returned to callers.          |
 | `EXECUTOR_SECRET_KEY`                           | recommended | Encrypts Executor credentials. Otherwise generated under `/data`.               |
 
 `WORKOS_API_URL` is an optional WorkOS API override intended for a local
@@ -188,6 +190,27 @@ io.mnfst.executor.upstream-revision=<exact commit in upstream-baseline.txt>
 
 Publishing an image does not deploy it. Deployment and digest updates belong to
 the separate `sst-executor` infrastructure repository.
+
+## Host-managed GitHub OAuth
+
+An Executor host with a service identity provider can own one GitHub OAuth app
+and project it into organizations without asking each workspace administrator
+for a client ID or secret. Set both
+`EXECUTOR_MANAGED_GITHUB_OAUTH_CLIENT_ID` and
+`EXECUTOR_MANAGED_GITHUB_OAUTH_CLIENT_SECRET`; setting only one refuses to boot.
+
+The typed GraphQL API exposes
+`POST /graphql/managed-oauth/profiles/:profile/ensure`. It has no provisioning
+payload: the target organization comes exclusively from the verified request
+identity. The handler accepts only a principal with the `service` role.
+Ensuring the `github` profile creates the canonical GitHub GraphQL
+integration and an organization-owned `github-prod` OAuth client. The response
+contains readiness and public identities only; secret bytes are never returned
+or logged.
+
+GitHub does not support Dynamic Client Registration. The host credential is
+therefore deployment configuration, while workspace projection remains an
+idempotent no-secret operation.
 
 ## Develop and check
 
