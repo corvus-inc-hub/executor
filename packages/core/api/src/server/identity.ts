@@ -22,6 +22,10 @@
 
 import { Context, Effect, Schema } from "effect";
 
+/** Credential class established by the verified identity adapter. Role names
+ *  are tenant data and must never be used to infer this authority. */
+export type PrincipalKind = "user" | "service";
+
 /**
  * The provider-neutral resolved identity. Both self-host's AuthProvider impls
  * (single-admin, Better Auth) and cloud's WorkOS path produce this. Self-host's
@@ -29,6 +33,7 @@ import { Context, Effect, Schema } from "effect";
  * resolver already yielded it) AND `roles` (cloud supplies `[]`).
  */
 export interface Principal {
+  readonly kind: PrincipalKind;
   readonly accountId: string;
   readonly organizationId: string;
   readonly organizationName: string;
@@ -53,6 +58,7 @@ export interface Principal {
 export class AuthContext extends Context.Service<
   AuthContext,
   {
+    readonly kind: PrincipalKind;
     readonly accountId: string;
     readonly organizationId: string;
     readonly email: string;
@@ -64,6 +70,7 @@ export class AuthContext extends Context.Service<
 
 /** Build the shared `AuthContext` value from a resolved `Principal`. */
 export const authContextFromPrincipal = (principal: Principal): AuthContext["Service"] => ({
+  kind: principal.kind,
   accountId: principal.accountId,
   organizationId: principal.organizationId,
   email: principal.email,

@@ -75,6 +75,7 @@ export const singleAdminIdentityLayer = (
     IdentityProvider.of({
       authenticate: () =>
         Effect.succeed<Principal>({
+          kind: "user",
           accountId: options.userId,
           organizationId: options.organizationId,
           organizationName: options.organizationName,
@@ -98,6 +99,7 @@ export const headerIdentityLayer: Layer.Layer<IdentityProvider> = Layer.succeed(
       const organizationId = request.headers.get("x-test-org");
       if (!userId || !organizationId) return Effect.fail(new Unauthorized());
       return Effect.succeed<Principal>({
+        kind: "user",
         accountId: userId,
         organizationId,
         organizationName: `Org ${organizationId}`,

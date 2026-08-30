@@ -77,6 +77,7 @@ const userPrincipal = (deps: WorkOSIdentityDeps, accountId: string, organization
     if (!authorized) return yield* new NoOrganization(NO_ORGANIZATION);
     const user = yield* deps.workos.getUser(accountId).pipe(Effect.mapError(authorizationFailure));
     return {
+      kind: "user",
       accountId,
       organizationId: authorized.id,
       organizationName: authorized.name,
@@ -95,6 +96,7 @@ const servicePrincipal = (deps: WorkOSIdentityDeps, clientId: string, organizati
     );
     if (!authorized) return yield* new NoOrganization(NO_ORGANIZATION);
     return {
+      kind: "service",
       accountId: clientId,
       organizationId: authorized.id,
       organizationName: authorized.name,
@@ -106,7 +108,7 @@ const servicePrincipal = (deps: WorkOSIdentityDeps, clientId: string, organizati
     } satisfies Principal;
   });
 
-const principalFromJwt = (
+export const principalFromVerifiedWorkOSToken = (
   deps: WorkOSIdentityDeps,
   verified: VerifiedWorkOSToken | null,
   request: Request,
@@ -133,7 +135,7 @@ const resolveJwtPrincipal = (deps: WorkOSIdentityDeps, token: string, request: R
     audience: deps.config.connectAudience,
   }).pipe(
     Effect.mapError(jwtFailure),
-    Effect.flatMap((verified) => principalFromJwt(deps, verified, request)),
+    Effect.flatMap((verified) => principalFromVerifiedWorkOSToken(deps, verified, request)),
   );
 
 const resolveApiKeyPrincipal = (deps: WorkOSIdentityDeps, token: string, request: Request) =>
@@ -156,6 +158,7 @@ const resolveApiKeyPrincipal = (deps: WorkOSIdentityDeps, token: string, request
       );
       if (!organization) return yield* new NoOrganization(NO_ORGANIZATION);
       return {
+        kind: "user",
         accountId: owner.accountId,
         organizationId: organization.id,
         organizationName: organization.name,

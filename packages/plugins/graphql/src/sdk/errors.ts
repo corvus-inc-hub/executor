@@ -16,6 +16,29 @@ export class GraphqlExtractionError extends Schema.TaggedErrorClass<GraphqlExtra
   },
 ) {}
 
+export class GraphqlManagedOAuthProfileNotConfiguredError extends Schema.TaggedErrorClass<GraphqlManagedOAuthProfileNotConfiguredError>()(
+  "GraphqlManagedOAuthProfileNotConfiguredError",
+  {
+    profile: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
+export class GraphqlManagedOAuthProfileConflictError extends Schema.TaggedErrorClass<GraphqlManagedOAuthProfileConflictError>()(
+  "GraphqlManagedOAuthProfileConflictError",
+  {
+    profile: Schema.String,
+    message: Schema.String,
+  },
+) {}
+
+export class GraphqlManagedOAuthProfileForbiddenError extends Schema.TaggedErrorClass<GraphqlManagedOAuthProfileForbiddenError>()(
+  "GraphqlManagedOAuthProfileForbiddenError",
+  {
+    message: Schema.String,
+  },
+) {}
+
 export class GraphqlInvocationError extends Data.TaggedError("GraphqlInvocationError")<{
   readonly message: string;
   readonly statusCode: Option.Option<number>;

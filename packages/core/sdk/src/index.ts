@@ -100,6 +100,7 @@ export type { Tool, ToolDef, ToolListFilter, ToolAnnotations } from "./tool";
 
 // Credential providers.
 export type { CredentialProvider, ProviderEntry } from "./provider";
+export { ownerForProviderItem, providerItemOwner } from "./provider";
 
 // Public projections / detection.
 export { ToolSchemaView, IntegrationDetectionResult } from "./types";

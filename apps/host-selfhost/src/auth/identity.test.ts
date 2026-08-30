@@ -8,7 +8,7 @@ import { EXECUTOR_ORG_SELECTOR_HEADER } from "@executor-js/sdk/shared";
 import type { WorkOSConfig } from "../config";
 import { makeWorkOSAccountProvider } from "../account/workos-account-provider";
 import type { ApiKeyService } from "./api-keys";
-import { makeWorkOSIdentityLayer } from "./identity";
+import { makeWorkOSIdentityLayer, principalFromVerifiedWorkOSToken } from "./identity";
 import type { OrganizationStore, StoredOrganization } from "./organization-store";
 import type { WorkOSClient } from "./workos";
 
@@ -120,7 +120,18 @@ const workos: WorkOSClient = {
   listUserApiKeys: unavailable,
   createUserApiKey: unavailable,
   deleteApiKey: unavailable,
-  getConnectApplication: unavailable,
+  getConnectApplication: (clientId) =>
+    Effect.succeed(
+      clientId === "client_trigger"
+        ? {
+            id: "connect_trigger",
+            clientId,
+            organizationId: config.serviceOrganizationId,
+            applicationType: "m2m",
+            scopes: ["credentials:lease"],
+          }
+        : null,
+    ),
 };
 
 const organizations: OrganizationStore = {
@@ -147,13 +158,56 @@ const apiKeys: ApiKeyService = {
   revokeUserKey: unavailable,
 };
 
-const authenticate = (request: Request) =>
+const authenticateWith = (
+  request: Request,
+  overrides: Partial<{
+    workos: WorkOSClient;
+    apiKeys: ApiKeyService;
+  }> = {},
+) =>
   Effect.gen(function* () {
     const provider = yield* IdentityProvider;
     return yield* provider.authenticate(request);
-  }).pipe(Effect.provide(makeWorkOSIdentityLayer({ config, workos, organizations, apiKeys })));
+  }).pipe(
+    Effect.provide(
+      makeWorkOSIdentityLayer({
+        config,
+        workos: overrides.workos ?? workos,
+        organizations,
+        apiKeys: overrides.apiKeys ?? apiKeys,
+      }),
+    ),
+  );
+
+const authenticate = (request: Request) => authenticateWith(request);
 
 describe("WorkOS identity provider", () => {
+  it.effect(
+    "marks only a verified M2M application as service in the selected target organization",
+    () =>
+      Effect.gen(function* () {
+        const principal = yield* principalFromVerifiedWorkOSToken(
+          { config, workos, organizations, apiKeys },
+          {
+            subject: "client_trigger",
+            organizationId: config.serviceOrganizationId,
+            scopes: ["credentials:lease"],
+            payload: { sub: "client_trigger", org_id: config.serviceOrganizationId },
+          },
+          new Request("https://executor.example.com/graphql/managed-oauth/profiles/github/ensure", {
+            headers: { [EXECUTOR_ORG_SELECTOR_HEADER]: organization.id },
+          }),
+        );
+
+        expect(principal).toMatchObject({
+          kind: "service",
+          accountId: "client_trigger",
+          organizationId: organization.id,
+          roles: ["service"],
+        });
+      }),
+  );
+
   it.effect("resolves a browser sealed session into the live organization and role", () =>
     Effect.gen(function* () {
       const principal = yield* authenticate(
@@ -162,6 +216,7 @@ describe("WorkOS identity provider", () => {
         }),
       );
       expect(principal).toMatchObject({
+        kind: "user",
         accountId: user.id,
         organizationId: organization.id,
         organizationSlug: "manifest",
@@ -185,6 +240,65 @@ describe("WorkOS identity provider", () => {
       );
       expect(principal.organizationId).toBe(organization.id);
       expect(principal.accountId).toBe(user.id);
+      expect(principal.kind).toBe("user");
+    }),
+  );
+
+  it.effect("keeps a human membership role named service classified as a user", () =>
+    Effect.gen(function* () {
+      const roleCollisionWorkos: WorkOSClient = {
+        ...workos,
+        getUserOrgMembership: (organizationId, userId) =>
+          Effect.succeed(
+            organizationId === organization.id && userId === user.id
+              ? { ...membership, role: { slug: "service" } }
+              : null,
+          ),
+      };
+      const principal = yield* authenticateWith(
+        new Request("https://executor.example.com/api/integrations", {
+          headers: { cookie: "wos-session=valid-session" },
+        }),
+        { workos: roleCollisionWorkos },
+      );
+
+      expect(principal).toMatchObject({
+        kind: "user",
+        accountId: user.id,
+        roles: ["service"],
+      });
+    }),
+  );
+
+  it.effect("keeps an organization API key classified as a user despite its service role", () =>
+    Effect.gen(function* () {
+      const organizationApiKeys: ApiKeyService = {
+        ...apiKeys,
+        validate: (value) =>
+          Effect.succeed(
+            value === "organization-api-key"
+              ? {
+                  accountId: "api-key:organization",
+                  organizationId: organization.id,
+                  keyId: "api_key_organization",
+                  roles: ["service"],
+                  permissions: [],
+                }
+              : null,
+          ),
+      };
+      const principal = yield* authenticateWith(
+        new Request("https://executor.example.com/api/integrations", {
+          headers: { authorization: "Bearer organization-api-key" },
+        }),
+        { apiKeys: organizationApiKeys },
+      );
+
+      expect(principal).toMatchObject({
+        kind: "user",
+        accountId: "api-key:organization",
+        roles: ["service"],
+      });
     }),
   );
 

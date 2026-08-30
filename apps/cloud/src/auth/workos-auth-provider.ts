@@ -134,6 +134,7 @@ const resolveJwtPrincipal = (token: string, jwt: JwtBearerConfig) =>
     if (!org) return yield* new NoOrganization(NO_ORGANIZATION_IN_ACCESS_TOKEN);
 
     return {
+      kind: "user",
       accountId: verified.accountId,
       organizationId: org.id,
       organizationName: org.name,
@@ -181,6 +182,7 @@ export const resolveApiKeyPrincipal = (request: Request, jwt: JwtBearerConfig | 
     if (!org) return yield* new NoOrganization(NO_ORGANIZATION_IN_API_KEY);
 
     return {
+      kind: "user",
       accountId: principal.accountId,
       organizationId: org.id,
       organizationName: org.name,
@@ -210,6 +212,7 @@ export const resolveSessionPrincipal = (request: Request) =>
     const org = yield* authorizeOrganizationSelector(session.userId, selector);
     if (!org) return yield* new NoOrganization(NO_ORGANIZATION_IN_SESSION);
     return {
+      kind: "user",
       accountId: session.userId,
       organizationId: org.id,
       organizationName: org.name,

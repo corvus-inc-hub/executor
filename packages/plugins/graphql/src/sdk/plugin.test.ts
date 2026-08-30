@@ -12,10 +12,13 @@ import {
   AuthTemplateSlug,
   ConnectionName,
   IntegrationSlug,
+  OAuthClientSlug,
   ProviderItemId,
   ProviderKey,
   ToolAddress,
   createExecutor,
+  definePlugin,
+  type CredentialProvider,
 } from "@executor-js/sdk";
 import {
   makeTestConfig,
@@ -119,6 +122,32 @@ const makeExecutor = () =>
   createExecutor(
     makeTestConfig({ plugins: [memoryCredentialsPlugin(), graphqlPlugin()] as const }),
   );
+
+const mutableCredentialsPlugin = () => {
+  const values = new Map<string, string>();
+  const provider: CredentialProvider = {
+    key: ProviderKey.make("mutable-test"),
+    writable: true,
+    get: (itemId) => Effect.sync(() => values.get(String(itemId)) ?? null),
+    has: (itemId) => Effect.sync(() => values.has(String(itemId))),
+    set: (itemId, value) =>
+      Effect.sync(() => {
+        values.set(String(itemId), value);
+      }),
+    delete: (itemId) =>
+      Effect.sync(() => {
+        values.delete(String(itemId));
+      }),
+  };
+  return {
+    values,
+    plugin: definePlugin(() => ({
+      id: "mutable-test-credentials" as const,
+      storage: () => ({}),
+      credentialProviders: [provider],
+    })),
+  };
+};
 
 const toolAddr = (integration: string, connection: string, tool: string): ToolAddress =>
   ToolAddress.make(`tools.${integration}.org.${connection}.${tool}`);
@@ -704,6 +733,258 @@ describe("graphqlPlugin real protocol server", () => {
 });
 
 describe("graphqlPlugin", () => {
+  it.effect(
+    "idempotently ensures a host-managed GitHub OAuth profile without returning its secret",
+    () =>
+      Effect.gen(function* () {
+        const profile = {
+          id: "github",
+          integration: {
+            slug: "github",
+            endpoint: "https://api.github.com/graphql",
+            name: "GitHub",
+            description: "Repositories, pull requests, reviews, and delivery evidence.",
+            authenticationTemplate: [
+              { kind: "oauth2", slug: "oauth", scopes: ["repo", "read:org"] },
+            ],
+          },
+          client: {
+            slug: "github-prod",
+            authorizationUrl: "https://github.com/login/oauth/authorize",
+            tokenUrl: "https://github.com/login/oauth/access_token",
+            clientId: "github-client-id",
+            clientSecret: "github-client-secret-that-must-never-be-returned",
+          },
+        } as const;
+        const executor = yield* createExecutor(
+          makeTestConfig({
+            plugins: [
+              memoryCredentialsPlugin(),
+              graphqlPlugin({ managedOAuthProfiles: [profile] }),
+            ] as const,
+          }),
+        );
+
+        const first = yield* executor.graphql.ensureManagedOAuthProfile("github");
+        const second = yield* executor.graphql.ensureManagedOAuthProfile("github");
+        yield* executor.integrations.update(IntegrationSlug.make("github"), {
+          description: "drifted description",
+        });
+        const driftError = yield* executor.graphql
+          .ensureManagedOAuthProfile("github")
+          .pipe(Effect.flip);
+
+        expect(first).toEqual({
+          profile: "github",
+          readiness: "ready",
+          integration: { slug: "github", action: "created" },
+          oauthClient: {
+            owner: "org",
+            slug: "github-prod",
+            clientId: "github-client-id",
+            action: "created",
+            credentialReferencePresent: true,
+          },
+        });
+        expect(second).toEqual({
+          profile: "github",
+          readiness: "ready",
+          integration: { slug: "github", action: "already-exact" },
+          oauthClient: {
+            owner: "org",
+            slug: "github-prod",
+            clientId: "github-client-id",
+            action: "already-exact",
+            credentialReferencePresent: true,
+          },
+        });
+        expect(driftError).toMatchObject({
+          _tag: "GraphqlManagedOAuthProfileConflictError",
+          profile: "github",
+        });
+        expect(JSON.stringify([first, second, driftError])).not.toContain(
+          profile.client.clientSecret,
+        );
+
+        const config = yield* executor.graphql.getConfig("github");
+        expect(config).toEqual({
+          endpoint: "https://api.github.com/graphql",
+          name: "GitHub",
+          authenticationTemplate: [{ kind: "oauth2", slug: "oauth", scopes: ["repo", "read:org"] }],
+        });
+        const clients = yield* executor.oauth.listClients();
+        expect(clients).toHaveLength(1);
+        expect(clients[0]).toMatchObject({
+          owner: "org",
+          slug: "github-prod",
+          clientId: "github-client-id",
+          origin: { kind: "manual", integration: "github" },
+        });
+        expect(JSON.stringify(clients)).not.toContain(profile.client.clientSecret);
+      }),
+  );
+
+  it.effect("serializes concurrent fresh managed OAuth profile ensures", () =>
+    Effect.gen(function* () {
+      const profile = {
+        id: "github",
+        integration: {
+          slug: "github",
+          endpoint: "https://api.github.com/graphql",
+          name: "GitHub",
+          description: "Repositories, pull requests, reviews, and delivery evidence.",
+          authenticationTemplate: [{ kind: "oauth2", slug: "oauth", scopes: ["repo", "read:org"] }],
+        },
+        client: {
+          slug: "github-prod",
+          authorizationUrl: "https://github.com/login/oauth/authorize",
+          tokenUrl: "https://github.com/login/oauth/access_token",
+          clientId: "github-client-id",
+          clientSecret: "managed-client-secret",
+        },
+      } as const;
+      const config = makeTestConfig({
+        plugins: [
+          memoryCredentialsPlugin(),
+          graphqlPlugin({ managedOAuthProfiles: [profile] }),
+        ] as const,
+      });
+      const firstExecutor = yield* createExecutor(config);
+      const secondExecutor = yield* createExecutor(config);
+
+      const results = yield* Effect.all(
+        [
+          firstExecutor.graphql.ensureManagedOAuthProfile("github"),
+          secondExecutor.graphql.ensureManagedOAuthProfile("github"),
+        ],
+        { concurrency: "unbounded" },
+      );
+
+      expect(results.map((result) => result.integration.action).sort()).toEqual([
+        "already-exact",
+        "created",
+      ]);
+      expect(results.map((result) => result.oauthClient.action).sort()).toEqual([
+        "already-exact",
+        "created",
+      ]);
+    }),
+  );
+
+  it.effect(
+    "refuses a conflicting managed OAuth client before changing the integration catalog",
+    () =>
+      Effect.gen(function* () {
+        const profile = {
+          id: "github",
+          integration: {
+            slug: "github",
+            endpoint: "https://api.github.com/graphql",
+            name: "GitHub",
+            description: "Repositories, pull requests, reviews, and delivery evidence.",
+            authenticationTemplate: [
+              { kind: "oauth2", slug: "oauth", scopes: ["repo", "read:org"] },
+            ],
+          },
+          client: {
+            slug: "github-prod",
+            authorizationUrl: "https://github.com/login/oauth/authorize",
+            tokenUrl: "https://github.com/login/oauth/access_token",
+            clientId: "managed-client-id",
+            clientSecret: "managed-client-secret",
+          },
+        } as const;
+        const executor = yield* createExecutor(
+          makeTestConfig({
+            plugins: [
+              memoryCredentialsPlugin(),
+              graphqlPlugin({ managedOAuthProfiles: [profile] }),
+            ] as const,
+          }),
+        );
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: OAuthClientSlug.make("github-prod"),
+          authorizationUrl: profile.client.authorizationUrl,
+          tokenUrl: profile.client.tokenUrl,
+          grant: "authorization_code",
+          clientId: "someone-elses-client-id",
+          clientSecret: "existing-secret",
+          resource: null,
+          origin: { kind: "manual", integration: IntegrationSlug.make("github") },
+        });
+
+        const error = yield* executor.graphql.ensureManagedOAuthProfile("github").pipe(Effect.flip);
+
+        expect(error).toMatchObject({
+          _tag: "GraphqlManagedOAuthProfileConflictError",
+          profile: "github",
+        });
+        expect(yield* executor.integrations.get(IntegrationSlug.make("github"))).toBeNull();
+        const clients = yield* executor.oauth.listClients();
+        expect(clients[0]?.clientId).toBe("someone-elses-client-id");
+      }),
+  );
+
+  it.effect("repairs a missing managed OAuth client secret without returning it", () =>
+    Effect.gen(function* () {
+      const profile = {
+        id: "github",
+        integration: {
+          slug: "github",
+          endpoint: "https://api.github.com/graphql",
+          name: "GitHub",
+          description: "GitHub delivery",
+          authenticationTemplate: [{ kind: "oauth2", slug: "oauth", scopes: ["repo", "read:org"] }],
+        },
+        client: {
+          slug: "github-prod",
+          authorizationUrl: "https://github.com/login/oauth/authorize",
+          tokenUrl: "https://github.com/login/oauth/access_token",
+          clientId: "github-client-id",
+          clientSecret: "managed-client-secret",
+        },
+      } as const;
+      const credentials = mutableCredentialsPlugin();
+      const executor = yield* createExecutor(
+        makeTestConfig({
+          plugins: [
+            credentials.plugin(),
+            graphqlPlugin({ managedOAuthProfiles: [profile] }),
+          ] as const,
+        }),
+      );
+      yield* executor.graphql.ensureManagedOAuthProfile("github");
+      credentials.values.delete("oauth-client:org:github-prod:secret");
+
+      const repaired = yield* executor.graphql.ensureManagedOAuthProfile("github");
+
+      expect(repaired.oauthClient).toEqual({
+        owner: "org",
+        slug: "github-prod",
+        clientId: "github-client-id",
+        action: "repaired-secret",
+        credentialReferencePresent: true,
+      });
+      expect(yield* executor.integrations.get(IntegrationSlug.make("github"))).toMatchObject({
+        name: profile.integration.name,
+        description: profile.integration.description,
+      });
+      expect(credentials.values.get("oauth-client:org:github-prod:secret")).toBe(
+        profile.client.clientSecret,
+      );
+      expect(JSON.stringify(repaired)).not.toContain(profile.client.clientSecret);
+
+      credentials.values.set("oauth-client:org:github-prod:secret", "stale-client-secret");
+      const rotated = yield* executor.graphql.ensureManagedOAuthProfile("github");
+      expect(rotated.oauthClient.action).toBe("repaired-secret");
+      expect(credentials.values.get("oauth-client:org:github-prod:secret")).toBe(
+        profile.client.clientSecret,
+      );
+      expect(JSON.stringify(rotated)).not.toContain(profile.client.clientSecret);
+    }),
+  );
+
   it.effect("registers tools per-connection from introspection JSON", () =>
     Effect.gen(function* () {
       const executor = yield* makeExecutor();

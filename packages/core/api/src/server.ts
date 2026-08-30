@@ -70,6 +70,7 @@ export {
   NoOrganization,
   Unavailable,
   authContextFromPrincipal,
+  type PrincipalKind,
   type Principal,
   type IdentityProviderShape,
   type IdentityFailure,

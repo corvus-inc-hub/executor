@@ -275,6 +275,13 @@ export interface OAuthService {
   /** All registered clients visible to the caller (their org's shared clients +
    *  their own user clients), as metadata-only summaries — never the secret. */
   readonly listClients: () => Effect.Effect<readonly OAuthClientSummary[], StorageFailure>;
+  /** Compare a confidential client's out-of-band secret with host authority.
+   *  Returns only a boolean and never returns or logs stored secret bytes. */
+  readonly clientSecretMatches: (
+    owner: Owner,
+    slug: OAuthClientSlug,
+    expectedSecret: string,
+  ) => Effect.Effect<boolean, StorageFailure>;
   /** Permanently remove a registered OAuth app, keyed by (owner, slug). The
    *  owner policy on `oauth_client` prevents removing another subject's user app.
    *  Idempotent: removing an already-gone app succeeds. Connections that

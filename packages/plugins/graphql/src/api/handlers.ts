@@ -2,6 +2,8 @@ import { HttpApiBuilder } from "effect/unstable/httpapi";
 import { Context, Effect } from "effect";
 
 import { addGroup, capture } from "@executor-js/api";
+import { AuthContext } from "@executor-js/api/server";
+import { GraphqlManagedOAuthProfileForbiddenError } from "../sdk/errors";
 import type { GraphqlPluginExtension } from "../sdk/plugin";
 import { GraphqlGroup } from "./group";
 
@@ -32,6 +34,23 @@ const ExecutorApiWithGraphql = addGroup(GraphqlGroup);
 
 export const GraphqlHandlers = HttpApiBuilder.group(ExecutorApiWithGraphql, "graphql", (handlers) =>
   handlers
+    .handle("ensureManagedOAuthProfile", ({ params }) =>
+      capture(
+        Effect.gen(function* () {
+          const auth = yield* AuthContext;
+          if (auth.kind !== "service" || !auth.roles.includes("service")) {
+            return yield* new GraphqlManagedOAuthProfileForbiddenError({
+              message:
+                "Managed OAuth profiles require a service principal for the target organization",
+            });
+          }
+
+          const ext = yield* GraphqlExtensionService;
+          const result = yield* ext.ensureManagedOAuthProfile(params.profile);
+          return { ...result, organizationId: auth.organizationId };
+        }),
+      ),
+    )
     .handle("addIntegration", ({ payload }) =>
       capture(
         Effect.gen(function* () {

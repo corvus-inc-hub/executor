@@ -4,6 +4,7 @@ import { Effect } from "effect";
 
 import {
   definePlugin,
+  ownerForProviderItem,
   Owner,
   ProviderItemId,
   ProviderKey,
@@ -29,11 +30,10 @@ import {
 // v2: the provider sees only an opaque `ProviderItemId` — there is NO scope
 // arg. The connection row that references the id owns the (tenant, owner,
 // subject) partition; the encrypted value is keyed solely by the opaque id.
-// Plugin storage writes still carry an `owner`: for connection-scoped ids it is
-// derived from the id's own owner segment (see `itemPartition`), so an
-// org-owned connection's material lands in the org partition no matter which
-// signed-in subject saved it; other ids fall back to the executor binding's
-// owner, captured once from the ctx at provider construction.
+// Plugin storage writes still carry an `owner`, derived from the provider item
+// id when it declares one; opaque ids fall back to the executor binding's owner.
+// Reads use that exact partition so stale subject-local rows cannot shadow
+// organization authority.
 // ---------------------------------------------------------------------------
 
 type PluginStorage = PluginCtx<unknown>["pluginStorage"];
@@ -87,31 +87,11 @@ const ENCRYPTED_PROVIDER_KEY = ProviderKey.make("encrypted");
 const ownerOf = (binding: OwnerBinding): Owner =>
   binding.subject == null ? Owner.make("org") : Owner.make("user");
 
-/** Storage partition an item's writes must target. Connection item ids carry
- *  their owner segment (`connection:<owner>:<integration>:<name>:<variable>`,
- *  built by the executor's `connectionsCreate`), and reads span the org
- *  partition plus the caller's own user partition. So an org-owned connection's
- *  material must land in the org partition, no matter which signed-in subject
- *  saved it; otherwise every OTHER subject in the tenant (another member, an
- *  M2M service account resolving a credential lease) finds nothing. User-owned
- *  connection ids stay in the writing subject's user partition, and
- *  non-connection ids keep the binding-derived owner. */
-const itemPartition = (id: ProviderItemId, fallback: Owner): Owner => {
-  if (id.startsWith("connection:org:")) return Owner.make("org");
-  if (id.startsWith("connection:user:")) return Owner.make("user");
-  return fallback;
-};
-
 const makeEncryptedProvider = (
   key: Buffer,
   storage: PluginStorage,
   owner: Owner,
 ): CredentialProvider => {
-  // Writes made before `itemPartition` existed targeted the binding's owner,
-  // stranding org-connection material in the writing subject's user partition,
-  // where it shadows the org row for that subject on read. Whenever a
-  // subject-bound executor (re)writes or deletes an org item, drop the caller's
-  // stale user-partition copy so the org partition is the single source again.
   const clearStrayUserCopy = (id: ProviderItemId, target: Owner) =>
     target === "org" && owner === "user"
       ? storage.remove({ collection: COLLECTION, key: id, owner })
@@ -123,7 +103,11 @@ const makeEncryptedProvider = (
 
     get: (id: ProviderItemId) =>
       storage
-        .get<string>({ collection: COLLECTION, key: id })
+        .getForOwner<string>({
+          collection: COLLECTION,
+          key: id,
+          owner: ownerForProviderItem(id, owner),
+        })
         .pipe(
           Effect.flatMap((entry) =>
             entry ? decryptSecret(key, entry.data) : Effect.succeed(null),
@@ -131,18 +115,19 @@ const makeEncryptedProvider = (
         ),
 
     has: (id: ProviderItemId) =>
-      storage.get({ collection: COLLECTION, key: id }).pipe(Effect.map((entry) => entry !== null)),
+      storage
+        .getForOwner({
+          collection: COLLECTION,
+          key: id,
+          owner: ownerForProviderItem(id, owner),
+        })
+        .pipe(Effect.map((entry) => entry !== null)),
 
     set: (id: ProviderItemId, value: string) => {
-      const target = itemPartition(id, owner);
+      const target = ownerForProviderItem(id, owner);
       return encryptSecret(key, value).pipe(
         Effect.flatMap((payload) =>
-          storage.put({
-            collection: COLLECTION,
-            key: id,
-            owner: target,
-            data: payload,
-          }),
+          storage.put({ collection: COLLECTION, key: id, owner: target, data: payload }),
         ),
         Effect.andThen(clearStrayUserCopy(id, target)),
         Effect.asVoid,
@@ -150,21 +135,20 @@ const makeEncryptedProvider = (
     },
 
     delete: (id: ProviderItemId) => {
-      const target = itemPartition(id, owner);
+      const target = ownerForProviderItem(id, owner);
       return storage
         .remove({ collection: COLLECTION, key: id, owner: target })
         .pipe(Effect.andThen(clearStrayUserCopy(id, target)));
     },
 
     list: () =>
-      storage.list<string>({ collection: COLLECTION }).pipe(
-        Effect.map((entries) =>
-          entries.map((entry) => ({
-            id: ProviderItemId.make(entry.key),
-            name: entry.key,
-          })),
+      storage
+        .list<string>({ collection: COLLECTION })
+        .pipe(
+          Effect.map((entries) =>
+            entries.map((entry) => ({ id: ProviderItemId.make(entry.key), name: entry.key })),
+          ),
         ),
-      ),
   };
 };
 

@@ -87,6 +87,7 @@ export const OrgAuthLive = Layer.effect(
 
           const session = sessionFromSealed(result, Redacted.value(credential));
           const auth = {
+            kind: "user" as const,
             accountId: session.accountId,
             organizationId: result.organizationId,
             email: session.email,

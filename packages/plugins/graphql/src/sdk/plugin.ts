@@ -1,4 +1,4 @@
-import { Effect, Match, Option, Schema } from "effect";
+import { Effect, Match, Option, Schema, Semaphore } from "effect";
 import type { Layer } from "effect";
 import { HttpClient } from "effect/unstable/http";
 
@@ -11,6 +11,7 @@ import {
   IntegrationDetectionResult,
   IntegrationSlug,
   mergeAuthTemplates,
+  OAuthClientSlug,
   sha256Hex,
   ToolName,
   ToolResult,
@@ -47,6 +48,8 @@ import {
   GraphqlAuthRequiredError,
   GraphqlIntrospectionError,
   GraphqlInvocationError,
+  GraphqlManagedOAuthProfileConflictError,
+  GraphqlManagedOAuthProfileNotConfiguredError,
 } from "./errors";
 import { effectiveOperationString, invokeWithLayer } from "./invoke";
 import { validateOperationString } from "./validate-selection";
@@ -97,6 +100,45 @@ const extractGraphqlErrorMessage = (errors: readonly unknown[]): string | undefi
 
 const GRAPHQL_PLUGIN_ID = "graphql";
 
+type ManagedOAuthEnsureLock = {
+  readonly semaphore: ReturnType<typeof Semaphore.makeUnsafe>;
+  references: number;
+};
+
+// Self-host creates a fresh scoped Executor for each request, so a lock held by
+// one extension instance would not serialize duplicate bootstrap calls. Keep a
+// process-wide, tenant+profile keyed lock while callers are active, and remove
+// it after the final waiter exits so tenant churn does not leak lock entries.
+const managedOAuthEnsureLocks = new Map<string, ManagedOAuthEnsureLock>();
+
+const withManagedOAuthEnsureLock = <A, E, R>(
+  key: string,
+  use: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const existing = managedOAuthEnsureLocks.get(key);
+      if (existing) {
+        existing.references += 1;
+        return existing;
+      }
+      const created: ManagedOAuthEnsureLock = {
+        semaphore: Semaphore.makeUnsafe(1),
+        references: 1,
+      };
+      managedOAuthEnsureLocks.set(key, created);
+      return created;
+    }),
+    (lock) => lock.semaphore.withPermits(1)(use),
+    (lock) =>
+      Effect.sync(() => {
+        lock.references -= 1;
+        if (lock.references === 0 && managedOAuthEnsureLocks.get(key) === lock) {
+          managedOAuthEnsureLocks.delete(key);
+        }
+      }),
+  );
+
 // ---------------------------------------------------------------------------
 // Extension input shapes
 // ---------------------------------------------------------------------------
@@ -140,6 +182,42 @@ const GraphqlConfigureAuthInputSchema = Schema.Struct({
   mode: Schema.optional(Schema.Literals(["merge", "replace"])),
 });
 export type GraphqlConfigureAuthInput = typeof GraphqlConfigureAuthInputSchema.Type;
+
+/** One confidential OAuth app owned by the Executor host and projected into a
+ *  tenant as an exact GraphQL integration plus org-owned OAuth client. */
+export interface GraphqlManagedOAuthProfile {
+  readonly id: string;
+  readonly integration: {
+    readonly slug: string;
+    readonly endpoint: string;
+    readonly name: string;
+    readonly description: string;
+    readonly authenticationTemplate: readonly GraphqlAuthMethodInput[];
+  };
+  readonly client: {
+    readonly slug: string;
+    readonly authorizationUrl: string;
+    readonly tokenUrl: string;
+    readonly clientId: string;
+    readonly clientSecret: string;
+  };
+}
+
+export interface GraphqlManagedOAuthEnsureResult {
+  readonly profile: string;
+  readonly readiness: "ready";
+  readonly integration: {
+    readonly slug: string;
+    readonly action: "created" | "already-exact";
+  };
+  readonly oauthClient: {
+    readonly owner: "org";
+    readonly slug: string;
+    readonly clientId: string;
+    readonly action: "created" | "repaired-secret" | "already-exact";
+    readonly credentialReferencePresent: true;
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Static control-tool schemas
@@ -643,7 +721,10 @@ export const describeGraphqlIntegrationDisplay = (
 // introspection JSON offline). Live introspection — the only thing that needed
 // an HTTP layer — is deferred to `resolveTools` / `invokeTool`, so the extension
 // no longer takes one.
-const makeGraphqlExtension = (ctx: PluginCtx<GraphqlStore>) => {
+const makeGraphqlExtension = (
+  ctx: PluginCtx<GraphqlStore>,
+  managedOAuthProfiles: ReadonlyMap<string, GraphqlManagedOAuthProfile> = new Map(),
+) => {
   const buildConfig = (input: GraphqlAddIntegrationInput): GraphqlIntegrationConfig =>
     GraphqlIntegrationConfig.make({
       endpoint: input.endpoint,
@@ -846,6 +927,161 @@ const makeGraphqlExtension = (ctx: PluginCtx<GraphqlStore>) => {
       }),
     );
 
+  const sameJson = (left: unknown, right: unknown): boolean =>
+    JSON.stringify(left) === JSON.stringify(right);
+
+  const ensureManagedOAuthProfileUnlocked = (
+    profileId: string,
+  ): Effect.Effect<
+    GraphqlManagedOAuthEnsureResult,
+    | GraphqlManagedOAuthProfileNotConfiguredError
+    | GraphqlManagedOAuthProfileConflictError
+    | StorageFailure
+  > =>
+    Effect.gen(function* () {
+      const profile = managedOAuthProfiles.get(profileId);
+      if (!profile) {
+        return yield* new GraphqlManagedOAuthProfileNotConfiguredError({
+          profile: profileId,
+          message: "Managed OAuth profile is not configured on this Executor host.",
+        });
+      }
+
+      const desiredConfig = GraphqlIntegrationConfig.make({
+        endpoint: profile.integration.endpoint,
+        name: profile.integration.name,
+        authenticationTemplate: normalizeGraphqlAuthMethods(
+          profile.integration.authenticationTemplate,
+        ),
+      });
+      const integrationSlug = IntegrationSlug.make(profile.integration.slug);
+      const existingIntegration = yield* ctx.core.integrations.get(integrationSlug);
+      let integrationAction: GraphqlManagedOAuthEnsureResult["integration"]["action"];
+      if (!existingIntegration) {
+        integrationAction = "created";
+      } else {
+        if (existingIntegration.kind !== GRAPHQL_PLUGIN_ID) {
+          return yield* new GraphqlManagedOAuthProfileConflictError({
+            profile: profileId,
+            message: "Managed OAuth integration slug is owned by a different plugin.",
+          });
+        }
+        const current = Option.getOrNull(
+          decodeGraphqlIntegrationConfigOption(existingIntegration.config),
+        );
+        if (!current) {
+          return yield* new GraphqlManagedOAuthProfileConflictError({
+            profile: profileId,
+            message: "Managed OAuth integration has an invalid stored configuration.",
+          });
+        }
+        const metadataExact =
+          existingIntegration.name === profile.integration.name &&
+          existingIntegration.description === profile.integration.description;
+        if (sameJson(current, desiredConfig) && metadataExact) {
+          integrationAction = "already-exact";
+        } else {
+          return yield* new GraphqlManagedOAuthProfileConflictError({
+            profile: profileId,
+            message: "Managed OAuth integration conflicts with the host profile.",
+          });
+        }
+      }
+
+      const clientSlug = OAuthClientSlug.make(profile.client.slug);
+      const clients = yield* ctx.oauth.listClients();
+      const candidates = clients.filter(
+        (client) =>
+          String(client.slug) === profile.client.slug ||
+          client.clientId === profile.client.clientId,
+      );
+      if (candidates.length > 1) {
+        return yield* new GraphqlManagedOAuthProfileConflictError({
+          profile: profileId,
+          message: "Managed OAuth client identity conflicts with multiple registered clients.",
+        });
+      }
+      const existingClient = candidates[0];
+      if (
+        existingClient &&
+        (existingClient.owner !== "org" ||
+          String(existingClient.slug) !== profile.client.slug ||
+          existingClient.grant !== "authorization_code" ||
+          existingClient.authorizationUrl !== profile.client.authorizationUrl ||
+          existingClient.tokenUrl !== profile.client.tokenUrl ||
+          existingClient.clientId !== profile.client.clientId ||
+          (existingClient.resource ?? null) !== null ||
+          existingClient.origin.kind !== "manual" ||
+          String(existingClient.origin.integration ?? "") !== profile.integration.slug)
+      ) {
+        return yield* new GraphqlManagedOAuthProfileConflictError({
+          profile: profileId,
+          message: "Managed OAuth client conflicts with the host profile.",
+        });
+      }
+
+      const secretMatches = existingClient
+        ? yield* ctx.oauth.clientSecretMatches("org", clientSlug, profile.client.clientSecret)
+        : false;
+      const clientAction: GraphqlManagedOAuthEnsureResult["oauthClient"]["action"] = !existingClient
+        ? "created"
+        : secretMatches
+          ? "already-exact"
+          : "repaired-secret";
+
+      if (!existingIntegration) {
+        yield* ctx.transaction(
+          ctx.core.integrations.register({
+            slug: integrationSlug,
+            name: profile.integration.name,
+            description: profile.integration.description,
+            config: desiredConfig,
+            canRemove: true,
+            canRefresh: true,
+          }),
+        );
+      }
+
+      if (!existingClient || !secretMatches) {
+        yield* ctx.oauth.createClient({
+          owner: "org",
+          slug: clientSlug,
+          authorizationUrl: profile.client.authorizationUrl,
+          tokenUrl: profile.client.tokenUrl,
+          grant: "authorization_code",
+          clientId: profile.client.clientId,
+          clientSecret: profile.client.clientSecret,
+          resource: null,
+          origin: { kind: "manual", integration: integrationSlug },
+        });
+      }
+      if (!(yield* ctx.oauth.clientSecretMatches("org", clientSlug, profile.client.clientSecret))) {
+        return yield* new GraphqlManagedOAuthProfileConflictError({
+          profile: profileId,
+          message: "Managed OAuth client secret is unavailable after provisioning.",
+        });
+      }
+
+      return {
+        profile: profileId,
+        readiness: "ready",
+        integration: { slug: profile.integration.slug, action: integrationAction },
+        oauthClient: {
+          owner: "org",
+          slug: profile.client.slug,
+          clientId: profile.client.clientId,
+          action: clientAction,
+          credentialReferencePresent: true,
+        },
+      };
+    });
+
+  const ensureManagedOAuthProfile = (profileId: string) =>
+    withManagedOAuthEnsureLock(
+      JSON.stringify([String(ctx.owner.tenant), profileId]),
+      ensureManagedOAuthProfileUnlocked(profileId),
+    );
+
   return {
     /** Register a GraphQL integration (introspects + persists operations). */
     addIntegration: (input: GraphqlAddIntegrationInput) => addIntegrationInternal(input),
@@ -861,6 +1097,10 @@ const makeGraphqlExtension = (ctx: PluginCtx<GraphqlStore>) => {
 
     /** Merge-append custom auth methods (custom-method-create flow). */
     configureAuth: configureAuthMethods,
+
+    /** Ensure one host-owned profile into the current executor tenant. Secret
+     *  bytes enter only through server configuration and never leave here. */
+    ensureManagedOAuthProfile,
 
     removeIntegration: (slug: string) =>
       ctx.transaction(
@@ -884,9 +1124,24 @@ export type GraphqlPluginExtension = ReturnType<typeof makeGraphqlExtension>;
 
 export interface GraphqlPluginOptions {
   readonly httpClientLayer?: Layer.Layer<HttpClient.HttpClient>;
+  readonly managedOAuthProfiles?: readonly GraphqlManagedOAuthProfile[];
 }
 
 export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
+  const managedOAuthProfiles = new Map<string, GraphqlManagedOAuthProfile>();
+  for (const profile of options?.managedOAuthProfiles ?? []) {
+    if (!profile.id.trim() || managedOAuthProfiles.has(profile.id)) {
+      // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: invalid host authority must fail at boot
+      throw new Error("Managed GraphQL OAuth profile ids must be non-empty and unique.");
+    }
+    if (!profile.client.clientId.trim() || !profile.client.clientSecret) {
+      // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: incomplete confidential app authority must fail at boot
+      throw new Error(
+        `Managed GraphQL OAuth profile ${profile.id} is missing its client credential.`,
+      );
+    }
+    managedOAuthProfiles.set(profile.id, profile);
+  }
   return {
     id: GRAPHQL_PLUGIN_ID as "graphql",
     packageName: "@executor-js/plugin-graphql",
@@ -901,13 +1156,16 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
     })),
     storage: (deps): GraphqlStore => makeDefaultGraphqlStore(deps),
 
-    extension: (ctx: PluginCtx<GraphqlStore>) => makeGraphqlExtension(ctx),
+    extension: (ctx: PluginCtx<GraphqlStore>) => makeGraphqlExtension(ctx, managedOAuthProfiles),
 
     integrationConfigure: {
       type: "graphql",
       schema: GraphqlConfigureInputSchema,
       configure: ({ ctx, integration, config }) =>
-        makeGraphqlExtension(ctx).configure(String(integration), config as GraphqlConfigureInput),
+        makeGraphqlExtension(ctx, managedOAuthProfiles).configure(
+          String(integration),
+          config as GraphqlConfigureInput,
+        ),
     },
 
     describeAuthMethods: describeGraphqlAuthMethods,
