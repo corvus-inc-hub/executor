@@ -455,16 +455,20 @@
       "version": "1.4.55",
       "dependencies": {
         "@executor-js/execution": "workspace:*",
-        "@executor-js/host-mcp": "workspace:*",
         "@executor-js/sdk": "workspace:*",
-        "effect": "catalog:",
       },
       "devDependencies": {
         "@effect/vitest": "catalog:",
+        "@executor-js/host-mcp": "workspace:*",
         "@types/node": "catalog:",
         "bun-types": "catalog:",
+        "effect": "catalog:",
+        "tsup": "catalog:",
         "typescript": "catalog:",
         "vitest": "catalog:",
+      },
+      "peerDependencies": {
+        "effect": "catalog:",
       },
     },
     "packages/core/cli": {

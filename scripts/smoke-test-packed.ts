@@ -37,6 +37,7 @@ const PUBLIC_PACKAGE_DIRS = [
   "packages/kernel/core",
   "packages/kernel/runtime-quickjs",
   "packages/core/sdk",
+  "packages/core/api",
   "packages/core/config",
   "packages/core/execution",
   "packages/core/cli",
@@ -52,7 +53,9 @@ const PUBLIC_PACKAGE_DIRS = [
 type PackageJson = {
   name: string;
   version: string;
+  catalog?: Record<string, string>;
   exports?: Record<string, unknown>;
+  peerDependencies?: Record<string, string>;
 };
 
 const readPackageJson = async (pkgDir: string): Promise<PackageJson> => {
@@ -102,6 +105,7 @@ type Tarballs = ReadonlyMap<string, string>;
 const smokeTestPackage = async (
   pkgDir: string,
   tarballs: Tarballs,
+  catalog: Readonly<Record<string, string>>,
   failures: SmokeFailure[],
 ): Promise<void> => {
   const pkg = await readPackageJson(pkgDir);
@@ -128,7 +132,19 @@ const smokeTestPackage = async (
       version: "0.0.0",
       private: true,
       type: "module",
-      dependencies: { [pkg.name]: `file:${tarballPath}` },
+      dependencies: {
+        [pkg.name]: `file:${tarballPath}`,
+        // Exercise the new server client rather than classifying its required
+        // Effect runtime as an intentionally absent peer.
+        ...(pkg.name === "@executor-js/api" && pkg.peerDependencies?.effect
+          ? {
+              effect:
+                pkg.peerDependencies.effect === "catalog:"
+                  ? catalog.effect
+                  : pkg.peerDependencies.effect,
+            }
+          : {}),
+      },
       overrides,
     };
     await writeFile(join(tmp, "package.json"), `${JSON.stringify(fixture, null, 2)}\n`);
@@ -194,6 +210,7 @@ const smokeTestPackage = async (
 };
 
 const main = async () => {
+  const rootPackage = await readPackageJson(repoRoot);
   console.log("[smoke] packing public packages via publish-packages.ts --dry-run");
   await $`bun run scripts/publish-packages.ts --dry-run`.cwd(repoRoot);
 
@@ -215,7 +232,7 @@ const main = async () => {
     }
     const pkg = await readPackageJson(pkgDir);
     console.log(`[smoke] ${pkg.name}`);
-    await smokeTestPackage(pkgDir, tarballs, failures);
+    await smokeTestPackage(pkgDir, tarballs, rootPackage.catalog ?? {}, failures);
   }
 
   if (failures.length === 0) {
