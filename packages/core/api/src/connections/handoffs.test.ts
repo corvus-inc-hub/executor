@@ -60,7 +60,10 @@ const webHandlerFor = (executor: Executor) =>
     (web) => Effect.promise(() => web.dispose()),
   );
 
-const handlerContextFor = (executor: Executor, input: { kind: "user" | "service"; id: string }) =>
+const handlerContextFor = (
+  executor: Executor,
+  input: { kind: "user" | "service"; id: string; scopes?: readonly string[] },
+) =>
   Context.make(ExecutorService, executor).pipe(
     Context.add(ExecutionEngineService, {} as ExecutionEngineService["Service"]),
     Context.add(AuthContext, {
@@ -71,6 +74,7 @@ const handlerContextFor = (executor: Executor, input: { kind: "user" | "service"
       name: null,
       avatarUrl: null,
       roles: input.kind === "service" ? ["service"] : [],
+      scopes: input.scopes ?? (input.kind === "service" ? ["connections:handoff"] : []),
     }),
   );
 
@@ -120,6 +124,18 @@ describe("connection handoff HTTP authority", () => {
       expect(pending).toMatchObject({ status: "pending" });
       expect(pending.url).toBe(`https://executor.example/acme/connect/${pending.handoffId}`);
 
+      const leaseOnlyRead = yield* Effect.promise(() =>
+        serviceWeb.handler(
+          new Request(`http://localhost/connection-handoffs/${pending.handoffId}`),
+          handlerContextFor(service, {
+            kind: "service",
+            id: "service-client",
+            scopes: ["credentials:lease"],
+          }),
+        ),
+      );
+      expect(leaseOnlyRead.status).toBe(403);
+
       const userCreate = yield* Effect.promise(() =>
         serviceWeb.handler(
           new Request("http://localhost/connection-handoffs", {
@@ -136,6 +152,27 @@ describe("connection handoff HTTP authority", () => {
         ),
       );
       expect(userCreate.status).toBe(403);
+
+      const leaseOnlyCreate = yield* Effect.promise(() =>
+        serviceWeb.handler(
+          new Request("http://localhost/connection-handoffs", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              memberId: "test-subject",
+              integration: INTEGRATION,
+              label: "Rejected lease identity",
+              returnTo: "https://manifest.example/os/connections",
+            }),
+          }),
+          handlerContextFor(service, {
+            kind: "service",
+            id: "service-client",
+            scopes: ["credentials:lease"],
+          }),
+        ),
+      );
+      expect(leaseOnlyCreate.status).toBe(403);
 
       const foreignWeb = yield* webHandlerFor(foreign);
       const foreignRead = yield* Effect.promise(() =>

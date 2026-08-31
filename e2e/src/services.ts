@@ -6,7 +6,7 @@
 // capabilities and the host environment.
 import { Context, type Effect } from "effect";
 
-import type { Target as TargetShape } from "./target";
+import type { Identity, Target as TargetShape } from "./target";
 import type { ApiSurface } from "./surfaces/api";
 import type { AutumnSurface } from "./surfaces/autumn";
 import type { BrowserSurface } from "./surfaces/browser";
@@ -26,6 +26,12 @@ export class Cli extends Context.Service<Cli, CliSurface>()("e2e/cli") {}
 
 /** Typed HttpApiClient over the wire (target capability "api"). */
 export class Api extends Context.Service<Api, ApiSurface>()("e2e/api") {}
+
+/** A real machine identity minted by the target's authorization server. */
+export class ServiceIdentity extends Context.Service<
+  ServiceIdentity,
+  (options?: { readonly scopes?: readonly string[] }) => Effect.Effect<Identity>
+>()("e2e/service-identity") {}
 
 /** Playwright browser sessions with video/trace (target capability "browser"). */
 export class Browser extends Context.Service<Browser, BrowserSurface>()("e2e/browser") {}

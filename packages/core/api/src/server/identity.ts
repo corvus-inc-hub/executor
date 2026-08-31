@@ -48,6 +48,9 @@ export interface Principal {
   readonly name: string | null;
   readonly avatarUrl: string | null;
   readonly roles: readonly string[];
+  /** Verified OAuth scopes for machine identities. Browser users and legacy
+   *  API keys carry no scopes and therefore cannot cross scoped service gates. */
+  readonly scopes?: readonly string[];
 }
 
 /**
@@ -65,6 +68,7 @@ export class AuthContext extends Context.Service<
     readonly name: string | null;
     readonly avatarUrl: string | null;
     readonly roles: readonly string[];
+    readonly scopes?: readonly string[];
   }
 >()("@executor-js/api/AuthContext") {}
 
@@ -77,6 +81,7 @@ export const authContextFromPrincipal = (principal: Principal): AuthContext["Ser
   name: principal.name,
   avatarUrl: principal.avatarUrl,
   roles: principal.roles,
+  scopes: principal.scopes ?? [],
 });
 
 // Optional per-failure render hints. Self-host produces the bare error (these

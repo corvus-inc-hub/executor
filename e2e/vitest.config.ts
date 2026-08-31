@@ -26,6 +26,14 @@ export default defineConfig({
       // selfhost identities are the shared bootstrap admin for now — run files
       // serially until per-test invite-signup isolation lands.
       project("selfhost", { fileParallelism: false }),
+      // Production-shaped WorkOS Connect identity rail for the self-hosted
+      // credential plane. It intentionally runs only the M2M lease contract
+      // and the hosted handoff browser journey: the broad historical selfhost
+      // suite still has unrelated assumptions that are being retired.
+      project("selfhost-workos", {
+        include: ["selfhost-workos/**/*.test.ts", "scenarios/connect-handoff.test.ts"],
+        fileParallelism: false,
+      }),
       // The same app as the PRODUCTION Docker artifact (the image users
       // deploy: production build, bun serve.ts, /data volume) instead of the
       // dev server. Runs the cross-target scenarios AND the selfhost/**
