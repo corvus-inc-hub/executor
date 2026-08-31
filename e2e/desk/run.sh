@@ -12,6 +12,6 @@ docker run --rm \
   -v "$PWD":/repo \
   -v executor-desk-node-modules:/repo/node_modules \
   -v executor-desk-bun-cache:/root/.bun/install/cache \
-  -e DESK_SCENARIO="${1:-scenarios/connect-handoff-session.test.ts}" \
-  -e DESK_PROJECT="${2:-cloud}" \
+  -e DESK_SCENARIO="${1:-scenarios/connect-handoff.test.ts}" \
+  -e DESK_PROJECT="${2:-selfhost-workos}" \
   executor-e2e-desk

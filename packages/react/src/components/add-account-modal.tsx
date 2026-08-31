@@ -564,6 +564,23 @@ export const mergeCustomMethods = (
   return [...declared, ...created.filter((method: AuthMethod) => !keys.has(authMethodKey(method)))];
 };
 
+export function resolveConnectionHandoffInitialization(input: {
+  readonly initializedKey: string | null;
+  readonly handoff: IntegrationAccountHandoff | null | undefined;
+  readonly methods: readonly AuthMethod[];
+}): { readonly key: string; readonly methodId?: string } | null {
+  const { handoff } = input;
+  if (!handoff || input.initializedKey === handoff.key) return null;
+  const method = handoff.template
+    ? input.methods.find(
+        (candidate) =>
+          candidate.id === handoff.template || String(candidate.template) === handoff.template,
+      )
+    : undefined;
+  if (handoff.template && !method) return null;
+  return { key: handoff.key, ...(method ? { methodId: method.id } : {}) };
+}
+
 /** Derive a stable JS-identifier-safe callable connection name from the label. */
 export const connectionNameFrom = (
   label: string,
@@ -1194,6 +1211,11 @@ function AddAccountModalView(props: AddAccountModalProps) {
   // and the remove warning have everything they need.
   const [editingClient, setEditingClient] = useState<OAuthClientSummary | null>(null);
   const [removingClient, setRemovingClient] = useState<OAuthClientSummary | null>(null);
+  // A hosted handoff initializes this form once. The integration method list is
+  // reactive and may refresh while the user is typing; treating that refresh as
+  // a new handoff would erase the credential and strand step 2 with a disabled
+  // submit button.
+  const initializedConnectionHandoffKey = useRef<string | null>(null);
 
   const doCreate = useAtomSet(addConnectionOptimistic(owner), {
     mode: "promiseExit",
@@ -1257,14 +1279,14 @@ function AddAccountModalView(props: AddAccountModalProps) {
   }, [allMethods, methodId]);
 
   useEffect(() => {
-    if (!initialState) return;
-    const initialMethod = initialState.template
-      ? allMethods.find(
-          (m: AuthMethod) =>
-            m.id === initialState.template || String(m.template) === initialState.template,
-        )
-      : undefined;
-    if (initialMethod) setMethodId(initialMethod.id);
+    const initialization = resolveConnectionHandoffInitialization({
+      initializedKey: initializedConnectionHandoffKey.current,
+      handoff: initialState,
+      methods: allMethods,
+    });
+    if (!initialState || !initialization) return;
+    initializedConnectionHandoffKey.current = initialization.key;
+    if (initialization.methodId) setMethodId(initialization.methodId);
     setOwner(normalizeConnectionOwner(initialState.owner ?? defaultOwner, ownerOptions));
     if (initialState.label) setLabel(initialState.label);
     setValues({});

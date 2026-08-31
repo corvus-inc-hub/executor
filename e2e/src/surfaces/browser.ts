@@ -22,10 +22,20 @@ export interface BrowserSession {
   readonly step: (label: string, action: (page: Page) => Promise<void>) => Promise<void>;
 }
 
+export interface BrowserSessionOptions {
+  /**
+   * Playwright traces contain action parameters and browser storage. Disable
+   * them for credential-bearing journeys; masked screenshots and video remain
+   * available without persisting raw credentials or session cookies.
+   */
+  readonly captureTrace?: boolean;
+}
+
 export interface BrowserSurface {
   readonly session: (
     identity: Identity,
     drive: (session: BrowserSession) => Promise<void>,
+    options?: BrowserSessionOptions,
   ) => Effect.Effect<void>;
 }
 
@@ -39,7 +49,7 @@ const slug = (text: string): string =>
 // acquireUseRelease so a vitest timeout (fiber interruption) still closes the
 // browser and flushes video + trace — a bare promise would leak Chromium.
 export const makeBrowserSurface = (dir: string, target: Target): BrowserSurface => ({
-  session: (identity, drive) =>
+  session: (identity, drive, options) =>
     Effect.acquireUseRelease(
       Effect.promise(async () => {
         const videoTmp = join(dir, ".video-tmp");
@@ -70,11 +80,14 @@ export const makeBrowserSurface = (dir: string, target: Target): BrowserSurface 
           recordVideo: { dir: videoTmp, size: { width: 1280, height: 800 } },
           baseURL: target.baseUrl,
         });
-        await context.tracing.start({
-          screenshots: true,
-          snapshots: true,
-          sources: true,
-        });
+        const captureTrace = options?.captureTrace ?? true;
+        if (captureTrace) {
+          await context.tracing.start({
+            screenshots: true,
+            snapshots: true,
+            sources: true,
+          });
+        }
         // Bake a synthetic URL bar into the recording so a shared session.mp4
         // (and the step screenshots) shows which page each moment was on.
         await installRecordingUrlBar(context);
@@ -140,20 +153,21 @@ export const makeBrowserSurface = (dir: string, target: Target): BrowserSurface 
           videoTmp,
           shots: { count: 0 },
           traceIds,
+          captureTrace,
         };
       }),
-      ({ page, context, shots }) =>
+      ({ page, context, shots, captureTrace }) =>
         Effect.promise(async () => {
           const step = async (label: string, action: (page: Page) => Promise<void>) => {
             // Acting on the page IS focusing the browser window — and when
             // filming, enterFocus lingers a beat on whatever the developer was
             // looking at before tabbing here.
             await enterFocus(dir, "browser");
-            await context.tracing.group(label);
+            if (captureTrace) await context.tracing.group(label);
             try {
               await action(page);
             } finally {
-              await context.tracing.groupEnd();
+              if (captureTrace) await context.tracing.groupEnd();
             }
             await page.screenshot({
               path: join(dir, `${String(shots.count++).padStart(2, "0")}-${slug(label)}.png`),
@@ -170,10 +184,12 @@ export const makeBrowserSurface = (dir: string, target: Target): BrowserSurface 
             throw error;
           }
         }),
-      ({ browser, context, page, videoTmp, traceIds }) =>
+      ({ browser, context, page, videoTmp, traceIds, captureTrace }) =>
         Effect.promise(async () => {
           appendTraces(dir, traceIds);
-          await context.tracing.stop({ path: join(dir, "trace.zip") }).catch(() => {});
+          if (captureTrace) {
+            await context.tracing.stop({ path: join(dir, "trace.zip") }).catch(() => {});
+          }
           const video = page.video();
           await context.close(); // flushes the recording
           await browser.close();

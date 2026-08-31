@@ -18,6 +18,7 @@ import {
   DEFAULT_CONNECTION_OWNER,
   mergeCustomMethods,
   oauthIdentityLabelFromHealth,
+  resolveConnectionHandoffInitialization,
   runCimdConnect,
   runDcrConnect,
 } from "./add-account-modal";
@@ -266,6 +267,40 @@ describe("createCredentialPayloadOrigin", () => {
         values: {},
         onePasswordItemId: "op://Private/Datadog/api-key",
         singleInput: false,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("resolveConnectionHandoffInitialization", () => {
+  const handoff = {
+    key: "handoff-1",
+    template: "api-key",
+    label: "Production",
+  } as const;
+
+  it("waits for the requested method, initializes once, and ignores reactive catalog refreshes", () => {
+    expect(
+      resolveConnectionHandoffInitialization({
+        initializedKey: null,
+        handoff,
+        methods: [],
+      }),
+    ).toBeNull();
+
+    expect(
+      resolveConnectionHandoffInitialization({
+        initializedKey: null,
+        handoff,
+        methods: [apiKeyMethod("api-key", "spec")],
+      }),
+    ).toEqual({ key: "handoff-1", methodId: "api-key" });
+
+    expect(
+      resolveConnectionHandoffInitialization({
+        initializedKey: "handoff-1",
+        handoff,
+        methods: [apiKeyMethod("api-key-refreshed", "spec", "api-key")],
       }),
     ).toBeNull();
   });

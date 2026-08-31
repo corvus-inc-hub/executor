@@ -3,6 +3,8 @@
 // observe and complete it. The retired model-callable createHandoff tool is
 // deliberately absent from this journey.
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 
 import { expect } from "@effect/vitest";
 import { Effect } from "effect";
@@ -14,7 +16,7 @@ import { IntegrationSlug, type ConnectionRef } from "@executor-js/sdk/shared";
 
 import { createEmulatorInstance } from "../src/emulator-instance";
 import { scenario } from "../src/scenario";
-import { Api, Browser, ServiceIdentity, Target } from "../src/services";
+import { Api, Browser, RunDir, ServiceIdentity, Target } from "../src/services";
 import type { Identity, Target as TargetShape } from "../src/target";
 import type { BrowserSurface } from "../src/surfaces/browser";
 import type { ApiSurface } from "../src/surfaces/api";
@@ -28,14 +30,31 @@ const emulator = Effect.gen(function* () {
   return yield* Effect.promise(() => connectEmulator({ baseUrl }));
 });
 
-const mintEmulatorApiKey = (client: EmulatorClient) =>
+const mintEmulatorApiKey = (client: EmulatorClient, login: string) =>
   Effect.gen(function* () {
-    const credential = yield* Effect.promise(() => client.credentials.mint({ type: "api-key" }));
+    const credential = yield* Effect.promise(() =>
+      client.credentials.mint({ type: "api-key", login }),
+    );
     if (!credential.token) {
-      return yield* Effect.die(`emulator credential mint failed: ${JSON.stringify(credential)}`);
+      return yield* Effect.die("emulator credential mint returned no token");
     }
     return credential.token;
   });
+
+const sendEmailCode = (toolAddress: string, subject: string) => `
+const segments = ${JSON.stringify(toolAddress)}.split(".").slice(1);
+let callable = tools;
+for (const segment of segments) callable = callable[segment];
+const sent = await callable({
+  body: {
+    from: "onboarding@example.com",
+    to: "workos-handoff@example.com",
+    subject: ${JSON.stringify(subject)},
+    html: "<p>WorkOS handoff delivery proof</p>",
+  },
+});
+return JSON.stringify({ ok: sent.ok, result: sent.ok ? sent.data : sent.error });
+`;
 
 scenario(
   "Connect · the service-created handoff opens this deployment and the bound user completes it",
@@ -43,12 +62,15 @@ scenario(
   Effect.gen(function* () {
     const target = yield* Target;
     const browser = yield* Browser;
+    const runDir = yield* RunDir;
     const newServiceIdentity = yield* ServiceIdentity;
     const { client: makeApiClient } = yield* Api;
 
     const integration = unique("resendhf");
     const emulatorClient = yield* emulator;
-    const apiKey = yield* mintEmulatorApiKey(emulatorClient);
+    const providerLogin = unique("handoffactor");
+    const apiKey = yield* mintEmulatorApiKey(emulatorClient, providerLogin);
+    const emailSubject = unique("handoffsend");
     const user = yield* target.newIdentity();
     const service = yield* newServiceIdentity({ scopes: ["connections:handoff"] });
     const userClient = yield* makeApiClient(api, user);
@@ -57,10 +79,13 @@ scenario(
     yield* runScenario({
       target,
       browser,
+      runDir,
       user,
       service,
       integration,
       apiKey,
+      providerLogin,
+      emailSubject,
       emulatorClient,
       makeApiClient,
       settlement,
@@ -84,10 +109,13 @@ scenario(
 const runScenario = (input: {
   readonly target: TargetShape;
   readonly browser: BrowserSurface;
+  readonly runDir: string;
   readonly user: Identity;
   readonly service: Identity;
   readonly integration: IntegrationSlug;
   readonly apiKey: string;
+  readonly providerLogin: string;
+  readonly emailSubject: string;
   readonly emulatorClient: EmulatorClient;
   readonly makeApiClient: ApiSurface["client"];
   readonly settlement: { connection?: ConnectionRef };
@@ -96,10 +124,13 @@ const runScenario = (input: {
     const {
       target,
       browser,
+      runDir,
       user,
       service,
       integration,
       apiKey,
+      providerLogin,
+      emailSubject,
       emulatorClient,
       makeApiClient,
       settlement,
@@ -134,31 +165,41 @@ const runScenario = (input: {
     expect(new URL(handoff.url).origin).toBe(new URL(target.baseUrl).origin);
     expect(new URL(handoff.url).pathname).toBe(`/${orgSlug}/connect/${handoff.handoffId}`);
 
-    yield* browser.session(user, async ({ page, step }) => {
-      await step("Open the service-created handoff URL", async () => {
-        await page.goto(handoff.url, { waitUntil: "networkidle" });
-      });
-      await step("The Add connection modal is open", async () => {
-        await page.getByRole("heading", { name: /Add connection/ }).waitFor({ timeout: 15_000 });
-      });
-      await step("Paste the provider credential", async () => {
-        const credential = page.getByRole("dialog").getByRole("textbox", { name: "Authorization" });
-        await credential.waitFor({ timeout: 15_000 });
-        await credential.fill(apiKey);
-      });
-      await step("Complete the handoff", async () => {
-        await page.getByRole("button", { name: "Continue" }).click();
-        await page
-          .getByRole("dialog")
-          .getByRole("button", { name: "Add connection", exact: true })
-          .click();
-        await page
-          .getByRole("heading", { name: /Add connection/ })
-          .waitFor({ state: "hidden", timeout: 20_000 });
-        await page.waitForURL(returnTo, { timeout: 20_000, waitUntil: "networkidle" });
-        await page.getByRole("dialog").waitFor({ state: "hidden", timeout: 20_000 });
-      });
-    });
+    yield* browser.session(
+      user,
+      async ({ page, step }) => {
+        await step("Open the service-created handoff URL", async () => {
+          await page.goto(handoff.url, { waitUntil: "networkidle" });
+        });
+        await step("The Add connection modal is open", async () => {
+          await page.getByRole("heading", { name: /Add connection/ }).waitFor({ timeout: 15_000 });
+        });
+        await step("Paste the provider credential", async () => {
+          const credential = page
+            .getByRole("dialog")
+            .getByRole("textbox", { name: "Authorization" });
+          await credential.waitFor({ timeout: 15_000 });
+          await credential.fill(apiKey);
+        });
+        await step("Complete the handoff", async () => {
+          await page.getByRole("button", { name: "Continue" }).click();
+          await page
+            .getByRole("dialog")
+            .getByRole("button", { name: "Add connection", exact: true })
+            .click();
+          await page
+            .getByRole("heading", { name: /Add connection/ })
+            .waitFor({ state: "hidden", timeout: 20_000 });
+          await page.waitForURL(returnTo, { timeout: 20_000, waitUntil: "networkidle" });
+          await page.getByRole("dialog").waitFor({ state: "hidden", timeout: 20_000 });
+        });
+      },
+      { captureTrace: false },
+    );
+    expect(
+      existsSync(join(runDir, "trace.zip")),
+      "credential-bearing browser journeys never persist Playwright traces",
+    ).toBe(false);
 
     const completed = yield* serviceClient.connections.getHandoff({
       params: { handoffId: handoff.handoffId },
@@ -175,7 +216,46 @@ const runScenario = (input: {
     expect(saved.integration).toBe(integration);
     expect(saved.owner).toBe("user");
     expect(
-      JSON.stringify(saved),
+      JSON.stringify(saved).includes(apiKey),
       "the saved projection never returns the provider secret",
-    ).not.toContain(apiKey);
+    ).toBe(false);
+
+    const receiptTools = yield* userClient.tools.list({
+      query: {
+        integration: completed.receipt.connection.integration,
+        owner: completed.receipt.connection.owner,
+        connection: completed.receipt.connection.name,
+      },
+    });
+    const sendTool = receiptTools.find((tool) => String(tool.name) === "emails.send");
+    expect(
+      sendTool?.address,
+      "the exact handoff-created connection exposes the Resend send operation",
+    ).toBeTruthy();
+    if (!sendTool) return yield* Effect.die("handoff-created Resend send tool was absent");
+
+    const executed = yield* userClient.executions.execute({
+      payload: {
+        code: sendEmailCode(String(sendTool.address), emailSubject),
+        autoApprove: true,
+      },
+    });
+    expect(executed.status, "the exact handoff-created connection executed").toBe("completed");
+    if (executed.status !== "completed") return;
+    expect(executed.isError, executed.text).toBe(false);
+    const outcome = JSON.parse(executed.text) as { readonly ok?: boolean };
+    expect(outcome.ok, executed.text).toBe(true);
+
+    const ledger = yield* Effect.promise(() => emulatorClient.ledger.list());
+    const providerRequest = ledger.find((entry) =>
+      JSON.stringify(entry.request.body).includes(emailSubject),
+    );
+    expect(
+      providerRequest?.response.status,
+      "the provider ledger recorded the exact handoff-bound send",
+    ).toBe(200);
+    expect(
+      providerRequest?.identity.user?.login,
+      "the provider resolved the unique credential pasted through the handoff",
+    ).toBe(providerLogin);
   });
