@@ -187,19 +187,12 @@ const runScenario = (input: {
         });
         await step("Complete the handoff", async () => {
           await page.getByRole("button", { name: "Continue" }).click();
-          await page.waitForFunction(() =>
-            document
-              .getAnimations()
-              .filter((animation) => animation.effect?.getTiming().iterations !== Infinity)
-              .every((animation) => animation.playState === "finished"),
-          );
-          const addConnection = page
-            .getByRole("dialog")
-            .getByRole("button", { name: "Add connection", exact: true });
-          expect(
-            await addConnection.isEnabled(),
-            "the completed credential step retains submit authority after motion settles",
-          ).toBe(true);
+          const addConnection = page.getByRole("dialog").getByRole("button", {
+            name: "Add connection",
+            exact: true,
+            disabled: false,
+          });
+          await addConnection.waitFor({ timeout: 15_000 });
           await addConnection.click();
           await page
             .getByRole("heading", { name: /Add connection/ })

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import * as Exit from "effect/Exit";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
@@ -1278,7 +1278,10 @@ function AddAccountModalView(props: AddAccountModalProps) {
     setMethodId(allMethods[0]!.id);
   }, [allMethods, methodId]);
 
-  useEffect(() => {
+  // This reset must finish before the modal becomes interactive. A passive
+  // effect can run after a fast paste + Continue, erase the credential, and
+  // turn the already-rendered Add connection action back into a disabled one.
+  useLayoutEffect(() => {
     const initialization = resolveConnectionHandoffInitialization({
       initializedKey: initializedConnectionHandoffKey.current,
       handoff: initialState,
