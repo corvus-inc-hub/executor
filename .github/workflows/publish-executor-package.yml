@@ -7,6 +7,9 @@ on:
   push:
     tags:
       - "v*"
+      # Manifest fork releases publish only the self-host image. They must not
+      # publish upstream npm/desktop artifacts from this workflow.
+      - "!v*-mnfst.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -23,6 +26,8 @@ concurrency:
 
 jobs:
   publish:
+    # Keep manual repair runs from bypassing the Manifest tag exclusion.
+    if: ${{ github.event_name != 'workflow_dispatch' || !contains(inputs.tag, '-mnfst.') }}
     runs-on: ubuntu-latest
     permissions:
       actions: write
