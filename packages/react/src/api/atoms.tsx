@@ -1,5 +1,6 @@
 import {
   ConnectionAddress,
+  ConnectionHandoffId,
   PolicyId,
   ProviderKey,
   type AuthTemplateSlug,
@@ -119,6 +120,16 @@ export const connectionsAllAtom = ExecutorApiClient.query("connections", "list",
   reactivityKeys: [ReactivityKey.connections],
 });
 
+/** Exact-member browser projection of one Executor-owned handoff. The route
+ * refreshes this atom while pending; GET only reads persisted terminal state
+ * and records expiry. */
+export const connectionHandoffAtom = Atom.family((handoffId: ConnectionHandoffId) =>
+  ExecutorApiClient.query("connections", "getHandoff", {
+    params: { handoffId },
+    timeToLive: "1 second",
+  }),
+);
+
 // ---------------------------------------------------------------------------
 // Providers — credential-backend discovery (new in v2).
 // ---------------------------------------------------------------------------
@@ -157,6 +168,13 @@ export const pausedExecutionAtom = (executionId: string) =>
 // ---------------------------------------------------------------------------
 
 export const createConnection = ExecutorApiClient.mutation("connections", "create");
+
+/** User-only explicit settlement after a credential/OAuth save returned its
+ * exact ConnectionRef. No observation or polling path can settle a handoff. */
+export const completeConnectionHandoff = ExecutorApiClient.mutation(
+  "connections",
+  "completeHandoff",
+);
 
 export const removeConnection = ExecutorApiClient.mutation("connections", "remove");
 

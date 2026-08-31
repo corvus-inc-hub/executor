@@ -23,6 +23,7 @@ import type { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
 import * as AtomHttpApi from "effect/unstable/reactivity/AtomHttpApi";
 import type { HealthCheckSpec } from "./health-check";
+import type { ConnectionHandoffId } from "./ids";
 
 // ---------------------------------------------------------------------------
 // Re-exports — the curated set of primitives a plugin author needs to
@@ -145,11 +146,18 @@ export type IntegrationPresetAuthentication =
 export interface IntegrationAccountHandoff {
   /** Changes on each handoff URL, so the accounts UI can open once per link. */
   readonly key: string;
+  /** Present only for an Executor-owned connection handoff. After the actual
+   * connection save succeeds, the hosted account UI explicitly completes this
+   * exact session before it closes. */
+  readonly connectionHandoffId?: ConnectionHandoffId;
   readonly owner?: "org" | "user";
   /** Auth template/method to preselect when present. */
   readonly template?: string;
   /** Non-secret connection label to prefill. */
   readonly label?: string;
+  /** The hosted service handoff owns the exact user target. The private UI may
+   * display it, but must not let the browser change owner or connection name. */
+  readonly fixedTarget?: boolean;
   /** Existing display identity to preserve when reconnecting a saved row. */
   readonly identityLabel?: string;
   /** Present when the agent handed off a CONFIDENTIAL OAuth-app registration

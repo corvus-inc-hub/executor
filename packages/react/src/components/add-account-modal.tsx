@@ -13,6 +13,7 @@ import {
   type HealthCheckCandidate,
   type HealthCheckResult,
   type HealthCheckSpec,
+  type ConnectionRef,
   type OAuthClientSummary,
   type Owner,
 } from "@executor-js/sdk/shared";
@@ -22,6 +23,7 @@ import { toast } from "sonner";
 import {
   addConnectionOptimistic,
   checkConnectionHealth,
+  completeConnectionHandoff,
   connectionsAllAtom,
   createOAuthClientOptimistic,
   integrationHealthCheckAtom,
@@ -1196,6 +1198,9 @@ function AddAccountModalView(props: AddAccountModalProps) {
   const doCreate = useAtomSet(addConnectionOptimistic(owner), {
     mode: "promiseExit",
   });
+  const doCompleteConnectionHandoff = useAtomSet(completeConnectionHandoff, {
+    mode: "promiseExit",
+  });
   const doStartOAuth = useAtomSet(startOAuth, { mode: "promiseExit" });
   const doCreateOAuthClient = useAtomSet(createOAuthClientOptimistic, { mode: "promiseExit" });
   const doProbe = useAtomSet(probeOAuth, { mode: "promiseExit" });
@@ -1607,6 +1612,24 @@ function AddAccountModalView(props: AddAccountModalProps) {
   // OAuth popup flow's busy state die with this instance.
   const close = useCallback(() => onOpenChange(false), [onOpenChange]);
 
+  const completeSavedConnectionHandoff = async (connection: ConnectionRef): Promise<boolean> => {
+    const handoffId = initialState?.connectionHandoffId;
+    if (!handoffId) return true;
+    const completion = await doCompleteConnectionHandoff({
+      params: { handoffId },
+      payload: connection,
+      reactivityKeys: [],
+    });
+    if (Exit.isSuccess(completion)) return true;
+    toast.error(
+      messageFromExit(
+        completion,
+        "Connection saved, but the secure request could not be completed. Try again.",
+      ),
+    );
+    return false;
+  };
+
   useEffect(() => {
     const handoff = initialState;
     const oauthClient = handoff?.oauthClient;
@@ -1749,6 +1772,10 @@ function AddAccountModalView(props: AddAccountModalProps) {
       toast.error(messageFromExit(exit, "Failed to add connection"));
       return;
     }
+    if (!(await completeSavedConnectionHandoff(exit.value))) {
+      setSubmitting(false);
+      return;
+    }
     toast.success("Connection added");
     close();
   };
@@ -1821,7 +1848,12 @@ function AddAccountModalView(props: AddAccountModalProps) {
     // the user may have typed a name while the probe was in flight, and a
     // hand-typed name is never clobbered.
     const probedIdentity = result.identity?.trim();
-    if (result.status === "healthy" && probedIdentity && probedIdentity.length > 0) {
+    if (
+      !initialState?.fixedTarget &&
+      result.status === "healthy" &&
+      probedIdentity &&
+      probedIdentity.length > 0
+    ) {
       setLabel((current) => {
         if (current.trim().length > 0 && !nameAutofilled.current) return current;
         nameAutofilled.current = true;
@@ -1862,11 +1894,13 @@ function AddAccountModalView(props: AddAccountModalProps) {
       }
     }
     setValidationResult((current) => (current ? { ...current, identity: value } : current));
-    setLabel((current) => {
-      if (current.trim().length > 0 && !nameAutofilled.current) return current;
-      nameAutofilled.current = true;
-      return value;
-    });
+    if (!initialState?.fixedTarget) {
+      setLabel((current) => {
+        if (current.trim().length > 0 && !nameAutofilled.current) return current;
+        nameAutofilled.current = true;
+        return value;
+      });
+    }
   };
 
   const handleOAuthConnect = async () => {
@@ -1909,8 +1943,15 @@ function AddAccountModalView(props: AddAccountModalProps) {
         toast.error(messageFromExit(exit, "Failed to connect"));
         return;
       }
-      if (exit.value.status === "connected") {
-        await probeAndAutoNameOAuthConnection(exit.value.connection, label, identityLabel);
+      if (exit.value.status !== "connected") {
+        setCcBusy(false);
+        toast.error("OAuth did not finish creating the connection");
+        return;
+      }
+      await probeAndAutoNameOAuthConnection(exit.value.connection, label, identityLabel);
+      if (!(await completeSavedConnectionHandoff(exit.value.connection))) {
+        setCcBusy(false);
+        return;
       }
       setCcBusy(false);
       toast.success("Connection added");
@@ -1944,6 +1985,7 @@ function AddAccountModalView(props: AddAccountModalProps) {
       },
       onSuccess: async (connection: OAuthCompletionPayload) => {
         await probeAndAutoNameOAuthConnection(connection, label, identityLabel);
+        if (!(await completeSavedConnectionHandoff(connection))) return;
         toast.success("Connection added");
         close();
       },
@@ -1995,6 +2037,7 @@ function AddAccountModalView(props: AddAccountModalProps) {
             },
             onSuccess: async (connection: OAuthCompletionPayload) => {
               await probeAndAutoNameOAuthConnection(connection, label, identityLabel);
+              if (!(await completeSavedConnectionHandoff(connection))) return;
               toast.success("Connection added");
               close();
             },
@@ -2086,6 +2129,7 @@ function AddAccountModalView(props: AddAccountModalProps) {
             },
             onSuccess: async (connection: OAuthCompletionPayload) => {
               await probeAndAutoNameOAuthConnection(connection, label, identityLabel);
+              if (!(await completeSavedConnectionHandoff(connection))) return;
               toast.success("Connection added");
               close();
             },
@@ -2699,7 +2743,9 @@ function AddAccountModalView(props: AddAccountModalProps) {
                     }
                     htmlFor="connection-name"
                   />
-                  {nameOptions.length > 0 ? (
+                  {initialState?.fixedTarget ? (
+                    <Input id="connection-name" value={label} readOnly aria-readonly="true" />
+                  ) : nameOptions.length > 0 ? (
                     // The response's identity fields are the options; picking
                     // one also stores its path as the check's identityField.
                     <FreeformCombobox
@@ -2753,7 +2799,7 @@ function AddAccountModalView(props: AddAccountModalProps) {
               while a Personal app mints Personal only in cloud;
               for transparent DCR the app + connection land under the chosen
               owner; for a credential method it's the plain owner choice. */}
-              {showSavedToPicker && showPlaceStep && (
+              {showSavedToPicker && showPlaceStep && !initialState?.fixedTarget && (
                 <div className="space-y-2">
                   <StepHeader index={wizardActive ? 2 : 3} label="Connection saved to" />
                   <ConnectionOwnerDropdown

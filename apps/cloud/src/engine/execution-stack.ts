@@ -41,9 +41,11 @@ import {
   HostConfig,
   PluginsProvider,
   collectTables,
+  type HostConfigShape,
 } from "@executor-js/api/server";
 import { makeDynamicWorkerExecutor } from "@executor-js/runtime-dynamic-worker";
 import type { AnyPlugin } from "@executor-js/sdk";
+import { parseExactOrigins } from "@executor-js/sdk/public-origin";
 
 import executorConfig from "../../executor.config";
 import { DbService } from "../db/db";
@@ -94,18 +96,30 @@ export const CloudPluginsProvider: Layer.Layer<PluginsProvider> = Layer.succeed(
  */
 export const CLOUD_MOUNT_PREFIX = "/api" as const;
 
-export const CloudHostConfig: Layer.Layer<HostConfig> = Layer.sync(HostConfig, () => ({
+export const cloudHostConfigFromEnv = (input: {
+  readonly ALLOW_LOCAL_NETWORK?: string;
+  readonly VITE_PUBLIC_SITE_URL?: string;
+  readonly EXECUTOR_CONNECTION_RETURN_ORIGINS?: string;
+}): HostConfigShape => ({
   // SSRF / private-network egress guard. Config-driven, NOT a test flag:
   // production leaves `ALLOW_LOCAL_NETWORK` unset so the guard stays ON (`false`);
   // the e2e dev-server env opts in with `"true"` so in-scenario fixture
   // servers on localhost are reachable. See `hosted-http-client.ts`.
-  allowLocalNetwork: env.ALLOW_LOCAL_NETWORK === "true",
-  webBaseUrl: env.VITE_PUBLIC_SITE_URL ?? "https://executor.sh",
+  allowLocalNetwork: input.ALLOW_LOCAL_NETWORK === "true",
+  webBaseUrl: input.VITE_PUBLIC_SITE_URL ?? "https://executor.sh",
   oauthCallbackPath: `${CLOUD_MOUNT_PREFIX}/oauth/callback`,
+  connectionReturnOrigins: parseExactOrigins(
+    input.EXECUTOR_CONNECTION_RETURN_ORIGINS,
+    "EXECUTOR_CONNECTION_RETURN_ORIGINS",
+  ),
   // WorkOS Vault is cloud's credential storage implementation detail, not a
   // user-selectable provider surface.
   exposeCredentialProviders: false,
-}));
+});
+
+export const CloudHostConfig: Layer.Layer<HostConfig> = Layer.sync(HostConfig, () =>
+  cloudHostConfigFromEnv(env),
+);
 
 export const CloudCodeExecutorProvider: Layer.Layer<CodeExecutorProvider> = Layer.sync(
   CodeExecutorProvider,

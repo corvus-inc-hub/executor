@@ -13,6 +13,7 @@ export {
   AuthTemplateSlug,
   ConnectionAddress,
   ConnectionName,
+  ConnectionHandoffId,
   ElicitationId,
   IntegrationSlug,
   OAuthClientSlug,
@@ -39,12 +40,23 @@ export type {
 } from "./integration";
 export type {
   Connection,
+  ConnectionRemovalReceipt,
   ConnectionRef,
   ConnectionValueInput,
   CreateConnectionInput,
   UpdateConnectionInput,
   ValidateConnectionInput,
 } from "./connection";
+export {
+  ConnectionHandoff,
+  ConnectionHandoffExpiryReceipt,
+  ConnectionHandoffReceipt,
+  ConnectionHandoffTarget,
+  CompletedConnectionHandoff,
+  ExpiredConnectionHandoff,
+  PendingConnectionHandoff,
+  type CreateConnectionHandoffInput,
+} from "./connection-handoff";
 export type { CredentialProvider, ProviderEntry } from "./provider";
 export { ownerForProviderItem, providerItemOwner } from "./provider";
 export type { Tool, ToolDef, ToolListFilter, ToolAnnotations } from "./tool";
@@ -60,6 +72,12 @@ export {
   IntegrationAlreadyExistsError,
   IntegrationRemovalNotAllowedError,
   ConnectionNotFoundError,
+  ConnectionHandoffNotFoundError,
+  ConnectionHandoffMemberMismatchError,
+  ConnectionHandoffTargetMismatchError,
+  ConnectionHandoffExpiredError,
+  ConnectionHandoffInvalidReturnTargetError,
+  ConnectionHandoffUnavailableError,
   InvalidConnectionInputError,
   CredentialProviderNotRegisteredError,
   CredentialResolutionError,

@@ -107,17 +107,6 @@ const ConnectionsListOutput = Schema.Struct({
   connections: Schema.Array(ConnectionListItem),
 });
 
-const ConnectionCreateHandoffInput = Schema.Struct({
-  integration: Schema.String,
-  owner: Schema.optional(OwnerSchema),
-  template: Schema.optional(Schema.String),
-  label: Schema.optional(Schema.String),
-});
-const ConnectionCreateHandoffOutput = Schema.Struct({
-  url: Schema.String,
-  instructions: Schema.String,
-});
-
 const ConnectionFromInput = Schema.Struct({
   provider: Schema.String,
   id: Schema.String,
@@ -174,6 +163,15 @@ const ConnectionsRefreshOutput = Schema.Struct({
 });
 
 const RemovedOutput = Schema.Struct({ removed: Schema.Boolean });
+const ConnectionRemovalOutput = Schema.Struct({
+  schema: Schema.Literal("executor.connection-removal.receipt.v1"),
+  receiptId: Schema.String,
+  tenant: Schema.String,
+  actorSubject: Schema.NullOr(Schema.String),
+  removedAt: Schema.Number,
+  removed: ConnectionOutput,
+  readback: Schema.Struct({ connection: Schema.Null }),
+});
 const CancelledOutput = Schema.Struct({ cancelled: Schema.Boolean });
 
 const ProvidersOutput = Schema.Struct({
@@ -331,13 +329,12 @@ const DetectInputStd = schemaToStandard(DetectInput);
 const DetectOutputStd = schemaToStandard(DetectOutput);
 const ConnectionsListInputStd = schemaToStandard(ConnectionsListInput);
 const ConnectionsListOutputStd = schemaToStandard(ConnectionsListOutput);
-const ConnectionCreateHandoffInputStd = schemaToStandard(ConnectionCreateHandoffInput);
-const ConnectionCreateHandoffOutputStd = schemaToStandard(ConnectionCreateHandoffOutput);
 const ConnectionCreateInputStd = schemaToStandard(ConnectionCreateInput);
 const ConnectionOutputStd = schemaToStandard(ConnectionOutput);
 const ConnectionRefInputStd = schemaToStandard(ConnectionRefInput);
 const ConnectionsRefreshOutputStd = schemaToStandard(ConnectionsRefreshOutput);
 const RemovedOutputStd = schemaToStandard(RemovedOutput);
+const ConnectionRemovalOutputStd = schemaToStandard(ConnectionRemovalOutput);
 const CancelledOutputStd = schemaToStandard(CancelledOutput);
 const ProvidersOutputStd = schemaToStandard(ProvidersOutput);
 const ProviderItemsInputStd = schemaToStandard(ProviderItemsInput);
@@ -455,26 +452,6 @@ const createConnectionInputFromTool = (
   };
 };
 
-const connectionCreateHandoffUrl = (
-  webBaseUrl: string | undefined,
-  orgSlug: string | undefined,
-  input: typeof ConnectionCreateHandoffInput.Type,
-): string => {
-  const search = new URLSearchParams({ addAccount: "1" });
-  if (input.owner !== undefined) search.set("owner", input.owner);
-  if (input.template !== undefined) search.set("template", input.template);
-  if (input.label !== undefined) search.set("label", input.label);
-  // Org-scoped hosts (cloud, self-host, cloudflare) serve the console under an
-  // optional `/<org-slug>` segment. Pin the URL to the executor's bound org so
-  // it opens that org directly instead of relying on the browser's last-active
-  // org (which `OrgSlugGate` would otherwise canonicalize a bare URL to). When
-  // no slug is known (CLI, local, non-request callers) we emit the bare path.
-  const orgPrefix = orgSlug !== undefined && orgSlug.length > 0 ? `/${orgSlug}` : "";
-  const path = `${orgPrefix}/integrations/${encodeURIComponent(input.integration)}?${search.toString()}`;
-  if (webBaseUrl === undefined || webBaseUrl.length === 0) return path;
-  return new URL(path, webBaseUrl.endsWith("/") ? webBaseUrl : `${webBaseUrl}/`).toString();
-};
-
 const oauthClientCreateHandoffUrl = (
   webBaseUrl: string | undefined,
   orgSlug: string | undefined,
@@ -578,7 +555,7 @@ export const coreToolsPlugin = definePlugin((options: CoreToolsPluginOptions = {
         tool({
           name: "connections.create",
           description:
-            'Low-level create or replace for a saved connection from provider item references. For a no-auth integration (public MCP server, public REST API), pass `template: "none"` with no `from`/`inputs` to wire it up directly. For normal API keys/tokens, use `connections.createHandoff` so the user enters the credential in the web UI. OAuth credentials should use `oauth.start`.',
+            'Low-level create or replace for a saved connection from provider item references. For a no-auth integration (public MCP server, public REST API), pass `template: "none"` with no `from`/`inputs` to wire it up directly. Browser-mediated credentials are created through the service-owned connection handoff API. OAuth credentials should use `oauth.start`.',
           inputSchema: ConnectionCreateInputStd,
           outputSchema: ConnectionOutputStd,
           // Creating a connection binds a credential reference and roots a new
@@ -595,33 +572,19 @@ export const coreToolsPlugin = definePlugin((options: CoreToolsPluginOptions = {
             ),
         }),
         tool({
-          name: "connections.createHandoff",
-          description:
-            "Return a browser URL that opens the Add account flow for one integration. Use this for API keys/tokens so the user enters secrets directly in the web UI instead of sending them through the agent. Optionally preselect owner, auth template, and a non-secret label.",
-          inputSchema: ConnectionCreateHandoffInputStd,
-          outputSchema: ConnectionCreateHandoffOutputStd,
-          execute: (input: typeof ConnectionCreateHandoffInput.Type) => {
-            const url = connectionCreateHandoffUrl(options.webBaseUrl, options.orgSlug, input);
-            return Effect.succeed({
-              url,
-              instructions:
-                "Ask the user to open this URL and add the account in the Executor web UI. Do not ask them to paste the credential value into chat. After they finish, call connections.list for the integration to discover the created connection.",
-            });
-          },
-        }),
-        tool({
           name: "connections.remove",
           description:
             "Remove a saved connection and its produced tools by owner, integration, and connection name.",
           inputSchema: ConnectionRefInputStd,
-          outputSchema: RemovedOutputStd,
+          outputSchema: ConnectionRemovalOutputStd,
           // Deleting a connection drops it and every tool it produced, which
           // prompt-injected code could use to disrupt an integration or force a
           // re-add flow. Approval-gated, matching v1 `sources.remove`.
           annotations: { requiresApproval: true },
           execute: (input: typeof ConnectionRefInput.Type, { ctx }) =>
-            Effect.map(ctx.connections.remove(connectionRefFromInput(input)), () => ({
-              removed: true,
+            Effect.map(ctx.connections.remove(connectionRefFromInput(input)), (receipt) => ({
+              ...receipt,
+              removed: connectionToOutput(receipt.removed),
             })),
         }),
         tool({
@@ -735,7 +698,8 @@ export const coreToolsPlugin = definePlugin((options: CoreToolsPluginOptions = {
           outputSchema: OAuthCreateClientHandoffOutputStd,
           // Pure URL builder: no DB write, no token, no secret. This is the SAFE
           // path (it routes the secret to the human in the browser), so it is
-          // deliberately NOT approval-gated, mirroring `connections.createHandoff`.
+          // deliberately NOT approval-gated: it returns provider authorization
+          // metadata but never exposes a credential.
           execute: (input: typeof OAuthCreateClientHandoffInput.Type) => {
             const url = oauthClientCreateHandoffUrl(options.webBaseUrl, options.orgSlug, input);
             return Effect.succeed({

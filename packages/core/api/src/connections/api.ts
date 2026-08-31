@@ -13,6 +13,15 @@ import { Predicate, Schema } from "effect";
 import {
   AuthTemplateSlug,
   ConnectionAddress,
+  ConnectionHandoff,
+  CompletedConnectionHandoff,
+  ConnectionHandoffExpiredError,
+  ConnectionHandoffId,
+  ConnectionHandoffInvalidReturnTargetError,
+  ConnectionHandoffMemberMismatchError,
+  ConnectionHandoffNotFoundError,
+  ConnectionHandoffTargetMismatchError,
+  ConnectionHandoffUnavailableError,
   ConnectionName,
   ConnectionNotFoundError,
   CredentialProviderNotRegisteredError,
@@ -72,6 +81,16 @@ const ToolResponse = Schema.Struct({
   name: Schema.String,
   pluginId: Schema.String,
   description: Schema.String,
+});
+
+const ConnectionRemovalResponse = Schema.Struct({
+  schema: Schema.Literal("executor.connection-removal.receipt.v1"),
+  receiptId: Schema.String,
+  tenant: Schema.String,
+  actorSubject: Schema.NullOr(Schema.String),
+  removedAt: Schema.Number,
+  removed: ConnectionResponse,
+  readback: Schema.Struct({ connection: Schema.Null }),
 });
 
 // ---------------------------------------------------------------------------
@@ -157,6 +176,17 @@ const CheckHealthQuery = Schema.Struct({
   ),
 });
 
+const CreateConnectionHandoffPayload = Schema.Struct({
+  memberId: Schema.String,
+  integration: IntegrationSlug,
+  template: Schema.optional(AuthTemplateSlug),
+  label: Schema.String,
+  returnTo: Schema.String,
+});
+
+const ConnectionHandoffParams = Schema.Struct({ handoffId: ConnectionHandoffId });
+const CompleteConnectionHandoffPayload = Schema.Struct(ConnectionParams);
+
 // ---------------------------------------------------------------------------
 // Error schemas with HTTP status annotations
 // ---------------------------------------------------------------------------
@@ -173,6 +203,30 @@ const CredentialProviderNotRegistered = CredentialProviderNotRegisteredError.ann
 const InvalidConnectionInput = InvalidConnectionInputError.annotate({
   httpApiStatus: 400,
 });
+const ConnectionHandoffNotFound = ConnectionHandoffNotFoundError.annotate({
+  httpApiStatus: 404,
+});
+const ConnectionHandoffMemberMismatch = ConnectionHandoffMemberMismatchError.annotate({
+  httpApiStatus: 403,
+});
+const ConnectionHandoffTargetMismatch = ConnectionHandoffTargetMismatchError.annotate({
+  httpApiStatus: 409,
+});
+const ConnectionHandoffExpired = ConnectionHandoffExpiredError.annotate({
+  httpApiStatus: 410,
+});
+const ConnectionHandoffInvalidReturnTarget = ConnectionHandoffInvalidReturnTargetError.annotate({
+  httpApiStatus: 400,
+});
+const ConnectionHandoffUnavailable = ConnectionHandoffUnavailableError.annotate({
+  httpApiStatus: 503,
+});
+
+export class ConnectionHandoffForbidden extends Schema.TaggedErrorClass<ConnectionHandoffForbidden>()(
+  "ConnectionHandoffForbidden",
+  { message: Schema.String },
+  { httpApiStatus: 403 },
+) {}
 
 // ---------------------------------------------------------------------------
 // Group
@@ -216,8 +270,49 @@ export const ConnectionsApi = HttpApiGroup.make("connections")
   .add(
     HttpApiEndpoint.delete("remove", "/connections/:owner/:integration/:name", {
       params: ConnectionParams,
-      success: Schema.Struct({ removed: Schema.Boolean }),
+      success: ConnectionRemovalResponse,
       error: [InternalError, ConnectionNotFound],
+    }),
+  )
+  .add(
+    HttpApiEndpoint.post("createHandoff", "/connection-handoffs", {
+      payload: CreateConnectionHandoffPayload,
+      success: ConnectionHandoff,
+      error: [
+        InternalError,
+        ConnectionHandoffForbidden,
+        IntegrationNotFound,
+        ConnectionHandoffInvalidReturnTarget,
+        ConnectionHandoffUnavailable,
+      ],
+    }),
+  )
+  .add(
+    HttpApiEndpoint.get("getHandoff", "/connection-handoffs/:handoffId", {
+      params: ConnectionHandoffParams,
+      success: ConnectionHandoff,
+      error: [
+        InternalError,
+        ConnectionHandoffForbidden,
+        ConnectionHandoffNotFound,
+        ConnectionHandoffMemberMismatch,
+      ],
+    }),
+  )
+  .add(
+    HttpApiEndpoint.post("completeHandoff", "/connection-handoffs/:handoffId/complete", {
+      params: ConnectionHandoffParams,
+      payload: CompleteConnectionHandoffPayload,
+      success: CompletedConnectionHandoff,
+      error: [
+        InternalError,
+        ConnectionHandoffForbidden,
+        ConnectionHandoffNotFound,
+        ConnectionHandoffMemberMismatch,
+        ConnectionHandoffTargetMismatch,
+        ConnectionHandoffExpired,
+        ConnectionNotFound,
+      ],
     }),
   )
   .add(

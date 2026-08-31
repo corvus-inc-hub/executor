@@ -58,9 +58,8 @@ export interface HostConfigShape {
    */
   readonly allowLocalNetwork: boolean;
   /**
-   * Base URL of the executor's web UI. Threaded into `coreTools.webBaseUrl` so
-   * `connections.createHandoff` can point the user at
-   * `${webBaseUrl}/integrations/{slug}?addAccount=1`.
+   * Base URL of the executor's web UI. Threaded into `coreTools.webBaseUrl` for
+   * hosted OAuth and other first-party browser continuations.
    *
    * Optional: when a host can't know its public URL at boot (a Worker has no
    * static URL var), leave it unset and `makeScopedExecutor` falls back to the
@@ -86,6 +85,11 @@ export interface HostConfigShape {
    * detail of credential storage.
    */
   readonly exposeCredentialProviders?: boolean;
+  /** Exact external origins to which a completed connection handoff may
+   * return. Empty means handoff creation fails closed. */
+  readonly connectionReturnOrigins?: readonly string[];
+  /** Optional connection handoff lifetime override. */
+  readonly connectionHandoffTtlMs?: number;
 }
 
 export class HostConfig extends Context.Service<HostConfig, HostConfigShape>()(
@@ -279,6 +283,8 @@ export const makeScopedExecutor = <
         webBaseUrl,
         orgSlug,
         includeProviders: config.exposeCredentialProviders ?? true,
+        connectionReturnOrigins: config.connectionReturnOrigins,
+        connectionHandoffTtlMs: config.connectionHandoffTtlMs,
       },
     }).pipe(Effect.withSpan("executor.stack.create_executor"));
     // The seam erases the plugin tuple type; the caller re-narrows via the

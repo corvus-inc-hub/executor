@@ -2,7 +2,14 @@ import { Schema } from "effect";
 
 import { ElicitationDeclinedError } from "./elicitation";
 import type { StorageFailure } from "./fuma-runtime";
-import { ConnectionName, IntegrationSlug, Owner, ProviderKey, ToolAddress } from "./ids";
+import {
+  ConnectionHandoffId,
+  ConnectionName,
+  IntegrationSlug,
+  Owner,
+  ProviderKey,
+  ToolAddress,
+} from "./ids";
 
 export interface UserActionableError {
   readonly __executorUserActionable: true;
@@ -147,6 +154,56 @@ export class ConnectionNotFoundError extends Schema.TaggedErrorClass<ConnectionN
     return `Connection not found: ${this.integration}.${this.owner}.${this.name}`;
   }
 }
+
+export class ConnectionHandoffNotFoundError extends Schema.TaggedErrorClass<ConnectionHandoffNotFoundError>()(
+  "ConnectionHandoffNotFoundError",
+  { handoffId: ConnectionHandoffId },
+) {
+  override get message(): string {
+    return `Connection handoff not found: ${this.handoffId}`;
+  }
+}
+
+export class ConnectionHandoffMemberMismatchError extends Schema.TaggedErrorClass<ConnectionHandoffMemberMismatchError>()(
+  "ConnectionHandoffMemberMismatchError",
+  { handoffId: ConnectionHandoffId },
+) {
+  override get message(): string {
+    return `Connection handoff is not bound to the acting member: ${this.handoffId}`;
+  }
+}
+
+export class ConnectionHandoffTargetMismatchError extends Schema.TaggedErrorClass<ConnectionHandoffTargetMismatchError>()(
+  "ConnectionHandoffTargetMismatchError",
+  { handoffId: ConnectionHandoffId },
+) {
+  override get message(): string {
+    return `Connection handoff completion does not match its issued target: ${this.handoffId}`;
+  }
+}
+
+export class ConnectionHandoffExpiredError extends Schema.TaggedErrorClass<ConnectionHandoffExpiredError>()(
+  "ConnectionHandoffExpiredError",
+  { handoffId: ConnectionHandoffId, expiresAt: Schema.Number },
+) {
+  override get message(): string {
+    return `Connection handoff expired: ${this.handoffId}`;
+  }
+}
+
+export class ConnectionHandoffInvalidReturnTargetError extends Schema.TaggedErrorClass<ConnectionHandoffInvalidReturnTargetError>()(
+  "ConnectionHandoffInvalidReturnTargetError",
+  { returnTo: Schema.String },
+) {
+  override get message(): string {
+    return "Connection handoff return target is not an allowlisted absolute URL.";
+  }
+}
+
+export class ConnectionHandoffUnavailableError extends Schema.TaggedErrorClass<ConnectionHandoffUnavailableError>()(
+  "ConnectionHandoffUnavailableError",
+  { message: Schema.String },
+) {}
 
 /** A connection create request was rejected before anything was written: the
  *  input is structurally invalid (no credential inputs for a credentialed

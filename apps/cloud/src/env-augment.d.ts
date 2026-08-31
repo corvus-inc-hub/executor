@@ -37,6 +37,9 @@ declare global {
       // SSRF / private-network egress guard. Unset in production -> the guard is
       // ON; the test workers set "true" so fixtures can reach localhost.
       ALLOW_LOCAL_NETWORK?: string;
+      /** Comma-separated exact application origins allowed as connection
+       * handoff return targets. Empty/unset fails closed. */
+      EXECUTOR_CONNECTION_RETURN_ORIGINS?: string;
 
       // Per-org execution rate-limit counter DO (wrangler.jsonc
       // `durable_objects`). Declared optional here (matching the BLOBS

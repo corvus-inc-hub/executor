@@ -9,6 +9,7 @@ import type { PluginBlobStore } from "./blob";
 import type {
   Connection,
   ConnectionRef,
+  ConnectionRemovalReceipt,
   CreateConnectionInput,
   UpdateConnectionInput,
 } from "./connection";
@@ -224,7 +225,7 @@ export interface PluginCtx<TStore = unknown> {
     ) => Effect.Effect<Connection, ConnectionNotFoundError | StorageFailure>;
     readonly remove: (
       ref: ConnectionRef,
-    ) => Effect.Effect<void, ConnectionNotFoundError | StorageFailure>;
+    ) => Effect.Effect<ConnectionRemovalReceipt, ConnectionNotFoundError | StorageFailure>;
     readonly refresh: (
       ref: ConnectionRef,
     ) => Effect.Effect<

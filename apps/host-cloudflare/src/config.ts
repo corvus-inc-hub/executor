@@ -1,7 +1,11 @@
 import type { D1Database, DurableObjectNamespace, R2Bucket } from "@cloudflare/workers-types";
 
 import { isValidOrgSlug } from "@executor-js/api";
-import { missingPublicOriginWarning, resolvePublicOrigin } from "@executor-js/sdk/public-origin";
+import {
+  missingPublicOriginWarning,
+  parseExactOrigins,
+  resolvePublicOrigin,
+} from "@executor-js/sdk/public-origin";
 
 let warnedNoCloudflareOrigin = false;
 
@@ -45,6 +49,7 @@ export interface CloudflareEnv {
   readonly EXECUTOR_SECRET_KEY?: string;
   readonly ALLOW_LOCAL_NETWORK?: string;
   readonly VITE_PUBLIC_SITE_URL?: string;
+  readonly EXECUTOR_CONNECTION_RETURN_ORIGINS?: string;
   /**
    * Dev/single-user escape hatch: when "true", skip Cloudflare Access entirely
    * and treat every request as a fixed admin. For local `wrangler dev` and
@@ -69,6 +74,7 @@ export interface CloudflareConfig {
   /** Explicit web base URL (`VITE_PUBLIC_SITE_URL`). Unset on a Worker with no
    *  static URL — the per-request origin is used instead (see RequestWebOrigin). */
   readonly webBaseUrl?: string;
+  readonly connectionReturnOrigins: readonly string[];
   readonly enableDevAuth: boolean;
 }
 
@@ -130,6 +136,10 @@ export const loadConfig = (env: CloudflareEnv): CloudflareConfig => {
     // spoofable via Host). Warn once on a real deployment so the operator pins it,
     // mirroring self-host (gated on enableDevAuth = local `wrangler dev`).
     webBaseUrl,
+    connectionReturnOrigins: parseExactOrigins(
+      env.EXECUTOR_CONNECTION_RETURN_ORIGINS,
+      "EXECUTOR_CONNECTION_RETURN_ORIGINS",
+    ),
     enableDevAuth,
   };
 };

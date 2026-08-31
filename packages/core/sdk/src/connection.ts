@@ -70,6 +70,19 @@ export interface ConnectionRef {
   readonly integration: IntegrationSlug;
 }
 
+/** Durable proof that a connection was removed and an immediate authoritative
+ * readback observed its absence. Credential values are never part of this
+ * receipt; `removed` is the SDK's safe connection metadata projection. */
+export interface ConnectionRemovalReceipt {
+  readonly schema: "executor.connection-removal.receipt.v1";
+  readonly receiptId: string;
+  readonly tenant: string;
+  readonly actorSubject: string | null;
+  readonly removedAt: number;
+  readonly removed: Connection;
+  readonly readback: { readonly connection: null };
+}
+
 /** Where a single credential input comes from. `value` is pasted raw and written
  *  to the default provider; `from` references an external provider (1Password,
  *  keychain) by opaque id — we store the routing and resolve on demand, never

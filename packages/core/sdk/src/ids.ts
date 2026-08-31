@@ -22,6 +22,10 @@ export const NO_AUTH_TEMPLATE = AuthTemplateSlug.make("none");
 export const ConnectionName = Schema.String.pipe(Schema.brand("ConnectionName"));
 export type ConnectionName = typeof ConnectionName.Type;
 
+/** Opaque correlation id for one browser-mediated connection handoff. */
+export const ConnectionHandoffId = Schema.String.pipe(Schema.brand("ConnectionHandoffId"));
+export type ConnectionHandoffId = typeof ConnectionHandoffId.Type;
+
 /** A registered OAuth app's slug. */
 export const OAuthClientSlug = Schema.String.pipe(Schema.brand("OAuthClientSlug"));
 export type OAuthClientSlug = typeof OAuthClientSlug.Type;

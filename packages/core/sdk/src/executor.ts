@@ -1,4 +1,4 @@
-import { Effect, Inspectable, Layer, Option, Predicate, Schema } from "effect";
+import { Clock, Effect, Inspectable, Layer, Option, Predicate, Schema } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 import { fumadb } from "@executor-js/fumadb";
 import { memoryAdapter } from "@executor-js/fumadb/adapters/memory";
@@ -20,11 +20,19 @@ import type {
   Connection,
   ConnectionInputOrigin,
   ConnectionRef,
+  ConnectionRemovalReceipt,
   CreateConnectionInput,
   ConnectionValueInput,
   UpdateConnectionInput,
   ValidateConnectionInput,
 } from "./connection";
+import {
+  ConnectionHandoff,
+  type CompletedConnectionHandoff,
+  type CreateConnectionHandoffInput,
+  type ExpiredConnectionHandoff,
+  type PendingConnectionHandoff,
+} from "./connection-handoff";
 import { HealthCheckResult, HealthCheckSpec } from "./health-check";
 import type { HealthCheckCandidate } from "./health-check";
 import {
@@ -52,6 +60,12 @@ import {
 export type { OnElicitation, InvokeOptions } from "./elicitation";
 import {
   ConnectionNotFoundError,
+  ConnectionHandoffExpiredError,
+  ConnectionHandoffInvalidReturnTargetError,
+  ConnectionHandoffMemberMismatchError,
+  ConnectionHandoffNotFoundError,
+  ConnectionHandoffTargetMismatchError,
+  ConnectionHandoffUnavailableError,
   CredentialProviderNotRegisteredError,
   CredentialResolutionError,
   IntegrationNotFoundError,
@@ -67,6 +81,7 @@ import {
 import {
   AuthTemplateSlug,
   ConnectionAddress,
+  ConnectionHandoffId,
   ConnectionName,
   IntegrationSlug,
   NO_AUTH_TEMPLATE,
@@ -87,6 +102,8 @@ import type {
   IntegrationDisplayDescriptor,
   RegisterIntegrationInput,
 } from "./integration";
+
+const decodeConnectionHandoff = Schema.decodeUnknownOption(ConnectionHandoff);
 import {
   makeOAuthService,
   type MintOAuthConnectionInput,
@@ -314,7 +331,7 @@ export type Executor<TPlugins extends readonly AnyPlugin[] = readonly []> = {
     ) => Effect.Effect<Connection, ConnectionNotFoundError | StorageFailure>;
     readonly remove: (
       ref: ConnectionRef,
-    ) => Effect.Effect<void, ConnectionNotFoundError | StorageFailure>;
+    ) => Effect.Effect<ConnectionRemovalReceipt, ConnectionNotFoundError | StorageFailure>;
     readonly refresh: (
       ref: ConnectionRef,
     ) => Effect.Effect<
@@ -352,6 +369,42 @@ export type Executor<TPlugins extends readonly AnyPlugin[] = readonly []> = {
     readonly resolveValues: (
       ref: ConnectionRef,
     ) => Effect.Effect<Record<string, string | null>, StorageFailure>;
+  };
+
+  /** Browser-mediated connection sessions. The service creates an opaque,
+   * member-bound handoff; only that exact member may observe and settle it by
+   * creating the named user connection in Executor's private account UI. */
+  readonly connectionHandoffs: {
+    readonly create: (
+      input: CreateConnectionHandoffInput,
+    ) => Effect.Effect<
+      PendingConnectionHandoff,
+      | IntegrationNotFoundError
+      | ConnectionHandoffInvalidReturnTargetError
+      | ConnectionHandoffUnavailableError
+      | StorageFailure
+    >;
+    readonly read: (
+      handoffId: ConnectionHandoffId,
+    ) => Effect.Effect<ConnectionHandoff, ConnectionHandoffNotFoundError | StorageFailure>;
+    readonly observe: (
+      handoffId: ConnectionHandoffId,
+    ) => Effect.Effect<
+      ConnectionHandoff,
+      ConnectionHandoffNotFoundError | ConnectionHandoffMemberMismatchError | StorageFailure
+    >;
+    readonly complete: (
+      handoffId: ConnectionHandoffId,
+      ref: ConnectionRef,
+    ) => Effect.Effect<
+      CompletedConnectionHandoff,
+      | ConnectionHandoffNotFoundError
+      | ConnectionHandoffMemberMismatchError
+      | ConnectionHandoffTargetMismatchError
+      | ConnectionHandoffExpiredError
+      | ConnectionNotFoundError
+      | StorageFailure
+    >;
   };
 
   /** Shared OAuth service. Hosts use this through the core HTTP OAuth group;
@@ -445,6 +498,10 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
     readonly webBaseUrl?: string;
     readonly orgSlug?: string;
     readonly includeProviders?: boolean;
+    /** Exact origins to which a completed connection handoff may return. */
+    readonly connectionReturnOrigins?: readonly string[];
+    /** Session lifetime; defaults to 15 minutes. */
+    readonly connectionHandoffTtlMs?: number;
   };
   /**
    * How long a connection's persisted tool catalog stays fresh when its plugin
@@ -1386,6 +1443,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const core = makeCoreDb(fuma);
     const blobs = config.blobs ?? makeFumaBlobStore(fuma);
     const transaction = <A, E>(effect: Effect.Effect<A, E>) => fuma.transaction(effect);
+    const connectionHandoffPluginId = "executor.connection-handoffs";
+    const connectionHandoffStorage = makePluginStorageFacade({
+      core,
+      pluginId: connectionHandoffPluginId,
+      owner: ownerBinding,
+    });
 
     // Populated once, never mutated after startup.
     const staticTools = new Map<string, StaticTools>();
@@ -2661,7 +2724,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
     const connectionsRemove = (
       ref: ConnectionRef,
-    ): Effect.Effect<void, ConnectionNotFoundError | StorageFailure> =>
+    ): Effect.Effect<ConnectionRemovalReceipt, ConnectionNotFoundError | StorageFailure> =>
       transaction(
         Effect.gen(function* () {
           const row = yield* findConnectionRow(ref);
@@ -2672,6 +2735,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               name: ref.name,
             });
           }
+          const removed = rowToConnection(row);
           const integrationRow = yield* findIntegrationRow(ref.integration);
           const runtime = integrationRow ? runtimes.get(integrationRow.plugin_id) : undefined;
           if (integrationRow && runtime?.plugin.removeConnection) {
@@ -2702,6 +2766,303 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 b("integration", "=", String(ref.integration)),
                 b("name", "=", String(ref.name)),
               ),
+          });
+          const readback = yield* findConnectionRow(ref);
+          if (readback) {
+            return yield* new StorageError({
+              message: `Connection removal readback still found: ${ref.integration}.${ref.owner}.${ref.name}`,
+              cause: undefined,
+            });
+          }
+          return {
+            schema: "executor.connection-removal.receipt.v1",
+            receiptId: `removal_${crypto.randomUUID()}`,
+            tenant,
+            actorSubject: subject,
+            removedAt: Date.now(),
+            removed,
+            readback: { connection: null },
+          } satisfies ConnectionRemovalReceipt;
+        }),
+      );
+
+    type TerminalConnectionHandoff = CompletedConnectionHandoff | ExpiredConnectionHandoff;
+
+    const connectionHandoffSessionCollection = "sessions";
+    const connectionHandoffTerminalCollection = "terminals";
+    const handoffTtlMs = config.coreTools?.connectionHandoffTtlMs ?? 15 * 60 * 1_000;
+
+    const decodeStoredConnectionHandoff = (
+      handoffId: ConnectionHandoffId,
+      data: unknown,
+    ): Effect.Effect<ConnectionHandoff, StorageFailure> => {
+      const decoded = decodeConnectionHandoff(data);
+      if (Option.isSome(decoded)) return Effect.succeed(decoded.value);
+      return Effect.fail(
+        new StorageError({
+          message: `Connection handoff storage is malformed: ${handoffId}`,
+          cause: undefined,
+        }),
+      );
+    };
+
+    const loadConnectionHandoffTerminal = (
+      handoffId: ConnectionHandoffId,
+    ): Effect.Effect<TerminalConnectionHandoff | null, StorageFailure> =>
+      Effect.gen(function* () {
+        const stored = yield* connectionHandoffStorage.getForOwner<unknown>({
+          owner: "org",
+          collection: connectionHandoffTerminalCollection,
+          key: String(handoffId),
+        });
+        if (!stored) return null;
+        const handoff = yield* decodeStoredConnectionHandoff(handoffId, stored.data);
+        if (handoff.status === "pending") {
+          return yield* new StorageError({
+            message: `Connection handoff terminal storage contains a pending session: ${handoffId}`,
+            cause: undefined,
+          });
+        }
+        return handoff;
+      });
+
+    const loadConnectionHandoff = (
+      handoffId: ConnectionHandoffId,
+    ): Effect.Effect<ConnectionHandoff, ConnectionHandoffNotFoundError | StorageFailure> =>
+      Effect.gen(function* () {
+        const terminal = yield* loadConnectionHandoffTerminal(handoffId);
+        if (terminal) return terminal;
+        const stored = yield* connectionHandoffStorage.getForOwner<unknown>({
+          owner: "org",
+          collection: connectionHandoffSessionCollection,
+          key: String(handoffId),
+        });
+        if (!stored) return yield* new ConnectionHandoffNotFoundError({ handoffId });
+        return yield* decodeStoredConnectionHandoff(handoffId, stored.data);
+      });
+
+    const persistPendingConnectionHandoff = (handoff: PendingConnectionHandoff) =>
+      connectionHandoffStorage
+        .put({
+          owner: "org",
+          collection: connectionHandoffSessionCollection,
+          key: String(handoff.handoffId),
+          data: handoff,
+        })
+        .pipe(Effect.as(handoff));
+
+    const persistConnectionHandoffTerminal = (handoff: TerminalConnectionHandoff) => {
+      const now = new Date();
+      return core
+        .create("plugin_storage", {
+          tenant,
+          owner: "org",
+          subject: ORG_SUBJECT,
+          plugin_id: connectionHandoffPluginId,
+          collection: connectionHandoffTerminalCollection,
+          key: String(handoff.handoffId),
+          data: handoff,
+          created_at: now,
+          updated_at: now,
+        })
+        .pipe(
+          Effect.as(handoff),
+          Effect.catchTag("UniqueViolationError", () =>
+            loadConnectionHandoffTerminal(handoff.handoffId).pipe(
+              Effect.flatMap((persisted) =>
+                persisted
+                  ? Effect.succeed(persisted)
+                  : Effect.fail(
+                      new StorageError({
+                        message: `Connection handoff terminal write lost without a persisted winner: ${handoff.handoffId}`,
+                        cause: undefined,
+                      }),
+                    ),
+              ),
+            ),
+          ),
+        );
+    };
+
+    const expireConnectionHandoff = (
+      handoff: PendingConnectionHandoff,
+    ): Effect.Effect<ConnectionHandoff, StorageFailure> =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        if (now < handoff.expiresAt) return handoff;
+        return yield* persistConnectionHandoffTerminal({
+          ...handoff,
+          status: "expired",
+          receipt: {
+            schema: "executor.connection-handoff.expiry.v1",
+            receiptId: `expiry_${String(handoff.handoffId).slice("handoff_".length)}`,
+            handoffId: handoff.handoffId,
+            tenant,
+            memberId: handoff.memberId,
+            expiredAt: handoff.expiresAt,
+            code: "CONNECTION_HANDOFF_EXPIRED",
+          },
+        });
+      });
+
+    const connectionHandoffsRead = (
+      handoffId: ConnectionHandoffId,
+    ): Effect.Effect<ConnectionHandoff, ConnectionHandoffNotFoundError | StorageFailure> =>
+      loadConnectionHandoff(handoffId).pipe(
+        Effect.flatMap((handoff) =>
+          handoff.status === "pending" ? expireConnectionHandoff(handoff) : Effect.succeed(handoff),
+        ),
+      );
+
+    const connectionHandoffsCreate = (
+      input: CreateConnectionHandoffInput,
+    ): Effect.Effect<
+      PendingConnectionHandoff,
+      | IntegrationNotFoundError
+      | ConnectionHandoffInvalidReturnTargetError
+      | ConnectionHandoffUnavailableError
+      | StorageFailure
+    > =>
+      Effect.gen(function* () {
+        const webBaseUrl = config.coreTools?.webBaseUrl;
+        if (!webBaseUrl || !URL.canParse(webBaseUrl)) {
+          return yield* new ConnectionHandoffUnavailableError({
+            message: "Connection handoffs require an absolute Executor web base URL.",
+          });
+        }
+        if (!URL.canParse(input.returnTo)) {
+          return yield* new ConnectionHandoffInvalidReturnTargetError({
+            returnTo: input.returnTo,
+          });
+        }
+        const returnTarget = new URL(input.returnTo);
+        const allowedOrigins = new Set(
+          (config.coreTools?.connectionReturnOrigins ?? [])
+            .filter((origin) => URL.canParse(origin))
+            .map((origin) => new URL(origin).origin),
+        );
+        if (!allowedOrigins.has(returnTarget.origin)) {
+          return yield* new ConnectionHandoffInvalidReturnTargetError({
+            returnTo: input.returnTo,
+          });
+        }
+        const integration = yield* findIntegrationRow(input.integration);
+        if (!integration) return yield* new IntegrationNotFoundError({ slug: input.integration });
+        const label = input.label.trim();
+        if (label.length === 0 || input.memberId.trim().length === 0) {
+          return yield* new ConnectionHandoffUnavailableError({
+            message: "Connection handoffs require a non-empty member and connection label.",
+          });
+        }
+        const handoffId = ConnectionHandoffId.make(`handoff_${crypto.randomUUID()}`);
+        const path = [config.coreTools?.orgSlug, "connect", encodeURIComponent(handoffId)]
+          .filter((part): part is string => part !== undefined && part.length > 0)
+          .join("/");
+        const now = yield* Clock.currentTimeMillis;
+        const handoff: PendingConnectionHandoff = {
+          status: "pending",
+          handoffId,
+          memberId: input.memberId,
+          integration: input.integration,
+          owner: "user",
+          connectionName: connectionIdentifier(label),
+          ...(input.template !== undefined ? { template: input.template } : {}),
+          label,
+          returnTo: returnTarget.toString(),
+          url: new URL(`/${path}`, webBaseUrl).toString(),
+          createdAt: now,
+          expiresAt: now + handoffTtlMs,
+        };
+        return yield* persistPendingConnectionHandoff(handoff);
+      });
+
+    const connectionHandoffsObserve = (
+      handoffId: ConnectionHandoffId,
+    ): Effect.Effect<
+      ConnectionHandoff,
+      ConnectionHandoffNotFoundError | ConnectionHandoffMemberMismatchError | StorageFailure
+    > =>
+      Effect.gen(function* () {
+        const handoff = yield* loadConnectionHandoff(handoffId);
+        if (subject === null || subject !== handoff.memberId) {
+          return yield* new ConnectionHandoffMemberMismatchError({ handoffId });
+        }
+        if (handoff.status !== "pending") return handoff;
+        return yield* expireConnectionHandoff(handoff);
+      });
+
+    const connectionHandoffsComplete = (
+      handoffId: ConnectionHandoffId,
+      ref: ConnectionRef,
+    ): Effect.Effect<
+      CompletedConnectionHandoff,
+      | ConnectionHandoffNotFoundError
+      | ConnectionHandoffMemberMismatchError
+      | ConnectionHandoffTargetMismatchError
+      | ConnectionHandoffExpiredError
+      | ConnectionNotFoundError
+      | StorageFailure
+    > =>
+      Clock.clockWith((clock) =>
+        Effect.gen(function* () {
+          const handoff = yield* loadConnectionHandoff(handoffId);
+          if (subject === null || subject !== handoff.memberId) {
+            return yield* new ConnectionHandoffMemberMismatchError({ handoffId });
+          }
+          if (
+            ref.owner !== "user" ||
+            ref.integration !== handoff.integration ||
+            ref.name !== handoff.connectionName
+          ) {
+            return yield* new ConnectionHandoffTargetMismatchError({ handoffId });
+          }
+          if (handoff.status === "completed") return handoff;
+          if (handoff.status === "expired") {
+            return yield* new ConnectionHandoffExpiredError({
+              handoffId,
+              expiresAt: handoff.expiresAt,
+            });
+          }
+          const unexpired = yield* expireConnectionHandoff(handoff);
+          if (unexpired.status === "completed") return unexpired;
+          if (unexpired.status === "expired") {
+            return yield* new ConnectionHandoffExpiredError({
+              handoffId,
+              expiresAt: unexpired.expiresAt,
+            });
+          }
+          const connectionRow = yield* findConnectionRow(ref);
+          if (!connectionRow) {
+            return yield* new ConnectionNotFoundError({
+              owner: ref.owner,
+              integration: ref.integration,
+              name: ref.name,
+            });
+          }
+          const connection = rowToConnection(connectionRow);
+          const completedAt = Math.max(unexpired.createdAt, yield* clock.currentTimeMillis);
+          const terminal = yield* persistConnectionHandoffTerminal({
+            ...unexpired,
+            status: "completed",
+            receipt: {
+              schema: "executor.connection-handoff.receipt.v1",
+              receiptId: `handoff_receipt_${String(handoffId).slice("handoff_".length)}`,
+              handoffId,
+              tenant,
+              memberId: unexpired.memberId,
+              completedAt,
+              connection: {
+                owner: "user",
+                integration: connection.integration,
+                name: connection.name,
+              },
+              readback: { connectionPresent: true },
+            },
+          });
+          if (terminal.status === "completed") return terminal;
+          return yield* new ConnectionHandoffExpiredError({
+            handoffId,
+            expiresAt: terminal.expiresAt,
           });
         }),
       );
@@ -4112,6 +4473,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         checkHealth: connectionCheckHealth,
         validate: connectionValidate,
         resolveValues: resolveConnectionValuesByRef,
+      },
+      connectionHandoffs: {
+        create: connectionHandoffsCreate,
+        read: connectionHandoffsRead,
+        observe: connectionHandoffsObserve,
+        complete: connectionHandoffsComplete,
       },
       oauth,
       tools: {

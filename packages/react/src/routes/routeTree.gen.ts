@@ -17,6 +17,7 @@ import { Route as DotPoliciesRouteImport } from './policies'
 import { Route as DotToolkitsDottoolkitSlugRouteImport } from './toolkits.$toolkitSlug'
 import { Route as DotResumeDotexecutionIdRouteImport } from './resume.$executionId'
 import { Route as DotIntegrationsDotnamespaceRouteImport } from './integrations.$namespace'
+import { Route as DotConnectDothandoffIdRouteImport } from './connect.$handoffId'
 import { Route as DotPluginsDotpluginIdDotsplatRouteImport } from './plugins.$pluginId.$'
 import { Route as DotIntegrationsDotaddDotpluginKeyRouteImport } from './integrations.add.$pluginKey'
 
@@ -62,6 +63,11 @@ const DotIntegrationsDotnamespaceRoute =
     path: '/{-$orgSlug}/integrations/$namespace',
     getParentRoute: () => rootRouteImport,
   } as any)
+const DotConnectDothandoffIdRoute = DotConnectDothandoffIdRouteImport.update({
+  id: '/{-$orgSlug}/connect/$handoffId',
+  path: '/{-$orgSlug}/connect/$handoffId',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const DotPluginsDotpluginIdDotsplatRoute =
   DotPluginsDotpluginIdDotsplatRouteImport.update({
     id: '/{-$orgSlug}/plugins/$pluginId/$',
@@ -81,6 +87,7 @@ export interface FileRoutesByFullPath {
   '/{-$orgSlug}/toolkits': typeof DotToolkitsRouteWithChildren
   '/{-$orgSlug}/tools': typeof DotToolsRoute
   '/{-$orgSlug}/': typeof DotIndexRoute
+  '/{-$orgSlug}/connect/$handoffId': typeof DotConnectDothandoffIdRoute
   '/{-$orgSlug}/integrations/$namespace': typeof DotIntegrationsDotnamespaceRoute
   '/{-$orgSlug}/resume/$executionId': typeof DotResumeDotexecutionIdRoute
   '/{-$orgSlug}/toolkits/$toolkitSlug': typeof DotToolkitsDottoolkitSlugRoute
@@ -93,6 +100,7 @@ export interface FileRoutesByTo {
   '/{-$orgSlug}/toolkits': typeof DotToolkitsRouteWithChildren
   '/{-$orgSlug}/tools': typeof DotToolsRoute
   '/{-$orgSlug}': typeof DotIndexRoute
+  '/{-$orgSlug}/connect/$handoffId': typeof DotConnectDothandoffIdRoute
   '/{-$orgSlug}/integrations/$namespace': typeof DotIntegrationsDotnamespaceRoute
   '/{-$orgSlug}/resume/$executionId': typeof DotResumeDotexecutionIdRoute
   '/{-$orgSlug}/toolkits/$toolkitSlug': typeof DotToolkitsDottoolkitSlugRoute
@@ -106,6 +114,7 @@ export interface FileRoutesById {
   '/{-$orgSlug}/toolkits': typeof DotToolkitsRouteWithChildren
   '/{-$orgSlug}/tools': typeof DotToolsRoute
   '/{-$orgSlug}/': typeof DotIndexRoute
+  '/{-$orgSlug}/connect/$handoffId': typeof DotConnectDothandoffIdRoute
   '/{-$orgSlug}/integrations/$namespace': typeof DotIntegrationsDotnamespaceRoute
   '/{-$orgSlug}/resume/$executionId': typeof DotResumeDotexecutionIdRoute
   '/{-$orgSlug}/toolkits/$toolkitSlug': typeof DotToolkitsDottoolkitSlugRoute
@@ -120,6 +129,7 @@ export interface FileRouteTypes {
     | '/{-$orgSlug}/toolkits'
     | '/{-$orgSlug}/tools'
     | '/{-$orgSlug}/'
+    | '/{-$orgSlug}/connect/$handoffId'
     | '/{-$orgSlug}/integrations/$namespace'
     | '/{-$orgSlug}/resume/$executionId'
     | '/{-$orgSlug}/toolkits/$toolkitSlug'
@@ -132,6 +142,7 @@ export interface FileRouteTypes {
     | '/{-$orgSlug}/toolkits'
     | '/{-$orgSlug}/tools'
     | '/{-$orgSlug}'
+    | '/{-$orgSlug}/connect/$handoffId'
     | '/{-$orgSlug}/integrations/$namespace'
     | '/{-$orgSlug}/resume/$executionId'
     | '/{-$orgSlug}/toolkits/$toolkitSlug'
@@ -144,6 +155,7 @@ export interface FileRouteTypes {
     | '/{-$orgSlug}/toolkits'
     | '/{-$orgSlug}/tools'
     | '/{-$orgSlug}/'
+    | '/{-$orgSlug}/connect/$handoffId'
     | '/{-$orgSlug}/integrations/$namespace'
     | '/{-$orgSlug}/resume/$executionId'
     | '/{-$orgSlug}/toolkits/$toolkitSlug'
@@ -157,6 +169,7 @@ export interface RootRouteChildren {
   DotToolkitsRoute: typeof DotToolkitsRouteWithChildren
   DotToolsRoute: typeof DotToolsRoute
   DotIndexRoute: typeof DotIndexRoute
+  DotConnectDothandoffIdRoute: typeof DotConnectDothandoffIdRoute
   DotIntegrationsDotnamespaceRoute: typeof DotIntegrationsDotnamespaceRoute
   DotResumeDotexecutionIdRoute: typeof DotResumeDotexecutionIdRoute
   DotIntegrationsDotaddDotpluginKeyRoute: typeof DotIntegrationsDotaddDotpluginKeyRoute
@@ -221,6 +234,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DotIntegrationsDotnamespaceRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/{-$orgSlug}/connect/$handoffId': {
+      id: '/{-$orgSlug}/connect/$handoffId'
+      path: '/{-$orgSlug}/connect/$handoffId'
+      fullPath: '/{-$orgSlug}/connect/$handoffId'
+      preLoaderRoute: typeof DotConnectDothandoffIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/{-$orgSlug}/plugins/$pluginId/$': {
       id: '/{-$orgSlug}/plugins/$pluginId/$'
       path: '/{-$orgSlug}/plugins/$pluginId/$'
@@ -256,6 +276,7 @@ const rootRouteChildren: RootRouteChildren = {
   DotToolkitsRoute: DotToolkitsRouteWithChildren,
   DotToolsRoute: DotToolsRoute,
   DotIndexRoute: DotIndexRoute,
+  DotConnectDothandoffIdRoute: DotConnectDothandoffIdRoute,
   DotIntegrationsDotnamespaceRoute: DotIntegrationsDotnamespaceRoute,
   DotResumeDotexecutionIdRoute: DotResumeDotexecutionIdRoute,
   DotIntegrationsDotaddDotpluginKeyRoute:

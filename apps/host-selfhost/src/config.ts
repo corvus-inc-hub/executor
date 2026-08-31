@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import {
   missingPublicOriginWarning,
+  parseExactOrigins,
   resolvePublicOrigin,
   shouldWarnMissingPublicOrigin,
 } from "@executor-js/sdk/public-origin";
@@ -17,6 +18,7 @@ export interface SelfHostConfig {
   readonly dbPath: string;
   readonly webBaseUrl: string;
   readonly allowLocalNetwork: boolean;
+  readonly connectionReturnOrigins: readonly string[];
 }
 
 export interface WorkOSConfig {
@@ -90,6 +92,9 @@ export const loadConfig = (): SelfHostConfig => {
     dbPath: process.env.EXECUTOR_DB_PATH ?? join(dataDir, "data.db"),
     webBaseUrl: resolveWebBaseUrl(port),
     allowLocalNetwork: process.env.EXECUTOR_ALLOW_LOCAL_NETWORK === "true",
+    connectionReturnOrigins: parseConnectionReturnOrigins(
+      process.env.EXECUTOR_CONNECTION_RETURN_ORIGINS,
+    ),
   };
 };
 
@@ -129,6 +134,9 @@ const normalizedOrigin = (name: string, value: string): string => {
   }
   return parsed.origin;
 };
+
+export const parseConnectionReturnOrigins = (value: string | undefined): readonly string[] =>
+  parseExactOrigins(value, "EXECUTOR_CONNECTION_RETURN_ORIGINS");
 
 export const loadWorkOSConfig = (selfHost = loadConfig()): WorkOSConfig => {
   const provider = process.env.EXECUTOR_AUTH_PROVIDER?.trim();
