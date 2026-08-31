@@ -179,14 +179,28 @@ const runScenario = (input: {
             .getByRole("dialog")
             .getByRole("textbox", { name: "Authorization" });
           await credential.waitFor({ timeout: 15_000 });
+          expect(
+            await credential.getAttribute("type"),
+            "recorded browser evidence keeps the provider credential masked",
+          ).toBe("password");
           await credential.fill(apiKey);
         });
         await step("Complete the handoff", async () => {
           await page.getByRole("button", { name: "Continue" }).click();
-          await page
+          await page.waitForFunction(() =>
+            document
+              .getAnimations()
+              .filter((animation) => animation.effect?.getTiming().iterations !== Infinity)
+              .every((animation) => animation.playState === "finished"),
+          );
+          const addConnection = page
             .getByRole("dialog")
-            .getByRole("button", { name: "Add connection", exact: true })
-            .click();
+            .getByRole("button", { name: "Add connection", exact: true });
+          expect(
+            await addConnection.isEnabled(),
+            "the completed credential step retains submit authority after motion settles",
+          ).toBe(true);
+          await addConnection.click();
           await page
             .getByRole("heading", { name: /Add connection/ })
             .waitFor({ state: "hidden", timeout: 20_000 });

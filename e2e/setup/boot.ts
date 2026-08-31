@@ -88,7 +88,10 @@ export const waitForHttp = async (
   let lastError: unknown;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(url, { redirect: "manual" });
+      const response = await fetch(url, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(Math.min(2_000, Math.max(1, deadline - Date.now()))),
+      });
       // During a cold vite compile /api/* falls back to the SPA's 200 HTML —
       // expectRedirect waits for the real handler (302) instead.
       if (options.expectRedirect ? response.status === 302 : response.status < 500) return;
