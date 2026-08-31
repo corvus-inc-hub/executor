@@ -155,7 +155,11 @@ describe("makeExecutorApiClient", () => {
       };
 
       expect(manifest.private).not.toBe(true);
-      expect(manifest.dependencies).not.toHaveProperty("@executor-js/host-mcp");
+      // The source package still owns server entrypoints used by the self-host
+      // image, so their runtime edge must remain installable in the workspace.
+      // The packed public manifest is narrowed to the client surface by the
+      // repository packer and is verified by scripts/smoke-test-packed.ts.
+      expect(manifest.dependencies).toHaveProperty("@executor-js/host-mcp", "workspace:*");
       expect(manifest.files).toContain("dist");
       expect(manifest.scripts?.build).toBeDefined();
       expect(manifest.publishConfig).toMatchObject({

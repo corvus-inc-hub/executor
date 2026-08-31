@@ -54,6 +54,7 @@ type PackageJson = {
   name: string;
   version: string;
   catalog?: Record<string, string>;
+  dependencies?: Record<string, string>;
   exports?: Record<string, unknown>;
   peerDependencies?: Record<string, string>;
 };
@@ -165,6 +166,17 @@ const smokeTestPackage = async (
     // Read the installed manifest — that's the real published view
     // (publishConfig.exports applied, workspace specifiers resolved).
     const installedPkg = await readPackageJson(join(tmp, "node_modules", ...pkg.name.split("/")));
+    if (
+      pkg.name === "@executor-js/api" &&
+      installedPkg.dependencies?.["@executor-js/host-mcp"] !== undefined
+    ) {
+      failures.push({
+        pkg: pkg.name,
+        subpath: "<install>",
+        reason: "published client manifest retains private @executor-js/host-mcp",
+      });
+      return;
+    }
     const subpaths = subpathsToTest(installedPkg);
     if (subpaths.length === 0) {
       failures.push({
