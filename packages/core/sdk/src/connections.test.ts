@@ -314,11 +314,23 @@ describe("connections.remove", () => {
         template: TEMPLATE,
         value: "v",
       });
-      yield* executor.connections.remove({
+      const receipt = yield* executor.connections.remove({
         owner: "org",
         integration: INTEG,
         name: ConnectionName.make("main"),
       });
+      expect(receipt).toMatchObject({
+        schema: "executor.connection-removal.receipt.v1",
+        tenant: "test-tenant",
+        actorSubject: "test-subject",
+        removed: {
+          owner: "org",
+          integration: INTEG,
+          name: "main",
+        },
+        readback: { connection: null },
+      });
+      expect(receipt.receiptId).toMatch(/^removal_[a-zA-Z0-9_-]+$/);
       const connections = yield* executor.connections.list();
       expect(connections).toEqual([]);
       const tools = yield* executor.tools.list();

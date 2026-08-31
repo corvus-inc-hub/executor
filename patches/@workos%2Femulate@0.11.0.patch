@@ -1,0 +1,16 @@
+diff --git a/dist/workos/routes/connect.js b/dist/workos/routes/connect.js
+index 61a566a..ed7f039 100644
+--- a/dist/workos/routes/connect.js
++++ b/dist/workos/routes/connect.js
+@@ -54,8 +54,9 @@ export function connectRoutes(ctx) {
+         return c.json(formatConnectApplication(application), 201);
+     });
+     // Get application
+-    app.get('/connect/applications/:id', (c) => {
+-        const application = ws.connectApplications.get(c.req.param('id'));
++    app.get('/connect/applications/:ref', (c) => {
++        const ref = c.req.param('ref');
++        const application = ws.connectApplications.get(ref) ?? ws.connectApplications.findOneBy('client_id', ref);
+         if (!application)
+             throw notFound('ConnectApplication');
+         return c.json(formatConnectApplication(application));

@@ -4,6 +4,7 @@ export const isConnectionIdentifier = (value: string): boolean =>
   /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value);
 
 export const connectionIdentifier = (input: string, fallback = "connection"): ConnectionName => {
+  if (isConnectionIdentifier(input)) return ConnectionName.make(input);
   const words = input.toLowerCase().match(/[a-z0-9]+/g);
   const base =
     words

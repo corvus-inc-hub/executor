@@ -4,8 +4,8 @@
 # display, then drop the film into the scenario's run dir as session.mp4.
 set -euo pipefail
 
-SCENARIO="${DESK_SCENARIO:-scenarios/connect-handoff-session.test.ts}"
-PROJECT="${DESK_PROJECT:-cloud}"
+SCENARIO="${DESK_SCENARIO:-scenarios/connect-handoff.test.ts}"
+PROJECT="${DESK_PROJECT:-selfhost-workos}"
 SIZE="${DESK_SIZE:-1440x900}"
 
 echo "[desk] installing dependencies (cached in a volume after first run)…"

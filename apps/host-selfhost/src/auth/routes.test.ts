@@ -12,6 +12,7 @@ const selfHost: SelfHostConfig = {
   dbPath: ":memory:",
   webBaseUrl: "https://executor.example.com",
   allowLocalNetwork: false,
+  connectionReturnOrigins: [],
 };
 
 const config: WorkOSConfig = {

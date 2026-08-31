@@ -42,6 +42,7 @@ const IDENTITY_UNAVAILABLE = {
   code: "identity_unavailable",
   message: "Identity validation is temporarily unavailable",
 };
+const CONNECTION_HANDOFF_SERVICE_SCOPE = "connections:handoff";
 
 export interface WorkOSIdentityDeps extends OrganizationAuthDeps {
   readonly apiKeys: ApiKeyService;
@@ -89,7 +90,12 @@ const userPrincipal = (deps: WorkOSIdentityDeps, accountId: string, organization
     } satisfies Principal;
   });
 
-const servicePrincipal = (deps: WorkOSIdentityDeps, clientId: string, organizationId: string) =>
+const servicePrincipal = (
+  deps: WorkOSIdentityDeps,
+  clientId: string,
+  organizationId: string,
+  scopes: readonly string[],
+) =>
   Effect.gen(function* () {
     const authorized = yield* authorizeServiceOrganization(deps, clientId, organizationId).pipe(
       Effect.mapError(authorizationFailure),
@@ -105,8 +111,21 @@ const servicePrincipal = (deps: WorkOSIdentityDeps, clientId: string, organizati
       name: clientId,
       avatarUrl: null,
       roles: ["service"],
+      scopes,
     } satisfies Principal;
   });
+
+export const authorizeWorkOSServiceRequest = (principal: Principal, request: Request) => {
+  if (principal.kind !== "service") return Effect.succeed(principal);
+  const { pathname } = new URL(request.url);
+  const hasHandoffScope = principal.scopes?.includes(CONNECTION_HANDOFF_SERVICE_SCOPE) === true;
+  const isCreateHandoff = request.method === "POST" && pathname === "/api/connection-handoffs";
+  const isReadHandoff =
+    request.method === "GET" && /^\/api\/connection-handoffs\/[^/]+$/.test(pathname);
+  return hasHandoffScope && (isCreateHandoff || isReadHandoff)
+    ? Effect.succeed(principal)
+    : Effect.fail(new NoOrganization(NO_ORGANIZATION));
+};
 
 export const principalFromVerifiedWorkOSToken = (
   deps: WorkOSIdentityDeps,
@@ -123,7 +142,7 @@ export const principalFromVerifiedWorkOSToken = (
       if (verified.organizationId !== deps.config.serviceOrganizationId) {
         return yield* new NoOrganization(NO_ORGANIZATION);
       }
-      return yield* servicePrincipal(deps, verified.subject, selector);
+      return yield* servicePrincipal(deps, verified.subject, selector, verified.scopes);
     }
     if (selector !== verified.organizationId) return yield* new NoOrganization(NO_ORGANIZATION);
     return yield* userPrincipal(deps, verified.subject, selector);
@@ -136,6 +155,7 @@ const resolveJwtPrincipal = (deps: WorkOSIdentityDeps, token: string, request: R
   }).pipe(
     Effect.mapError(jwtFailure),
     Effect.flatMap((verified) => principalFromVerifiedWorkOSToken(deps, verified, request)),
+    Effect.flatMap((principal) => authorizeWorkOSServiceRequest(principal, request)),
   );
 
 const resolveApiKeyPrincipal = (deps: WorkOSIdentityDeps, token: string, request: Request) =>

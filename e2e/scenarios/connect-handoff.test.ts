@@ -1,23 +1,10 @@
-// The agentic connect handoff: an agent adds an API over MCP, asks for a
-// handoff URL (`coreTools.connections.createHandoff`), and the user opens that
-// URL in a browser to paste the credential. This scenario walks the WHOLE
-// path — the exact flow that failed in production with a "wrong / bad" URL —
-// against a real emulated Resend provider (a per-run emulators.dev instance)
-// so the failure point is captured with trace + screenshots instead of
-// guessed at:
-//
-//   1. MCP `execute` → `openapi.addSpec` registers the emulated Resend API
-//   2. MCP `execute` → `connections.createHandoff` returns the browser URL
-//   3. The URL's origin must be THIS deployment (not a hardcoded host) AND it
-//      must carry the bound org's slug (`/<slug>/integrations/…`), so a user in
-//      several orgs lands in the exact org the agent is scoped to, not whatever
-//      org the browser happened to last canonicalize onto
-//   4. Playwright opens it: the Add connection modal must be open with a
-//      credential field, the emulator-minted API key is pasted and submitted
-//   5. The saved connection is proven live: `execute` sends an email through
-//      the new tools and the emulator's request ledger shows the call
-//      arriving with the pasted bearer token
+// A production-shaped hosted connection handoff. The service creates the
+// member-bound handoff over Executor's HTTP API; the browser user can only
+// observe and complete it. The retired model-callable createHandoff tool is
+// deliberately absent from this journey.
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 
 import { expect } from "@effect/vitest";
 import { Effect } from "effect";
@@ -25,141 +12,94 @@ import { AccountHttpApi } from "@executor-js/api";
 import { composePluginApi } from "@executor-js/api/server";
 import { connectEmulator, type EmulatorClient } from "@executor-js/emulate";
 import { openApiHttpPlugin } from "@executor-js/plugin-openapi/api";
+import { IntegrationSlug, type ConnectionRef } from "@executor-js/sdk/shared";
 
 import { createEmulatorInstance } from "../src/emulator-instance";
 import { scenario } from "../src/scenario";
-import { Api, Browser, Mcp, Target } from "../src/services";
+import { Api, Browser, RunDir, ServiceIdentity, Target } from "../src/services";
 import type { Identity, Target as TargetShape } from "../src/target";
 import type { BrowserSurface } from "../src/surfaces/browser";
-import type { McpSession } from "../src/surfaces/mcp";
+import type { ApiSurface } from "../src/surfaces/api";
 
 const api = composePluginApi([openApiHttpPlugin()] as const);
+const unique = (prefix: string) =>
+  IntegrationSlug.make(`${prefix}_${randomBytes(4).toString("hex")}`);
 
-const unique = (prefix: string) => `${prefix}_${randomBytes(4).toString("hex")}`;
-
-// The emulator serves its own OpenAPI document (bearer auth, same shape as
-// real Resend — and as the Sentry spec that failed in prod). Adding it by URL
-// with no authenticationTemplate exercises exactly the agentic path: the
-// add-account modal must render a paste-a-token flow derived from the spec's
-// bare `http`/`bearer` security scheme.
-const addSpecCode = (slug: string, specUrl: string) => `
-const added = await tools.executor.openapi.addSpec({
-  spec: { kind: "url", url: ${JSON.stringify(specUrl)} },
-  slug: ${JSON.stringify(slug)},
-});
-return added.ok ? { ok: true, slug: added.data.slug, toolCount: added.data.toolCount } : { ok: false, error: added.error };
-`;
-
-const createHandoffCode = (slug: string) => `
-const handoff = await tools.executor.coreTools.connections.createHandoff({
-  integration: ${JSON.stringify(slug)},
-  owner: "org",
-  label: "Resend (emulated)",
-});
-return handoff.ok ? { ok: true, url: handoff.data.url } : { ok: false, error: handoff.error };
-`;
-
-// Selfhost scenarios share one workspace identity — leaked connections fail
-// other scenarios' zero-state assertions, so remove everything this one made.
-const removeConnectionsCode = (slug: string) => `
-const list = await tools.executor.coreTools.connections.list({});
-const mine = (list.ok ? list.data.connections : []).filter((c) => c.integration === ${JSON.stringify(slug)});
-for (const c of mine) {
-  await tools.executor.coreTools.connections.remove({ owner: c.owner, integration: c.integration, name: c.name });
-}
-return { removed: mine.length };
-`;
-
-const sendEmailCode = (slug: string, subject: string) => `
-const found = await tools.search({ namespace: ${JSON.stringify(slug)}, query: "send email", limit: 5 });
-const path = found.items[0]?.path;
-if (!path) return { ok: false, error: "no send tool found", items: found.items };
-let t = tools;
-for (const seg of path.split(".")) t = t[seg];
-const sent = await t({
-  body: {
-    from: "onboarding@example.com",
-    to: "e2e@example.com",
-    subject: ${JSON.stringify(subject)},
-    html: "<p>connect-handoff e2e</p>",
-  },
-});
-return { ok: sent.ok, path, result: sent.ok ? sent.data : sent.error };
-`;
-
-/** Run `execute`, auto-approving any paused executions (approval-gated tools
- *  pause once per gated call) and parse the sandbox's JSON return value. */
-const executeJson = (session: McpSession, code: string) =>
-  Effect.gen(function* () {
-    let result = yield* session.call("execute", { code });
-    let guard = 0;
-    while (result.text.includes("executionId:") && guard < 10) {
-      result = yield* session.approvePaused(result.text);
-      guard += 1;
-    }
-    expect(result.ok, `execute completed (got: ${result.text.slice(0, 400)})`).toBe(true);
-    return JSON.parse(result.text) as Record<string, unknown>;
-  });
-
-// The typed control-plane client — minting and ledger reads with real shapes
-// instead of hand-rolled fetch + casts, against this scenario's own instance.
 const emulator = Effect.gen(function* () {
   const baseUrl = yield* createEmulatorInstance("resend", "connect-handoff");
   return yield* Effect.promise(() => connectEmulator({ baseUrl }));
 });
 
-const mintEmulatorApiKey = (client: EmulatorClient) =>
+const mintEmulatorApiKey = (client: EmulatorClient, login: string) =>
   Effect.gen(function* () {
-    const credential = yield* Effect.promise(() => client.credentials.mint({ type: "api-key" }));
-    const token = credential.token;
-    if (!token) throw new Error(`emulator credential mint failed: ${JSON.stringify(credential)}`);
-    return token;
+    const credential = yield* Effect.promise(() =>
+      client.credentials.mint({ type: "api-key", login }),
+    );
+    if (!credential.token) {
+      return yield* Effect.die("emulator credential mint returned no token");
+    }
+    return credential.token;
   });
 
+const sendEmailCode = (toolAddress: string, subject: string) => `
+const segments = ${JSON.stringify(toolAddress)}.split(".").slice(1);
+let callable = tools;
+for (const segment of segments) callable = callable[segment];
+const sent = await callable({
+  body: {
+    from: "onboarding@example.com",
+    to: "workos-handoff@example.com",
+    subject: ${JSON.stringify(subject)},
+    html: "<p>WorkOS handoff delivery proof</p>",
+  },
+});
+return JSON.stringify({ ok: sent.ok, result: sent.ok ? sent.data : sent.error });
+`;
+
 scenario(
-  "Connect · the agentic handoff URL opens this deployment's add-account flow and the pasted key works",
+  "Connect · the service-created handoff opens this deployment and the bound user completes it",
   { timeout: 240_000 },
   Effect.gen(function* () {
     const target = yield* Target;
-    const mcp = yield* Mcp;
     const browser = yield* Browser;
+    const runDir = yield* RunDir;
+    const newServiceIdentity = yield* ServiceIdentity;
     const { client: makeApiClient } = yield* Api;
 
     const integration = unique("resendhf");
-    const emailSubject = unique("connect-handoff");
     const emulatorClient = yield* emulator;
-    const apiKey = yield* mintEmulatorApiKey(emulatorClient);
-
-    const identity = yield* target.newIdentity();
-    const session = mcp.session(identity);
-    const client = yield* makeApiClient(api, identity);
-
-    // The bound org's slug, read from the same account surface the console
-    // shell reads — the handoff URL must canonicalize onto exactly this.
-    const accountClient = yield* makeApiClient(AccountHttpApi, identity);
-    const me = yield* accountClient.account.me();
-    const orgSlug = me.organization?.slug;
-    expect(orgSlug, "the bound organization advertises a URL slug").toBeTruthy();
+    const providerLogin = unique("handoffactor");
+    const apiKey = yield* mintEmulatorApiKey(emulatorClient, providerLogin);
+    const emailSubject = unique("handoffsend");
+    const user = yield* target.newIdentity();
+    const service = yield* newServiceIdentity({ scopes: ["connections:handoff"] });
+    const userClient = yield* makeApiClient(api, user);
+    const settlement: { connection?: ConnectionRef } = {};
 
     yield* runScenario({
       target,
       browser,
-      session,
-      identity,
+      runDir,
+      user,
+      service,
       integration,
-      emailSubject,
       apiKey,
-      orgSlug: orgSlug!,
+      providerLogin,
+      emailSubject,
       emulatorClient,
+      makeApiClient,
+      settlement,
     }).pipe(
-      // Best-effort cleanup even on failure: drop the created connection(s)
-      // over MCP, then the integration over the API. `connections.remove` is
-      // approval-gated, so the cleanup execute pauses per connection;
-      // `executeJson` auto-approves each pause so the removes actually run.
       Effect.ensuring(
         Effect.gen(function* () {
-          yield* executeJson(session, removeConnectionsCode(integration));
-          yield* client.openapi.removeSpec({ params: { slug: integration } });
+          if (settlement.connection) {
+            yield* userClient.connections
+              .remove({ params: settlement.connection })
+              .pipe(Effect.ignore);
+          }
+          yield* userClient.openapi
+            .removeSpec({ params: { slug: integration } })
+            .pipe(Effect.ignore);
         }).pipe(Effect.ignore),
       ),
     );
@@ -169,94 +109,167 @@ scenario(
 const runScenario = (input: {
   readonly target: TargetShape;
   readonly browser: BrowserSurface;
-  readonly session: McpSession;
-  readonly identity: Identity;
-  readonly integration: string;
-  readonly emailSubject: string;
+  readonly runDir: string;
+  readonly user: Identity;
+  readonly service: Identity;
+  readonly integration: IntegrationSlug;
   readonly apiKey: string;
-  readonly orgSlug: string;
+  readonly providerLogin: string;
+  readonly emailSubject: string;
   readonly emulatorClient: EmulatorClient;
+  readonly makeApiClient: ApiSurface["client"];
+  readonly settlement: { connection?: ConnectionRef };
 }) =>
   Effect.gen(function* () {
     const {
       target,
       browser,
-      session,
-      identity,
+      runDir,
+      user,
+      service,
       integration,
-      emailSubject,
       apiKey,
-      orgSlug,
+      providerLogin,
+      emailSubject,
       emulatorClient,
+      makeApiClient,
+      settlement,
     } = input;
+    expect(user.subject, "the browser identity has an exact WorkOS member subject").toBeTruthy();
 
-    // 1. Agent registers the emulated provider over MCP.
-    const added = yield* executeJson(session, addSpecCode(integration, emulatorClient.openapiUrl));
-    expect(added.ok, `addSpec succeeded: ${JSON.stringify(added)}`).toBe(true);
-
-    // 2. Agent asks for the browser handoff URL.
-    const handoff = yield* executeJson(session, createHandoffCode(integration));
-    expect(handoff.ok, `createHandoff succeeded: ${JSON.stringify(handoff)}`).toBe(true);
-    const handoffUrl = String(handoff.url);
-
-    // 3. The URL must target THIS deployment AND carry the bound org's slug.
-    //    (Production returned a URL the user called "wrong/bad" — it had no slug,
-    //    so a multi-org user could land in the wrong workspace. Pin both here.)
-    const parsed = new URL(handoffUrl);
-    expect(parsed.origin, `handoff URL (${handoffUrl}) targets this deployment`).toBe(
-      new URL(target.baseUrl).origin,
-    );
-    expect(parsed.pathname, `handoff URL (${handoffUrl}) carries the bound org slug`).toBe(
-      `/${orgSlug}/integrations/${integration}`,
-    );
-    expect(parsed.searchParams.get("addAccount")).toBe("1");
-
-    // 4. The user opens the handoff URL and pastes the credential.
-    yield* browser.session(identity, async ({ page, step }) => {
-      await step("Open the handoff URL from the agent", async () => {
-        await page.goto(handoffUrl, { waitUntil: "networkidle" });
-      });
-
-      await step("The Add connection modal is open", async () => {
-        await page.getByRole("heading", { name: /Add connection/ }).waitFor({ timeout: 15_000 });
-      });
-
-      await step("Paste the emulator API key", async () => {
-        // The single-input bearer method renders an affixed field ("Authorization:
-        // Bearer " prefix) with no placeholder; its accessible name is the
-        // placement name ("Authorization"). Scope to the dialog so the match
-        // stays unique.
-        const credential = page.getByRole("dialog").getByRole("textbox", { name: "Authorization" });
-        await credential.waitFor({ timeout: 15_000 });
-        await credential.fill(apiKey);
-      });
-
-      await step("Submit Add connection", async () => {
-        // The credential wizard is two steps: Continue (validate) then Add
-        // connection (name + place). Scope the submit click to the dialog,
-        // since the page also has its own "Add connection" trigger button.
-        await page.getByRole("button", { name: "Continue" }).click();
-        await page
-          .getByRole("dialog")
-          .getByRole("button", { name: "Add connection", exact: true })
-          .click();
-        await page
-          .getByRole("heading", { name: /Add connection/ })
-          .waitFor({ state: "hidden", timeout: 20_000 });
-      });
+    const serviceClient = yield* makeApiClient(api, service);
+    const userClient = yield* makeApiClient(api, user);
+    yield* userClient.openapi.addSpec({
+      payload: {
+        spec: { kind: "url", url: emulatorClient.openapiUrl },
+        slug: integration,
+      },
     });
 
-    // 5. The connection is live: send an email through the new tools and see
-    //    it arrive at the emulator with the pasted token.
-    const sent = yield* executeJson(session, sendEmailCode(integration, emailSubject));
-    expect(sent.ok, `email sent through the pasted connection: ${JSON.stringify(sent)}`).toBe(true);
+    const accountClient = yield* makeApiClient(AccountHttpApi, user);
+    const me = yield* accountClient.account.me();
+    const orgSlug = me.organization?.slug;
+    expect(orgSlug, "the service is scoped to the exact customer organization").toBeTruthy();
 
-    const entries = yield* Effect.promise(() => emulatorClient.ledger.list());
-    const recorded = entries.find((entry) =>
-      JSON.stringify(entry.request.body ?? "").includes(emailSubject),
+    const returnTo = new URL(`/${orgSlug}/integrations/${integration}`, target.baseUrl).toString();
+    const handoff = yield* serviceClient.connections.createHandoff({
+      payload: {
+        memberId: user.subject!,
+        integration,
+        label: "Resend (emulated)",
+        returnTo,
+      },
+    });
+    expect(handoff.status).toBe("pending");
+    expect(handoff.memberId).toBe(user.subject);
+    expect(new URL(handoff.url).origin).toBe(new URL(target.baseUrl).origin);
+    expect(new URL(handoff.url).pathname).toBe(`/${orgSlug}/connect/${handoff.handoffId}`);
+
+    yield* browser.session(
+      user,
+      async ({ page, step }) => {
+        await step("Open the service-created handoff URL", async () => {
+          await page.goto(handoff.url, { waitUntil: "networkidle" });
+        });
+        await step("The Add connection modal is open", async () => {
+          await page.getByRole("heading", { name: /Add connection/ }).waitFor({ timeout: 15_000 });
+        });
+        await step("Paste the provider credential", async () => {
+          const credential = page
+            .getByRole("dialog")
+            .getByRole("textbox", { name: "Authorization" });
+          await credential.waitFor({ timeout: 15_000 });
+          expect(
+            await credential.getAttribute("type"),
+            "recorded browser evidence keeps the provider credential masked",
+          ).toBe("password");
+          await credential.fill(apiKey);
+        });
+        await step("Complete the handoff", async () => {
+          await page.getByRole("button", { name: "Continue" }).click();
+          await page.waitForFunction(() =>
+            document
+              .getAnimations()
+              .filter((animation) => animation.effect?.getTiming().iterations !== Infinity)
+              .every((animation) => animation.playState === "finished"),
+          );
+          const addConnection = page
+            .getByRole("dialog")
+            .getByRole("button", { name: "Add connection", exact: true });
+          expect(
+            await addConnection.isEnabled(),
+            "the completed credential step retains submit authority after motion settles",
+          ).toBe(true);
+          await addConnection.click();
+          await page
+            .getByRole("heading", { name: /Add connection/ })
+            .waitFor({ state: "hidden", timeout: 20_000 });
+          await page.waitForURL(returnTo, { timeout: 20_000, waitUntil: "networkidle" });
+          await page.getByRole("dialog").waitFor({ state: "hidden", timeout: 20_000 });
+        });
+      },
+      { captureTrace: false },
     );
     expect(
-      recorded?.summary,
-      "the emulator's request ledger recorded the call made through Executor",
-    ).toBeDefined();
+      existsSync(join(runDir, "trace.zip")),
+      "credential-bearing browser journeys never persist Playwright traces",
+    ).toBe(false);
+
+    const completed = yield* serviceClient.connections.getHandoff({
+      params: { handoffId: handoff.handoffId },
+    });
+    expect(completed.status, "the service observes terminal settlement").toBe("completed");
+    if (completed.status !== "completed") return yield* Effect.die("handoff did not complete");
+    settlement.connection = completed.receipt.connection;
+    expect(completed.receipt).toMatchObject({
+      schema: "executor.connection-handoff.receipt.v1",
+      memberId: user.subject,
+      readback: { connectionPresent: true },
+    });
+    const saved = yield* userClient.connections.get({ params: completed.receipt.connection });
+    expect(saved.integration).toBe(integration);
+    expect(saved.owner).toBe("user");
+    expect(
+      JSON.stringify(saved).includes(apiKey),
+      "the saved projection never returns the provider secret",
+    ).toBe(false);
+
+    const receiptTools = yield* userClient.tools.list({
+      query: {
+        integration: completed.receipt.connection.integration,
+        owner: completed.receipt.connection.owner,
+        connection: completed.receipt.connection.name,
+      },
+    });
+    const sendTool = receiptTools.find((tool) => String(tool.name) === "emails.send");
+    expect(
+      sendTool?.address,
+      "the exact handoff-created connection exposes the Resend send operation",
+    ).toBeTruthy();
+    if (!sendTool) return yield* Effect.die("handoff-created Resend send tool was absent");
+
+    const executed = yield* userClient.executions.execute({
+      payload: {
+        code: sendEmailCode(String(sendTool.address), emailSubject),
+        autoApprove: true,
+      },
+    });
+    expect(executed.status, "the exact handoff-created connection executed").toBe("completed");
+    if (executed.status !== "completed") return;
+    expect(executed.isError, executed.text).toBe(false);
+    const outcome = JSON.parse(executed.text) as { readonly ok?: boolean };
+    expect(outcome.ok, executed.text).toBe(true);
+
+    const ledger = yield* Effect.promise(() => emulatorClient.ledger.list());
+    const providerRequest = ledger.find((entry) =>
+      JSON.stringify(entry.request.body).includes(emailSubject),
+    );
+    expect(
+      providerRequest?.response.status,
+      "the provider ledger recorded the exact handoff-bound send",
+    ).toBe(200);
+    expect(
+      providerRequest?.identity.user?.login,
+      "the provider resolved the unique credential pasted through the handoff",
+    ).toBe(providerLogin);
   });

@@ -43,6 +43,7 @@ export {
   IntegrationSlug,
   AuthTemplateSlug,
   ConnectionName,
+  ConnectionHandoffId,
   OAuthClientSlug,
   OAuthState,
   ProviderKey,
@@ -69,6 +70,12 @@ export {
   IntegrationAlreadyExistsError,
   IntegrationRemovalNotAllowedError,
   ConnectionNotFoundError,
+  ConnectionHandoffNotFoundError,
+  ConnectionHandoffMemberMismatchError,
+  ConnectionHandoffTargetMismatchError,
+  ConnectionHandoffExpiredError,
+  ConnectionHandoffInvalidReturnTargetError,
+  ConnectionHandoffUnavailableError,
   CredentialProviderNotRegisteredError,
   CredentialResolutionError,
   isUserActionableError,
@@ -90,12 +97,23 @@ export type {
 export { freshCustomAuthSlug, mergeAuthTemplates } from "./integration";
 export type {
   Connection,
+  ConnectionRemovalReceipt,
   ConnectionRef,
   ConnectionValueInput,
   CreateConnectionInput,
   UpdateConnectionInput,
   ValidateConnectionInput,
 } from "./connection";
+export {
+  ConnectionHandoff,
+  ConnectionHandoffExpiryReceipt,
+  ConnectionHandoffReceipt,
+  ConnectionHandoffTarget,
+  CompletedConnectionHandoff,
+  ExpiredConnectionHandoff,
+  PendingConnectionHandoff,
+  type CreateConnectionHandoffInput,
+} from "./connection-handoff";
 export type { Tool, ToolDef, ToolListFilter, ToolAnnotations } from "./tool";
 
 // Credential providers.

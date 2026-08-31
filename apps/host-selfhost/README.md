@@ -56,6 +56,7 @@ or invalid.
 | Variable                                        | Required    | Purpose                                                                         |
 | ----------------------------------------------- | ----------- | ------------------------------------------------------------------------------- |
 | `EXECUTOR_WEB_BASE_URL`                         | yes         | Exact public origin used by browser and MCP URLs.                               |
+| `EXECUTOR_CONNECTION_RETURN_ORIGINS`            | for handoff | Comma-separated exact application origins allowed as connection return targets. |
 | `EXECUTOR_AUTH_PROVIDER`                        | recommended | Must be `workos-authkit` when set.                                              |
 | `WORKOS_API_KEY`                                | yes         | Server-side WorkOS API key.                                                     |
 | `WORKOS_CLIENT_ID`                              | yes         | AuthKit application's client ID and default Connect audience.                   |

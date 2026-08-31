@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join as pathJoin } from "node:path";
-import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect";
+import { Context, Data, Duration, Effect, Layer, Option, Schedule, Schema } from "effect";
 import { FileSystem } from "effect";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
 import { NodeFileSystem } from "@effect/platform-node";
@@ -41,10 +41,98 @@ export const isFetchDisabled = (
 // Service
 // ---------------------------------------------------------------------------
 
-export type IntegrationsRegistryData = unknown;
+export const IntegrationCatalogKind = Schema.Literals(["cli", "graphql", "mcp", "openapi"]);
+export type IntegrationCatalogKind = typeof IntegrationCatalogKind.Type;
+
+export const IntegrationCatalogItem = Schema.Struct({
+  id: Schema.String,
+  kind: IntegrationCatalogKind,
+  slug: Schema.String,
+  name: Schema.String,
+  description: Schema.String,
+  icon: Schema.optional(Schema.String),
+  domain: Schema.String,
+  categories: Schema.Array(Schema.String),
+  feeds: Schema.Array(Schema.String),
+  connectUrl: Schema.optional(Schema.String),
+  url: Schema.optional(Schema.String),
+  authKind: Schema.optional(Schema.String),
+  popularity: Schema.optional(Schema.Number),
+  standalone: Schema.optional(Schema.Boolean),
+});
+export type IntegrationCatalogItem = typeof IntegrationCatalogItem.Type;
+
+export const IntegrationsCatalog = Schema.Struct({
+  version: Schema.Number,
+  generatedAt: Schema.String,
+  integrations: Schema.Array(IntegrationCatalogItem),
+});
+export type IntegrationsCatalog = typeof IntegrationsCatalog.Type;
+
+const IntegrationsRegistryWireItem = Schema.Struct({
+  id: Schema.String,
+  kind: IntegrationCatalogKind,
+  slug: Schema.String,
+  name: Schema.String,
+  description: Schema.String,
+  icon: Schema.optional(Schema.String),
+  domain: Schema.String,
+  categories: Schema.Array(Schema.String),
+  feeds: Schema.Array(Schema.String),
+  connectUrl: Schema.optional(Schema.String),
+  url: Schema.optional(Schema.NullOr(Schema.String)),
+  auth: Schema.optional(Schema.Struct({ kind: Schema.String })),
+  popularity: Schema.optional(Schema.NullOr(Schema.Number)),
+  standalone: Schema.optional(Schema.Boolean),
+});
+
+const IntegrationsRegistryWirePayload = Schema.Struct({
+  version: Schema.Number,
+  generatedAt: Schema.String,
+  data: Schema.Array(IntegrationsRegistryWireItem),
+});
+
+const decodeWirePayload = Schema.decodeUnknownOption(IntegrationsRegistryWirePayload);
+
+/** Admit the integrations.sh feed into Executor's stable, credential-free
+ * catalog contract. Provider auth instructions and arbitrary wire fields are
+ * intentionally not projected across this seam. */
+export const decodeIntegrationsCatalog = (input: unknown): IntegrationsCatalog | undefined => {
+  const decoded = decodeWirePayload(input);
+  if (Option.isNone(decoded)) return undefined;
+  return {
+    version: decoded.value.version,
+    generatedAt: decoded.value.generatedAt,
+    integrations: decoded.value.data.map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      slug: item.slug,
+      name: item.name,
+      description: item.description,
+      ...(item.icon !== undefined ? { icon: item.icon } : {}),
+      domain: item.domain,
+      categories: item.categories,
+      feeds: item.feeds,
+      ...(item.connectUrl !== undefined ? { connectUrl: item.connectUrl } : {}),
+      ...(item.url != null ? { url: item.url } : {}),
+      ...(item.auth !== undefined ? { authKind: item.auth.kind } : {}),
+      ...(item.popularity != null ? { popularity: item.popularity } : {}),
+      ...(item.standalone !== undefined ? { standalone: item.standalone } : {}),
+    })),
+  };
+};
+
+export interface IntegrationsCatalogSearchInput {
+  readonly query?: string;
+  readonly kinds?: readonly IntegrationCatalogKind[];
+  readonly limit?: number;
+}
 
 export interface IntegrationsRegistryService {
-  readonly get: () => Effect.Effect<IntegrationsRegistryData>;
+  readonly get: (id: string) => Effect.Effect<IntegrationCatalogItem | null>;
+  readonly search: (
+    input?: IntegrationsCatalogSearchInput,
+  ) => Effect.Effect<readonly IntegrationCatalogItem[]>;
   readonly refresh: (force?: boolean) => Effect.Effect<void>;
 }
 
@@ -104,13 +192,45 @@ const cacheFileFor = (cacheDir: string, source: string): string => {
 // Layer
 // ---------------------------------------------------------------------------
 
-const UnknownFromJsonString = Schema.fromJsonString(Schema.Unknown);
-const decodeJsonOption = Schema.decodeUnknownOption(UnknownFromJsonString);
+const WirePayloadFromJsonString = Schema.fromJsonString(Schema.Unknown);
+const decodeJsonOption = Schema.decodeUnknownOption(WirePayloadFromJsonString);
 
-const parseJson = (text: string): IntegrationsRegistryData => {
+const parseJson = (text: string): IntegrationsCatalog | undefined => {
   const decoded = decodeJsonOption(text);
   if (Option.isNone(decoded)) return undefined;
-  return decoded.value;
+  return decodeIntegrationsCatalog(decoded.value);
+};
+
+class IntegrationsRegistryInvalidPayloadError extends Data.TaggedError(
+  "IntegrationsRegistryInvalidPayloadError",
+)<{ readonly message: string }> {}
+
+const normalizedSearchText = (item: IntegrationCatalogItem): string =>
+  [item.name, item.slug, item.domain, item.description, ...item.categories]
+    .join(" ")
+    .toLocaleLowerCase();
+
+const searchCatalog = (
+  catalog: IntegrationsCatalog | undefined,
+  input: IntegrationsCatalogSearchInput = {},
+): readonly IntegrationCatalogItem[] => {
+  if (!catalog) return [];
+  const tokens = (input.query ?? "")
+    .trim()
+    .toLocaleLowerCase()
+    .split(/\s+/u)
+    .filter((token) => token.length > 0);
+  const kinds = input.kinds === undefined ? null : new Set(input.kinds);
+  const limit = Math.min(Math.max(Math.trunc(input.limit ?? 25), 0), 100);
+  return catalog.integrations
+    .filter((item) => kinds === null || kinds.has(item.kind))
+    .filter((item) => {
+      if (tokens.length === 0) return true;
+      const searchText = normalizedSearchText(item);
+      return tokens.every((token) => searchText.includes(token));
+    })
+    .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id))
+    .slice(0, limit);
 };
 
 export const layer = (
@@ -173,8 +293,14 @@ export const layer = (
 
       const fetchAndWrite = Effect.gen(function* () {
         const text = yield* fetchText;
+        const catalog = parseJson(text);
+        if (!catalog) {
+          return yield* new IntegrationsRegistryInvalidPayloadError({
+            message: "integrations.sh returned a payload outside the supported catalog contract",
+          });
+        }
         yield* writeCache(text);
-        return text;
+        return catalog;
       });
 
       const readFromDisk = Effect.gen(function* () {
@@ -186,23 +312,23 @@ export const layer = (
       });
 
       const populate = Effect.gen(function* () {
-        if (disabled) return undefined as IntegrationsRegistryData;
+        if (disabled) return undefined;
 
         const fromDisk = yield* readFromDisk;
         if (fromDisk) return fromDisk;
 
-        const text = yield* withWriteLock(fetchAndWrite);
-        if (Option.isSome(text)) {
-          return parseJson(text.value);
+        const fetched = yield* withWriteLock(fetchAndWrite);
+        if (Option.isSome(fetched)) {
+          return fetched.value;
         }
         // Another process held the lock. Try to read what they wrote.
         const settled = yield* readFromDisk;
-        return settled ?? (undefined as IntegrationsRegistryData);
+        return settled;
       }).pipe(
         Effect.catchCause((cause) =>
           Effect.logDebug("IntegrationsRegistry.populate failed").pipe(
             Effect.annotateLogs("cause", cause),
-            Effect.as(undefined as IntegrationsRegistryData),
+            Effect.as(undefined),
           ),
         ),
         Effect.withSpan("IntegrationsRegistry.populate"),
@@ -259,7 +385,12 @@ export const layer = (
       }
 
       return {
-        get: () => cachedGet,
+        get: (id: string) =>
+          cachedGet.pipe(
+            Effect.map((catalog) => catalog?.integrations.find((item) => item.id === id) ?? null),
+          ),
+        search: (input?: IntegrationsCatalogSearchInput) =>
+          cachedGet.pipe(Effect.map((catalog) => searchCatalog(catalog, input))),
         refresh,
       };
     }),

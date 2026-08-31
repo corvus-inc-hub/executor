@@ -9,11 +9,13 @@ import { desktopTarget } from "./desktop";
 import { localTarget } from "./local";
 import { selfhostTarget } from "./selfhost";
 import { selfhostDockerTarget } from "./selfhost-docker";
+import { selfhostWorkosTarget } from "./selfhost-workos";
 
 const factories: Record<string, () => Target> = {
   cloud: cloudTarget,
   selfhost: selfhostTarget,
   "selfhost-docker": selfhostDockerTarget,
+  "selfhost-workos": selfhostWorkosTarget,
   cloudflare: cloudflareTarget,
   desktop: desktopTarget,
   // The packaged desktop bundle launches its own app per scenario, same as

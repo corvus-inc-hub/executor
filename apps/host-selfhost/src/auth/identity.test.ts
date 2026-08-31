@@ -8,7 +8,11 @@ import { EXECUTOR_ORG_SELECTOR_HEADER } from "@executor-js/sdk/shared";
 import type { WorkOSConfig } from "../config";
 import { makeWorkOSAccountProvider } from "../account/workos-account-provider";
 import type { ApiKeyService } from "./api-keys";
-import { makeWorkOSIdentityLayer, principalFromVerifiedWorkOSToken } from "./identity";
+import {
+  authorizeWorkOSServiceRequest,
+  makeWorkOSIdentityLayer,
+  principalFromVerifiedWorkOSToken,
+} from "./identity";
 import type { OrganizationStore, StoredOrganization } from "./organization-store";
 import type { WorkOSClient } from "./workos";
 
@@ -182,6 +186,41 @@ const authenticateWith = (
 const authenticate = (request: Request) => authenticateWith(request);
 
 describe("WorkOS identity provider", () => {
+  it.effect("denies machine identities outside their exact scoped service routes", () =>
+    Effect.gen(function* () {
+      const servicePrincipal = {
+        kind: "service" as const,
+        accountId: "client_trigger",
+        organizationId: organization.id,
+        organizationName: organization.name,
+        email: "",
+        name: "client_trigger",
+        avatarUrl: null,
+        roles: ["service"],
+        scopes: ["connections:handoff"],
+      };
+      const admitted = yield* authorizeWorkOSServiceRequest(
+        servicePrincipal,
+        new Request("https://executor.example.com/api/connection-handoffs", { method: "POST" }),
+      );
+      const generic = yield* authorizeWorkOSServiceRequest(
+        servicePrincipal,
+        new Request("https://executor.example.com/api/openapi/specs", { method: "POST" }),
+      ).pipe(Effect.result);
+      const leaseOnlyHandoff = yield* authorizeWorkOSServiceRequest(
+        { ...servicePrincipal, scopes: ["credentials:lease"] },
+        new Request("https://executor.example.com/api/connection-handoffs", { method: "POST" }),
+      ).pipe(Effect.result);
+
+      expect(admitted).toBe(servicePrincipal);
+      expect(generic).toMatchObject({ _tag: "Failure", failure: { _tag: "NoOrganization" } });
+      expect(leaseOnlyHandoff).toMatchObject({
+        _tag: "Failure",
+        failure: { _tag: "NoOrganization" },
+      });
+    }),
+  );
+
   it.effect(
     "marks only a verified M2M application as service in the selected target organization",
     () =>
@@ -204,6 +243,7 @@ describe("WorkOS identity provider", () => {
           accountId: "client_trigger",
           organizationId: organization.id,
           roles: ["service"],
+          scopes: ["credentials:lease"],
         });
       }),
   );

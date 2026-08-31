@@ -61,6 +61,7 @@ type ToolRow = {
 export function IntegrationDetailPage(props: {
   namespace: string;
   tab?: IntegrationDetailSearchTab;
+  accountHandoff?: IntegrationAccountHandoff | null;
 }) {
   const { namespace } = props;
   const slug = IntegrationSlug.make(namespace);
@@ -158,7 +159,7 @@ export function IntegrationDetailPage(props: {
       ...(oauthClient !== undefined ? { oauthClient } : {}),
     };
   }, [locationSearch]);
-  const accountHandoff = manualAccountHandoff ?? urlAccountHandoff;
+  const accountHandoff = manualAccountHandoff ?? props.accountHandoff ?? urlAccountHandoff;
 
   useEffect(() => {
     if (accountHandoff && !isBuiltInIntegration) {

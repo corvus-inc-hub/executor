@@ -150,7 +150,17 @@ function executorApiPlugin(): Plugin {
 
           const response = await handler(webRequest);
           res.statusCode = response.status;
-          response.headers.forEach((value, key) => res.setHeader(key, value));
+          // Node's outgoing response needs Set-Cookie as a string array. A
+          // generic Headers.forEach() folds repeated values and can leave only
+          // the final cookie; the WorkOS callback sets both the sealed session
+          // and clears the one-time login state in the same response.
+          const combinedSetCookie = response.headers.get("set-cookie");
+          const setCookies =
+            response.headers.getSetCookie?.() ?? (combinedSetCookie ? [combinedSetCookie] : []);
+          response.headers.forEach((value, key) => {
+            if (key !== "set-cookie") res.setHeader(key, value);
+          });
+          if (setCookies.length > 0) res.setHeader("set-cookie", setCookies);
           if (response.body) {
             const reader = response.body.getReader();
             for (;;) {

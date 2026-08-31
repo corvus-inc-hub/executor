@@ -3,9 +3,33 @@ import { expect, test } from "@effect/vitest";
 import {
   getPlatformOrigin,
   missingPublicOriginWarning,
+  parseExactOrigins,
   resolvePublicOrigin,
   shouldWarnMissingPublicOrigin,
 } from "./public-origin";
+
+test("parseExactOrigins canonicalizes exact HTTP origins and fails closed", () => {
+  expect(
+    parseExactOrigins(
+      " https://manifest.example/,https://customer.example:8443,https://manifest.example ",
+      "EXECUTOR_CONNECTION_RETURN_ORIGINS",
+    ),
+  ).toEqual(["https://manifest.example", "https://customer.example:8443"]);
+  expect(parseExactOrigins(undefined, "EXECUTOR_CONNECTION_RETURN_ORIGINS")).toEqual([]);
+
+  for (const invalid of [
+    "https://manifest.example/return",
+    "https://manifest.example?return=1",
+    "https://manifest.example/#return",
+    "ftp://manifest.example",
+    "https://user:secret@manifest.example",
+    "not-a-url",
+  ]) {
+    expect(() => parseExactOrigins(invalid, "EXECUTOR_CONNECTION_RETURN_ORIGINS")).toThrowError(
+      /EXECUTOR_CONNECTION_RETURN_ORIGINS must contain only exact HTTP\(S\) origins/,
+    );
+  }
+});
 
 test("getPlatformOrigin reads host-only vars as https, trims trailing slash on URL vars", () => {
   expect(getPlatformOrigin({ RAILWAY_PUBLIC_DOMAIN: "demo.up.railway.app" })).toBe(

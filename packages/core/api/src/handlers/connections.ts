@@ -1,5 +1,5 @@
 import { HttpApiBuilder } from "effect/unstable/httpapi";
-import { Effect } from "effect";
+import { Effect, Option } from "effect";
 
 import { capture } from "@executor-js/api";
 import {
@@ -13,7 +13,16 @@ import {
 } from "@executor-js/sdk";
 
 import { ExecutorApi } from "../api";
+import { ConnectionHandoffForbidden } from "../connections/api";
 import { ExecutorService } from "../services";
+import { AuthContext } from "../server/identity";
+
+const CONNECTION_HANDOFF_SERVICE_SCOPE = "connections:handoff";
+
+const isHandoffService = (auth: AuthContext["Service"]): boolean =>
+  auth.kind === "service" &&
+  auth.roles.includes("service") &&
+  auth.scopes?.includes(CONNECTION_HANDOFF_SERVICE_SCOPE) === true;
 
 const toResponse = (c: Connection) => ({
   owner: c.owner,
@@ -122,12 +131,60 @@ export const ConnectionsHandlers = HttpApiBuilder.group(ExecutorApi, "connection
       capture(
         Effect.gen(function* () {
           const executor = yield* ExecutorService;
-          yield* executor.connections.remove({
+          const receipt = yield* executor.connections.remove({
             owner: path.owner,
             integration: path.integration,
             name: path.name,
           });
-          return { removed: true };
+          return {
+            ...receipt,
+            removed: toResponse(receipt.removed),
+          };
+        }),
+      ),
+    )
+    .handle("createHandoff", ({ payload }) =>
+      capture(
+        Effect.gen(function* () {
+          const auth = yield* Effect.serviceOption(AuthContext);
+          if (Option.isNone(auth) || !isHandoffService(auth.value)) {
+            return yield* new ConnectionHandoffForbidden({
+              message: "Only an authenticated service may create a connection handoff.",
+            });
+          }
+          const executor = yield* ExecutorService;
+          return yield* executor.connectionHandoffs.create(payload);
+        }),
+      ),
+    )
+    .handle("getHandoff", ({ params }) =>
+      capture(
+        Effect.gen(function* () {
+          const auth = yield* Effect.serviceOption(AuthContext);
+          const executor = yield* ExecutorService;
+          if (Option.isSome(auth) && isHandoffService(auth.value)) {
+            return yield* executor.connectionHandoffs.read(params.handoffId);
+          }
+          if (Option.isSome(auth) && auth.value.kind === "user") {
+            return yield* executor.connectionHandoffs.observe(params.handoffId);
+          }
+          return yield* new ConnectionHandoffForbidden({
+            message: "Connection handoff status is unavailable to this principal.",
+          });
+        }),
+      ),
+    )
+    .handle("completeHandoff", ({ params, payload }) =>
+      capture(
+        Effect.gen(function* () {
+          const auth = yield* Effect.serviceOption(AuthContext);
+          if (Option.isNone(auth) || auth.value.kind !== "user") {
+            return yield* new ConnectionHandoffForbidden({
+              message: "Only the authenticated user may complete a connection handoff.",
+            });
+          }
+          const executor = yield* ExecutorService;
+          return yield* executor.connectionHandoffs.complete(params.handoffId, payload);
         }),
       ),
     )

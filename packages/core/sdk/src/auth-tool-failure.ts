@@ -33,11 +33,10 @@ export type AuthToolFailureInput = {
 };
 
 // In v1.5 a connection IS the credential: there is no standalone secret to
-// "bind" to an integration afterward. Manually-entered credentials are created via
-// the connection handoff (the user enters the value in the web UI, which
-// creates the bound connection in one step); OAuth credentials are minted by
-// the OAuth start flow. These strings are read by the agent resolving the
-// failure, so they must name tools that actually exist on the executor.
+// "bind" to an integration afterward. Browser-mediated credentials are owned by
+// the host's connection experience; OAuth credentials are minted by the OAuth
+// start flow. These strings are read by the agent resolving the failure, so
+// they must not advertise service-only APIs as model-callable tools.
 const authRecovery = (code: AuthToolFailureCode, input?: AuthToolFailureInput["recovery"]) => {
   // A scope-insufficient rejection cannot be fixed by re-running the same
   // grant, so this branch deliberately omits startOAuthTool/oauthInstructions:
@@ -55,14 +54,13 @@ const authRecovery = (code: AuthToolFailureCode, input?: AuthToolFailureInput["r
     };
   }
   return {
-    createConnectionTool: "executor.coreTools.connections.createHandoff",
     startOAuthTool: "executor.coreTools.oauth.start",
     listConnectionsTool: "executor.coreTools.connections.list",
     ...(input?.configureIntegrationTool
       ? { configureIntegrationTool: input.configureIntegrationTool }
       : {}),
     connectionInstructions:
-      "For API keys and tokens, call createConnectionTool for the integration to get a browser URL; the user enters the credential there, which creates the bound connection. Do not ask the user to paste secrets into chat. Then call listConnectionsTool to confirm the connection exists before retrying this tool.",
+      "For API keys and tokens, ask the user to connect the integration through the Executor-hosted Connections experience. Do not ask the user to paste secrets into chat. Then call listConnectionsTool to confirm the connection exists before retrying this tool.",
     oauthInstructions:
       "For OAuth credentials, call startOAuthTool and give the returned authorizationUrl to the user. The completed connection binds automatically, then retry the tool.",
   };

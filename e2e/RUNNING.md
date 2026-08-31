@@ -260,11 +260,12 @@ developer actually uses it. Three tiers, pick deliberately:
 
 1. **Chat theater** (`src/clients/chat-theater.ts`): the default for
    product-flow recordings. The "agent" is a chat renderer in a recorded
-   PTY; every tool spinner brackets a REAL mcporter MCP call (OAuth,
-   execute, approval resume). No inference, no third-party binary.
-   Exemplar: `scenarios/connect-handoff-session.test.ts`. Artifacts:
-   `terminal.cast` (the chat) + `session.mp4` (browser hops); the viewer
-   plays them in story order.
+   PTY; every tool spinner brackets the real product operation it narrates.
+   No inference, no third-party agent binary.
+   Exemplar: `cli/service-lifecycle.test.ts`. Artifact: `terminal.cast`.
+   Hosted connection handoff is a distinct production-shaped browser journey:
+   `scenarios/connect-handoff.test.ts` on `selfhost-workos`. The service creates
+   the handoff before the bound WorkOS user opens and completes it.
 2. **Replay brain + real client** (`src/clients/replay-brain.ts`): when the
    third-party CLIENT's behavior is under test (OpenCode/Claude Code
    protocol handling). A scripted OpenAI-wire server plays the LLM; the
@@ -273,10 +274,11 @@ developer actually uses it. Three tiers, pick deliberately:
 3. **Real-inference evals**: a different axis (performance distributions,
    not pass/fail). Not in this suite.
 
-**The Desk** (`desk/`): films a scenario on one virtual Linux desktop — the
-chat renderer in a visible xterm, the browser as a real headed window, one
-ffmpeg x11grab. The film replaces session.mp4 in the run dir; the scenario
-file is unchanged (chat-theater switches transports on `E2E_DESK=1`).
+**The Desk** (`desk/`): films a scenario on one virtual Linux desktop — a chat
+renderer in a visible xterm when the selected scenario uses chat theater, or a
+real headed browser for the default WorkOS handoff journey, captured by one
+ffmpeg x11grab. The film replaces session.mp4 in the run dir; the scenario file
+is unchanged (chat-theater switches transports on `E2E_DESK=1`).
 
 ```
 e2e/desk/run.sh [scenario] [project]   # docker; first run builds + installs

@@ -58,6 +58,35 @@ export const resolvePublicOrigin = (options: {
   return getPlatformOrigin(options.env);
 };
 
+/** Parse a comma-separated allowlist into canonical, exact web origins. Empty
+ * input is an empty allowlist; malformed entries reject the whole setting so a
+ * typo can never broaden or partially weaken a security boundary. */
+export const parseExactOrigins = (
+  value: string | undefined,
+  sourceName: string,
+): readonly string[] => {
+  const origins = new Set<string>();
+  for (const candidate of (value ?? "").split(",")) {
+    const input = candidate.trim();
+    if (input.length === 0) continue;
+    const parsed = URL.canParse(input) ? new URL(input) : null;
+    if (
+      !parsed ||
+      (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+      parsed.username.length > 0 ||
+      parsed.password.length > 0 ||
+      parsed.pathname !== "/" ||
+      parsed.search.length > 0 ||
+      parsed.hash.length > 0
+    ) {
+      // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: an invalid allowlist must fail closed during host configuration
+      throw new Error(`${sourceName} must contain only exact HTTP(S) origins`);
+    }
+    origins.add(parsed.origin);
+  }
+  return [...origins];
+};
+
 /**
  * True unless this is explicitly local dev or a test run. A staging/demo deploy
  * often leaves `NODE_ENV` unset, and silently using a localhost fallback there is

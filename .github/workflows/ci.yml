@@ -265,6 +265,83 @@ jobs:
           path: e2e/runs/
           retention-days: 7
 
+  manifest-selfhost-workos:
+    name: Manifest selfhost-workos handoff
+    if: github.repository == 'manifest-platform/executor' && github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Cache Bun package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-1.3.11-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-1.3.11-
+
+      - run: bun install --frozen-lockfile
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-1.60.0
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright Chromium
+        run: bunx playwright install --with-deps chromium chromium-headless-shell
+        working-directory: e2e
+
+      - name: Run the production-shaped WorkOS handoff acceptance
+        id: acceptance
+        run: bunx vitest run --project selfhost-workos
+        working-directory: e2e
+
+      - name: Reject credential-bearing browser artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d e2e/runs/selfhost-workos ] && \
+            find e2e/runs/selfhost-workos -type f -name 'trace.zip' -print -quit | grep -q .; then
+            find e2e/runs/selfhost-workos -type f -name 'trace.zip' -print
+            echo "::error::credential-bearing Playwright trace must not be retained"
+            exit 1
+          fi
+
+      - name: Require browser evidence after accepted handoff
+        if: steps.acceptance.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          find e2e/runs/selfhost-workos -type f -name '*.png' -print -quit | grep -q .
+          find e2e/runs/selfhost-workos -type f \( -name 'session.mp4' -o -name 'session.webm' \) -print -quit | grep -q .
+
+      - name: Upload masked browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-selfhost-workos-browser-evidence
+          path: |
+            e2e/runs/selfhost-workos/**/*.png
+            e2e/runs/selfhost-workos/**/session.mp4
+            e2e/runs/selfhost-workos/**/session.webm
+          if-no-files-found: ignore
+          retention-days: 7
+
   e2e-local:
     name: E2E (stdio MCP)
     # Skipped on pull_request: the local scenario boots a real `executor web`

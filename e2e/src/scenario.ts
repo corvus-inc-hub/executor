@@ -37,6 +37,7 @@ import {
   OpenCode,
   Restart,
   RunDir,
+  ServiceIdentity,
   Target,
   Telemetry,
   TtlControl,
@@ -69,6 +70,7 @@ type AllServices =
   | RunDir
   | Cli
   | Api
+  | ServiceIdentity
   | Browser
   | Mcp
   | Billing
@@ -92,6 +94,9 @@ const contextFor = (target: TargetShape, dir: string): Context.Context<AllServic
   ) as Context.Context<AllServices>;
   const has = target.capabilities.has.bind(target.capabilities);
   if (has("api")) context = Context.add(context, Api, makeApiSurface(target));
+  if (target.newServiceIdentity) {
+    context = Context.add(context, ServiceIdentity, target.newServiceIdentity);
+  }
   if (has("browser")) context = Context.add(context, Browser, makeBrowserSurface(dir, target));
   if (has("mcp-oauth")) context = Context.add(context, Mcp, makeMcpSurface(target, dir));
   if (has("billing")) context = Context.add(context, Billing, true);

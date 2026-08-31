@@ -200,7 +200,6 @@ const expectModelVisibleAuthFailure = (execution: ExecuteResult) => {
         details: {
           category: "authentication",
           recovery: {
-            createConnectionTool: "executor.coreTools.connections.createHandoff",
             listConnectionsTool: "executor.coreTools.connections.list",
           },
         },

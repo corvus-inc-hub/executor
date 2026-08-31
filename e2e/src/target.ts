@@ -24,6 +24,9 @@ export interface Identity {
   readonly cookies?: ReadonlyArray<{ readonly name: string; readonly value: string }>;
   /** Credentials for surfaces that sign in themselves (Better Auth, OAuth consent). */
   readonly credentials?: { readonly email: string; readonly password: string };
+  /** Provider subject when the scenario must bind a service-created handoff
+   *  to the exact user or prove a machine application's identity. */
+  readonly subject?: string;
 }
 
 export interface Target {
@@ -38,6 +41,11 @@ export interface Target {
    * that create one, like onboarding / billing limits).
    */
   readonly newIdentity: (options?: { readonly org?: boolean }) => Effect.Effect<Identity>;
+  /** Mint a real service identity from the target's authorization server.
+   *  Present only on targets that expose a production-shaped M2M plane. */
+  readonly newServiceIdentity?: (options?: {
+    readonly scopes?: readonly string[];
+  }) => Effect.Effect<Identity>;
   /** Headless OAuth consent for the MCP surface, when "mcp-oauth" is supported. */
   readonly mcpConsent?: (
     identity: Identity,
